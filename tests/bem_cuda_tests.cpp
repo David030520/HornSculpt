@@ -5,6 +5,8 @@
 #include <complex>
 #include <cuda_runtime_api.h>
 #include <fstream>
+#include <galerkin/interaction_plan.hpp>
+#include <galerkin/space.hpp>
 #include <hornsculpt/bem.hpp>
 #include <hornsculpt/draft_geometry.hpp>
 #include <hornsculpt/meshing.hpp>
@@ -210,7 +212,8 @@ void checkMappedQuadrature() {
                         "Mapped quadrature violated the original residual contract.");
                 double error = 0, scale = 0;
                 for (std::size_t j = 0; j < a.boundary()->surfacePressure.size(); ++j) {
-                    error += std::norm(a.boundary()->surfacePressure[j] - b.boundary()->surfacePressure[j]);
+                    error += std::norm(a.boundary()->surfacePressure[j] -
+                                       b.boundary()->surfacePressure[j]);
                     scale += std::norm(b.boundary()->surfacePressure[j]);
                 }
                 require(std::sqrt(error / scale) < 2e-5,
@@ -227,6 +230,42 @@ void checkMappedQuadrature() {
     std::cout << "Mapped/device CUDA quadrature parity, multiple excitations, cache reuse and "
                  "replacement passed.\n";
 }
+void checkCompactQuadrature() {
+    const auto mesh = sphere(2);
+    auto input = request();
+    input.frequencies = {2500};
+    galerkin::PairQuadratureSettings settings;
+    settings.relativeTolerance = input.numerics.nearRelativeTolerance;
+    settings.maximumSubdivisionDepth = input.numerics.nearMaximumDepth;
+    const double k = 2 * std::numbers::pi * input.frequencies.front() / input.medium.soundSpeed;
+    const auto plan = galerkin::makeInteractionPlan(galerkin::buildSpace(mesh), settings, k);
+    const auto compactCount =
+        std::count_if(plan.wholePanelDegrees.begin(), plan.wholePanelDegrees.end(),
+                      [](auto d) { return d != 0; });
+    require(compactCount > 0, "CUDA regression does not exercise compact full-panel rules.");
+    CudaBemSolver solver(mesh);
+    const auto actual = solver.solve(input);
+    auto strict = input;
+    strict.numerics.nearRelativeTolerance = 1e-6;
+    const auto reference = solver.solve(strict);
+    double worst{};
+    for (std::size_t e = 0; e < input.excitations.size(); ++e) {
+        const auto &a = actual.frequencies.front().excitations[e];
+        const auto &b = reference.frequencies.front().excitations[e];
+        require(a.boundaryResidual <= input.numerics.relativeResidualTolerance &&
+                    b.boundaryResidual <= strict.numerics.relativeResidualTolerance,
+                "Compact CUDA quadrature failed the unchanged solve residual.");
+        for (std::size_t j = 0; j < a.observerPressure.size(); ++j)
+            worst = std::max(worst, std::abs(a.observerPressure[j] / b.observerPressure[j] - 1.));
+        worst = std::max(worst, std::abs(a.impedances.front().volumeImpedance /
+                                             b.impedances.front().volumeImpedance -
+                                         1.));
+    }
+    require(worst < 1e-4, "Compact CUDA rules disagree with stricter FP64 adaptive quadrature.");
+    std::cout << "Compact CUDA rules: " << compactCount << " pairs, " << mesh.triangles.size()
+              << " triangles, complex field/impedance difference " << worst << '\n';
+}
+
 void checkTightResidual() {
     // A single existing sphere fixture exercises the supported residual floor
     // without a frequency search or a geometry/discretization tolerance change.
@@ -515,8 +554,9 @@ void checkAsymptoticFarField() {
                      1.) < 1e-4,
             "Far-field mode changed the solved radiation impedance.");
     for (std::size_t j = 0; j < farSurface.boundary()->surfacePressure.size(); ++j)
-        require(std::abs(farSurface.boundary()->surfacePressure[j] / finiteSurface.boundary()->surfacePressure[j] - 1.) <
-                    1e-4,
+        require(std::abs(farSurface.boundary()->surfacePressure[j] /
+                             finiteSurface.boundary()->surfacePressure[j] -
+                         1.) < 1e-4,
                 "Far-field mode changed surface pressure.");
     auto scaled = input;
     scaled.frequencies = {1715};
@@ -623,6 +663,10 @@ void checkAsymptoticFarField() {
 int main(int argc, char **argv) {
     try {
         std::cout << "CUDA device: " << CudaBemSolver::deviceDescription() << '\n';
+        if (argc == 2 && std::string_view(argv[1]) == "--compact-quadrature") {
+            checkCompactQuadrature();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--mapped-quadrature") {
             checkMappedQuadrature();
             return 0;

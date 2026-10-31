@@ -10,6 +10,18 @@
 namespace hornsculpt::galerkin {
 struct Space;
 
+#if defined(__CUDACC__)
+#define HS_INTERACTION_HD __host__ __device__
+#else
+#define HS_INTERACTION_HD
+#endif
+// Packed unordered distinct pair, independent of the mesh's panel count.
+HS_INTERACTION_HD inline std::size_t unorderedPanelPairIndex(std::uint32_t a, std::uint32_t b) {
+    const std::size_t low = a < b ? a : b, high = a < b ? b : a;
+    return high * (high - 1) / 2 + low;
+}
+#undef HS_INTERACTION_HD
+
 struct TouchingInteraction {
     std::uint32_t test{}, trial{};
     PairPermutation permutation;
@@ -27,6 +39,11 @@ struct InteractionPlan {
     // Ordered disjoint pairs: explicit geometric near OR not qualified regular.
     std::vector<NearInteraction> near;
     std::vector<PairQuadraturePatch> patches;
+    // For streamed all-pair planning, one byte per unordered pair replaces
+    // identical full-panel patches and their two directed near jobs. Nonzero
+    // degree 8/14 was accepted by the SAME adaptive moment error estimator;
+    // zero means no override. Empty for spatially indexed plans.
+    std::vector<std::uint8_t> wholePanelDegrees;
     // Exact near membership: nearTrials[nearOffsets[t]..nearOffsets[t+1]) is
     // strictly increasing. All other disjoint pairs use regular quadrature.
     std::vector<std::uint32_t> nearOffsets, nearTrials;
@@ -43,6 +60,8 @@ struct InteractionPlan {
 // capped at eight. nearDistanceRatio=0 disables geometric correction only;
 // numerical regular qualification still applies. The payload budget includes
 // candidates, retained patches and bounded concurrent adaptive workspaces.
+// Completed rules use a shared output pool; worker scratch holds only the
+// currently integrated pair. Flattening releases each consumed rule promptly.
 InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSettings &settings,
                                     double maximumWavenumber, std::stop_token stop = {},
                                     unsigned maximumThreads = 0,

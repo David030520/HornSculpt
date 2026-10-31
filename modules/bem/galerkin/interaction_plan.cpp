@@ -55,7 +55,8 @@ void reserveTracked(std::vector<T> &values, std::size_t count,
 }
 
 std::vector<PanelPair> candidates(const Space &space, double ratio, std::stop_token stop,
-                                  AdaptiveQuadratureWorkspace &budget, const std::vector<bool> &active) {
+                                  AdaptiveQuadratureWorkspace &budget,
+                                  const std::vector<bool> &active) {
     double maximumEdge = 0;
     for (const auto &panel : space.panels) {
         if (!(panel.maximumEdgeLength > 0) || !std::isfinite(panel.maximumEdgeLength))
@@ -187,6 +188,12 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
         allPairs |=
             !bounds.back().qualifiedShape || maximumWavenumber * panel.maximumEdgeLength > 2;
     }
+    if (allPairs) {
+        const auto panelCount = space.panels.size();
+        const auto pairCount = panelCount * (panelCount - 1) / 2;
+        reserveTracked(result.wholePanelDegrees, pairCount, fixedBudget);
+        result.wholePanelDegrees.resize(pairCount, 0);
+    }
     reserveTracked(result.nearOffsets, space.panels.size() + 1, fixedBudget);
     result.nearOffsets.resize(space.panels.size() + 1, 0);
     for (std::size_t test = 0; test < space.panels.size(); ++test) {
@@ -214,9 +221,9 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
     // With qualified shapes, k*h<=2 and a sufficient arithmetic budget, every
     // unqualified pair has centroid-ball gap<h. Its vertex-zero distance is
     // <(1+8/3)*h<4*h, so ratio2 is a conservative spatial candidate search.
-    const auto pairs =
-        allPairs ? std::vector<PanelPair>{}
-                 : candidates(space, std::max(2., settings.nearDistanceRatio), stop, fixedBudget, active);
+    const auto pairs = allPairs ? std::vector<PanelPair>{}
+                                : candidates(space, std::max(2., settings.nearDistanceRatio), stop,
+                                             fixedBudget, active);
     result.candidatePairs = pairs.size();
     unsigned count =
         maximumThreads ? maximumThreads : std::max(1U, std::thread::hardware_concurrency());
@@ -224,7 +231,11 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
         std::min<std::size_t>({count, 8, allPairs ? space.panels.size() : pairs.size()}));
     if (!count)
         return result;
-    std::vector<std::vector<PlannedPair>> perWorker(count);
+    // Completed rules belong to the output pool, not to a worker's temporary
+    // adaptive workspace. Streamed rows have unequal lengths; charging retained
+    // rules to individual workers otherwise exhausts one pool prematurely.
+    std::vector<PlannedPair> planned;
+    std::mutex outputMutex;
     std::atomic<std::size_t> streamedCandidates{};
     std::atomic<std::size_t> next{};
     std::atomic<bool> failed{};
@@ -235,7 +246,7 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
     std::vector<std::jthread> workers;
     workers.reserve(count);
     for (unsigned worker = 0; worker < count; ++worker)
-        workers.emplace_back([&, worker](std::stop_token localStop) {
+        workers.emplace_back([&](std::stop_token localStop) {
             try {
                 AdaptiveQuadratureWorkspace workspace(maximumHostBytes / 4 / count);
                 const auto process = [&](PanelPair pair) {
@@ -262,7 +273,6 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
                     if (degree && !geometricNear)
                         return;
                     try {
-                        PairQuadratureRule retained;
                         {
                             AdaptivePairQuadratureState state(test, trial, settings,
                                                               maximumWavenumber, workspace,
@@ -273,22 +283,34 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
                                 for (std::size_t i = 0; i < tasks.size(); ++i) {
                                     cancelled(pairStop.get_token());
                                     estimates[i] = estimatePairPatchCpu(test, trial, tasks[i],
-                                                                        maximumWavenumber, pairStop.get_token());
+                                                                        maximumWavenumber,
+                                                                        pairStop.get_token());
                                 }
                                 state.commit(std::span(estimates).first(tasks.size()));
                             }
+                            std::lock_guard lock(outputMutex);
                             const auto &rule = state.result();
-                            // The copy is intentional: both old and retained
-                            // capacities are charged BEFORE allocating it.
-                            reserveTracked(retained.patches, rule.patches.size(), workspace);
-                            retained.patches.assign(rule.patches.begin(), rule.patches.end());
-                            retained.topology = rule.topology;
-                            retained.estimatedRelativeError = rule.estimatedRelativeError;
-                            retained.maximumDepth = rule.maximumDepth;
-                            retained.peakWorkspaceBytes = rule.peakWorkspaceBytes;
+                            if (allPairs && rule.maximumDepth == 0 && rule.patches.size() == 1 &&
+                                !rule.patches.front().projection) {
+                                // The accepted tensor rule is exactly the root
+                                // patch. Keep its degree, not millions of copies
+                                // of the same barycentric identity and CSR jobs.
+                                result.wholePanelDegrees[unorderedPanelPairIndex(pair.first,
+                                                                                 pair.second)] =
+                                    static_cast<std::uint8_t>(rule.patches.front().degree);
+                                result.maximumEstimatedRelativeError =
+                                    std::max(result.maximumEstimatedRelativeError,
+                                             rule.estimatedRelativeError);
+                                return;
+                            }
+                            reserveTracked(planned, planned.size() + 1, outputBudget);
+                            // Reserve the destination charge before transferring
+                            // ownership. takeResult releases the scratch charge;
+                            // no second patch allocation or copy is needed.
+                            outputBudget.acquire(state.result().patches.capacity() *
+                                                 sizeof(PairQuadraturePatch));
+                            planned.push_back({pair, state.takeResult()});
                         }
-                        reserveTracked(perWorker[worker], perWorker[worker].size() + 1, workspace);
-                        perWorker[worker].push_back({pair, std::move(retained)});
                     } catch (const std::exception &error) {
                         if (pairStop.stop_requested())
                             throw;
@@ -332,15 +354,9 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
     if (allPairs)
         result.candidatePairs = streamedCandidates.load();
     cancelled(stop);
-    std::vector<PlannedPair> planned;
-    for (auto &worker : perWorker)
-        for (auto &pair : worker) {
-            reserveTracked(planned, planned.size() + 1, outputBudget);
-            planned.push_back(std::move(pair));
-        }
     std::sort(planned.begin(), planned.end(),
               [](const auto &a, const auto &b) { return a.pair < b.pair; });
-    for (const auto &entry : planned) {
+    for (auto &entry : planned) {
         cancelled(stop);
         const auto first = index32(result.patches.size()),
                    size = index32(entry.rule.patches.size());
@@ -349,6 +365,11 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
                        outputBudget);
         result.patches.insert(result.patches.end(), entry.rule.patches.begin(),
                               entry.rule.patches.end());
+        // Both buffers were charged during the copy. Release consumed rules
+        // immediately so later flattening does not retain a complete duplicate.
+        const auto retainedBytes = entry.rule.patches.capacity() * sizeof(PairQuadraturePatch);
+        std::vector<PairQuadraturePatch>().swap(entry.rule.patches);
+        outputBudget.release(retainedBytes);
         reserveTracked(result.near, result.near.size() + 2, outputBudget);
         if (active[entry.pair.first])
             result.near.push_back({entry.pair.first, entry.pair.second, first, size, 0});

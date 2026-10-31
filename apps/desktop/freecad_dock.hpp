@@ -45,6 +45,7 @@ class FreeCadDock final : public QDockWidget {
     std::function<void(std::vector<std::uint32_t>)> onFacesSelected;
     std::function<void(QString)> onError;
     std::function<void()> onAssignmentEditStarted;
+    std::function<void()> onEditBemRegions;
     std::function<void(std::vector<std::uint32_t>, std::optional<double>)> onFaceTargetChanged;
 
   private:
@@ -60,6 +61,7 @@ class FreeCadDock final : public QDockWidget {
     QPushButton *connect_{};
     QPushButton *install_{};
     QPushButton *apply_{};
+    QPushButton *bemRegions_{};
     QPushButton *confirm_{};
     QPushButton *missing_{};
     QTreeWidget *faces_{};

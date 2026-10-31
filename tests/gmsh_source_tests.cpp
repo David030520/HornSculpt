@@ -66,7 +66,10 @@ int main(int argc, char **argv) {
         MeshingOptions options;
         options.targetEdgeLength = .02;
         options.quality.enabled = false;
-        const std::vector<AcousticRegionDefinition> regions{{7, "Innen", {2, 3}, {6}}};
+        const AcousticModelDefinition regions{
+            {{7, "Innen", BemDomainKind::interior, {2, 3}}, {1, "Außen", BemDomainKind::exterior}},
+            {{1, "Öffnung", 7, 1, {6}}},
+            std::nullopt};
         const auto checked = validateGmshMesh(cup, regions, options);
         require(checked.mesh == cup && !checked.quality.watertight(),
                 "Explicit Gmsh interface did not preserve the source mesh.");

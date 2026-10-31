@@ -1,4 +1,5 @@
 #include "acoustic_partition_fixture.hpp"
+#include "acoustic_regions_dialog.hpp"
 #include "angular_response_widget.hpp"
 #include "baffle_dialog.hpp"
 #include "cad_fixture.hpp"
@@ -15,6 +16,7 @@
 #include "simulation_dock.hpp"
 #include "simulation_layout_checks.hpp"
 #include "simulation_request.hpp"
+#include "subdomain_baffle_fixture.hpp"
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepTools.hxx>
 #include <QAction>
@@ -36,6 +38,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -49,6 +52,7 @@
 #include <QStatusBar>
 #include <QTabBar>
 #include <QTabWidget>
+#include <QTableWidget>
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTest>
@@ -1673,7 +1677,10 @@ void testSubdomainGuiArchive(bool coupled = false) {
     MeshingOptions options;
     options.targetEdgeLength = .02;
     dock.setPartitionMeshingOptions(options);
-    dock.setAcousticRegions({{7, "Hornluft", {2, 3}}});
+    dock.setAcousticModel({{{7, "Hornluft", BemDomainKind::interior, {2, 3}},
+                            {1, "Außenraum", BemDomainKind::exterior}},
+                           {},
+                           std::nullopt});
     if (coupled) {
         lem::Network network;
         network.nodes = {{{1}, lem::Domain::acoustic, true, "reference", {}},
@@ -1711,7 +1718,7 @@ void testSubdomainGuiArchive(bool coupled = false) {
     std::cerr << "GUI stage read\n" << std::flush;
     const auto restored = readProject(path).simulation;
     require(restored.request && restored.request->subdomains == archive.request->subdomains &&
-                restored.resultRegions == archive.resultRegions && restored.sourceMesh &&
+                restored.resultModel == archive.resultModel && restored.sourceMesh &&
                 *restored.sourceMesh == *mesh &&
                 !restored.result->frequencies.front().excitations.front().subdomainTraces().empty(),
             "GUI subdomain archive did not preserve its source and local traces.");
@@ -1779,7 +1786,10 @@ void testGmshSubdomainEndToEnd() {
     project.geometryRevision = project.revision;
     project.meshing.targetEdgeLength = .02;
     project.meshing.quality.enabled = false;
-    project.simulation.settings.acousticRegions = {{7, "Hornluft", {2, 3}, {6}}};
+    project.simulation.settings.acousticModel = {{{7, "Hornluft", BemDomainKind::interior, {2, 3}},
+                                                  {1, "Außenraum", BemDomainKind::exterior}},
+                                                 {{1, "Interface", 7, 1, {6}}},
+                                                 std::nullopt};
     project.simulation.settings.minimumFrequency = project.simulation.settings.maximumFrequency =
         500;
     project.simulation.settings.frequencyCount = 1;
@@ -1794,14 +1804,78 @@ void testGmshSubdomainEndToEnd() {
     require(main.sourceImportError().isEmpty() && main.geometryReady(),
             "Gmsh source project did not open.");
     main.show();
+    auto *cadDock = dynamic_cast<FreeCadDock *>(main.findChild<QDockWidget *>("freecadDock"));
+    auto *cadFaces = cadDock ? cadDock->findChild<QTreeWidget *>("cadFaces") : nullptr;
+    require(cadDock && cadFaces, "CAD face selection is unavailable.");
+    for (int i = 0; i < cadFaces->topLevelItemCount(); ++i) {
+        auto *item = cadFaces->topLevelItem(i);
+        const auto id = item->data(0, Qt::UserRole).toUInt();
+        item->setSelected(id == 2 || id == 3);
+    }
+    require(cadDock->selectedFaces() == std::vector<std::uint32_t>({2, 3}),
+            "CAD multi-selection failed.");
+    auto *regionButton = main.findChild<QPushButton *>("cadBemRegions");
+    auto *regionDock =
+        dynamic_cast<SimulationDock *>(main.findChild<QDockWidget *>("simulationDock"));
+    require(regionButton && regionButton->isEnabled() && regionDock,
+            "BEM region button unavailable in face assignment.");
+    bool dialogUsed = false;
+    QTimer::singleShot(0, &main, [&] {
+        auto *dialog = dynamic_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!dialog || dialog->objectName() != "acousticRegionsDialog")
+            return;
+        auto *tree = dialog->findChild<QTreeWidget *>("acousticModelTree");
+        auto *faces = dialog->findChild<QListWidget *>("acousticRegionFaces");
+        auto *assign = dialog->findChild<QPushButton *>("acousticAssignFaces");
+        if (!tree || !faces || !assign || tree->topLevelItemCount() != 3) {
+            dialog->reject();
+            return;
+        }
+        std::vector<std::uint32_t> preselected;
+        for (auto *item : faces->selectedItems())
+            preselected.push_back(item->data(Qt::UserRole).toUInt());
+        std::sort(preselected.begin(), preselected.end());
+        if (preselected != std::vector<std::uint32_t>({2, 3})) {
+            dialog->reject();
+            return;
+        }
+        faces->clearSelection();
+        tree->setCurrentItem(tree->topLevelItem(2));
+        for (int i = 0; i < faces->count(); ++i)
+            if (faces->item(i)->data(Qt::UserRole).toUInt() == 1 ||
+                faces->item(i)->data(Qt::UserRole).toUInt() == 6)
+                faces->item(i)->setSelected(true);
+        assign->click();
+        dialogUsed = true;
+        dialog->accept();
+    });
+    const auto beforeRegionEdit = main.revision();
+    regionButton->click();
+    require(dialogUsed && main.revision() > beforeRegionEdit &&
+                regionDock->archive().settings.acousticModel.interfaces.front().faceIds ==
+                    std::vector<std::uint32_t>({1, 6}),
+            "Face assignment button did not create a real BEM interface edit.");
+    auto *undo = main.findChild<QAction *>("undoEdit");
+    auto *redo = main.findChild<QAction *>("redoEdit");
+    require(undo && redo && undo->isEnabled(), "Region edit did not enter undo history.");
+    undo->trigger();
+    require(regionDock->archive().settings.acousticModel.interfaces.front().faceIds ==
+                std::vector<std::uint32_t>{6},
+            "Undo did not restore BEM interface assignment.");
+    redo->trigger();
+    require(regionDock->archive().settings.acousticModel.interfaces.front().faceIds ==
+                std::vector<std::uint32_t>({1, 6}),
+            "Redo did not restore BEM interface assignment.");
+    undo->trigger();
+    project.simulation.settings.acousticModel.interfaces = {{1, "Interface", 7, 1, {6}}};
     std::cerr << "Gmsh GUI stage mesh\n" << std::flush;
     main.requestMesh();
     waitUntil([&] { return !main.meshInProgress(); });
     require(main.lastMeshError().isEmpty() && main.meshReady(),
             "Gmsh source mesh did not validate.");
     auto *dock = dynamic_cast<SimulationDock *>(main.findChild<QDockWidget *>("simulationDock"));
-    require(dock && dock->archive().settings.acousticRegions ==
-                        project.simulation.settings.acousticRegions,
+    require(dock &&
+                dock->archive().settings.acousticModel == project.simulation.settings.acousticModel,
             "Gmsh region definition changed.");
     std::cerr << "Gmsh GUI stage solve\n" << std::flush;
     main.requestSolve();
@@ -1861,6 +1935,115 @@ void testGmshSubdomainEndToEnd() {
     require(reopened.sourceImportError().isEmpty() && reopened.simulationReady(),
             "Saved Gmsh project did not reopen current.");
     std::cerr << "Gmsh GUI stage done\n" << std::flush;
+}
+void testSymmetricBaffleGuiArchive() {
+    auto mesh = testing::openRimSourceMesh(true);
+    for (auto &triangle : mesh.triangles)
+        triangle.boundary = BoundaryCondition::wall;
+    require(mesh.triangles.size() < 10000, "Symmetric fixture exceeds triangle budget.");
+    MeshImportSelection selection;
+    selection.lengthScaleToMetres = 1;
+    selection.imported.mesh = mesh;
+    for (std::uint64_t i = 0; i < mesh.vertices.size(); ++i)
+        selection.imported.nodeTags.push_back(i + 1);
+    for (std::size_t i = 0; i < mesh.triangles.size(); ++i)
+        selection.imported.triangleMetadata.push_back({i + 1, mesh.triangles[i].faceId, {}});
+    auto cad = std::make_shared<CadSnapshot>(*makeGmshCadSnapshot(selection, "quarter-baffle.msh"));
+    for (auto &face : cad->faces)
+        if (face.id == 1)
+            face.boundary = BoundaryCondition::driven;
+    for (auto &triangle : cad->mesh.triangles)
+        if (triangle.faceId == 1)
+            triangle.boundary = BoundaryCondition::driven;
+    Project project;
+    project.source = ProjectSource::freecad;
+    project.gmsh = selection;
+    project.cad = cad;
+    project.preview = std::shared_ptr<const SurfaceMesh>(cad, &cad->mesh);
+    project.geometryRevision = project.revision;
+    project.meshing.targetEdgeLength = .1;
+    project.meshing.quality.enabled = false;
+    validateMeshSettings(project.meshing);
+    auto &settings = project.simulation.settings;
+    settings.minimumFrequency = settings.maximumFrequency = 500;
+    settings.frequencyCount = 1;
+    settings.symmetryXYEnabled = true;
+    settings.symmetryPlaneTolerance = 1e-6;
+    settings.acousticModel.domains = {{7, "Innen", BemDomainKind::interior, {1, 3}},
+                                      {8, "Freifeld", BemDomainKind::exterior}};
+    settings.acousticModel.domains[0].groups = {{1, "Driver", {1}}, {2, "Horn", {3}}};
+    settings.acousticModel.interfaces = {{9, "Räumliches Interface", 7, 8, {2}}};
+    settings.acousticModel.interfaces[0].groups = {{1, "Öffnung", {2}}};
+    settings.acousticModel.exteriorBaffle = ExteriorBaffle{{0, 0, 0}, {0, 0, 1}, 1e-6};
+    QTemporaryDir directory;
+    require(directory.isValid(), "Temporary directory unavailable.");
+    const auto path = directory.filePath("quarter-baffle.hsproj");
+    writeProject(path, project);
+    if (const auto screenshot = qEnvironmentVariable("HS_SUBDOMAIN_SCREENSHOT");
+        !screenshot.isEmpty()) {
+        std::map<std::uint32_t, QString> labels;
+        for (const auto &face : cad->faces)
+            labels.emplace(face.id, face.label);
+        AcousticRegionsDialog editor(settings.acousticModel, std::move(labels));
+        editor.resize(1200, 700);
+        editor.show();
+        QApplication::processEvents();
+        require(editor.grab().save(screenshot + "-editor.png"), "Model editor screenshot failed.");
+        editor.close();
+    }
+    MainWindow main;
+    main.openProject(path);
+    main.show();
+    waitUntil([&] { return !main.sourceImportInProgress(); });
+    require(main.sourceImportError().isEmpty() && main.geometryReady(),
+            "Symmetric source failed to open.");
+    main.requestMesh();
+    waitUntil([&] { return !main.meshInProgress(); });
+    if (!main.lastMeshError().isEmpty())
+        throw std::runtime_error(main.lastMeshError().toStdString());
+    require(main.meshReady(), "Symmetric source mesh failed validation.");
+    main.requestSolve();
+    waitUntil([&] { return !main.simulationInProgress(); });
+    if (!main.lastSimulationError().isEmpty())
+        throw std::runtime_error(main.lastSimulationError().toStdString());
+    require(main.simulationReady(), "Symmetric baffle solve did not finish.");
+    if (const auto screenshot = qEnvironmentVariable("HS_SUBDOMAIN_SCREENSHOT");
+        !screenshot.isEmpty()) {
+        auto *workflow = main.findChild<QLabel *>("workflowStatus");
+        require(workflow, "Workflow status missing.");
+        waitUntil([&] { return workflow->text().startsWith("Ergebnis aktuell"); });
+        require(main.grab().save(screenshot + "-result.png"),
+                "Solved main window screenshot failed.");
+    }
+    QAction *save = nullptr;
+    for (auto *action : main.findChildren<QAction *>())
+        if (action->shortcut() == QKeySequence::Save)
+            save = action;
+    require(save, "Save action missing.");
+    saveAndWait(main, save);
+    const auto saved = readProject(path);
+    require(saved.simulation.current && saved.simulation.request &&
+                saved.simulation.request->symmetry &&
+                saved.simulation.request->exteriorBaffle == settings.acousticModel.exteriorBaffle &&
+                saved.simulation.settings.acousticModel == settings.acousticModel &&
+                saved.simulation.request->subdomains &&
+                saved.simulation.request->subdomains->interfaces.front().id == 9,
+            "Symmetry, baffle or named interface groups did not survive archive.");
+    const auto &mask = saved.simulation.request->observerValidity;
+    require(mask.size() == 147 && mask == exteriorObserverValidity(*saved.simulation.request) &&
+                std::count(mask.begin(), mask.end(), 0) > 0 &&
+                std::count(mask.begin(), mask.end(), 1) > 0 && saved.simulation.result &&
+                saved.simulation.result->frequencies.front().excitations.front().observerValidity ==
+                    mask,
+            "147 observer validity entries did not survive archive.");
+    MainWindow reopened;
+    reopened.openProject(path);
+    waitUntil([&] { return !reopened.sourceImportInProgress(); });
+    if (!reopened.sourceImportError().isEmpty())
+        throw std::runtime_error(
+            (QStringLiteral("Symmetric source reopen failed: ") + reopened.sourceImportError())
+                .toStdString());
+    require(reopened.simulationReady(), "Symmetric project reopened without a current result.");
 }
 void testGmshImportPreservesLiveLink() {
     MainWindow main;
@@ -2508,6 +2691,10 @@ int main(int argc, char **argv) {
         }
         if (argc == 2 && QString::fromLocal8Bit(argv[1]) == "--subdomain-lem-gui-only") {
             testSubdomainGuiArchive(true);
+            return 0;
+        }
+        if (argc == 2 && QString::fromLocal8Bit(argv[1]) == "--symmetry-baffle-gui-only") {
+            testSymmetricBaffleGuiArchive();
             return 0;
         }
         if (argc == 2 && QString::fromLocal8Bit(argv[1]) == "--subdomain-gui-only") {

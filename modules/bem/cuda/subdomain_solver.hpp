@@ -28,11 +28,11 @@ void assembleSubdomainSamples(const SubdomainPanel *panels, const SubdomainPairS
                               const cuDoubleComplex *knownFlux, const double *rowScale,
                               cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
                               cudaStream_t stream);
-void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t panelCount, unsigned dimension,
-                           double waveNumber, unsigned excitationCount,
-                           const cuDoubleComplex *knownFlux, const double *rowScale,
-                           cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
-                           cudaStream_t stream);
+void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t panelCount,
+                           std::size_t fluxStride, unsigned dimension, double waveNumber,
+                           unsigned excitationCount, const cuDoubleComplex *knownFlux,
+                           const double *rowScale, cuDoubleComplex *matrix, cuDoubleComplex *rhs,
+                           int *error, cudaStream_t stream);
 BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRequest &request,
                           std::stop_token stop, std::function<void(const BemProgress &)> progress,
                           bool allowZero = false);

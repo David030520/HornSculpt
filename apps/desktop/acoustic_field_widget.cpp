@@ -49,7 +49,9 @@ bool sameFieldRequest(const std::optional<BemRequest> &a, const std::optional<Be
         a->numerics.nearRelativeTolerance != b->numerics.nearRelativeTolerance ||
         a->numerics.nearMaximumDepth != b->numerics.nearMaximumDepth ||
         a->axisymmetric != b->axisymmetric || a->infiniteBaffle != b->infiniteBaffle ||
-        a->subdomains != b->subdomains || a->coupling.has_value() != b->coupling.has_value() ||
+        a->subdomains != b->subdomains || a->symmetry != b->symmetry ||
+        a->exteriorBaffle != b->exteriorBaffle || a->observerValidity != b->observerValidity ||
+        a->coupling.has_value() != b->coupling.has_value() ||
         (a->coupling && !lem::samePhysics(*a->coupling, *b->coupling)) ||
         a->excitations.size() != b->excitations.size())
         return false;

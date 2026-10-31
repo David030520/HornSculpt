@@ -64,7 +64,9 @@ struct SimulationSettings {
     AxisymmetricSamplingSettings axisymmetricSampling;
     int ctaExcitationIndex{-1}; // display selection only
     unsigned singularOrder{4};
-    std::vector<AcousticRegionDefinition> acousticRegions;
+    AcousticModelDefinition acousticModel;
+    bool symmetryXYEnabled{};
+    double symmetryPlaneTolerance{1e-6}; // m
 };
 
 struct SimulationArchive {
@@ -81,7 +83,7 @@ struct SimulationArchive {
     // Missing in older archives: completeness of a stale result cannot be inferred.
     std::optional<bool> resultComplete;
     std::shared_ptr<const SurfaceMesh> sourceMesh;
-    std::vector<AcousticRegionDefinition> resultRegions;
+    AcousticModelDefinition resultModel;
 };
 
 struct Project;
@@ -120,9 +122,9 @@ FaceColors retainedCadFaceColors(const FaceColors &colors, const CadSnapshot *pr
 
 // Losing an assigned physical surface keeps a persistent review obligation.
 // A numeric ID in a new document is never evidence for a BEM-port match.
-std::vector<AcousticRegionDefinition>
-reconciledCadAcousticRegions(std::vector<AcousticRegionDefinition> regions,
-                             const CadSnapshot *previous, const CadSnapshot *current);
+AcousticModelDefinition reconciledCadAcousticModel(AcousticModelDefinition model,
+                                                   const CadSnapshot *previous,
+                                                   const CadSnapshot *current);
 lem::Network reconciledCadBemAssignments(lem::Network network, const CadSnapshot *previous,
                                          const CadSnapshot *current);
 

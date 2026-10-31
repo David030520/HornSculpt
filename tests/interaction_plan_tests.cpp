@@ -91,6 +91,16 @@ void checkMembership(const Space &space, const InteractionPlan &plan, double rat
                     reverse->patchCount == job.patchCount,
                 "Reverse near interaction duplicates or loses its patch storage");
     }
+    const auto patchNear = actualNear;
+    for (std::uint32_t trial = 1; trial < space.panels.size(); ++trial)
+        for (std::uint32_t test = 0; test < trial; ++test)
+            if (!plan.wholePanelDegrees.empty() &&
+                plan.wholePanelDegrees[unorderedPanelPairIndex(test, trial)]) {
+                require(!actualNear.contains({test, trial}) && !actualNear.contains({trial, test}),
+                        "Full-panel override duplicates an adaptive near job.");
+                actualNear.emplace(test, trial);
+                actualNear.emplace(trial, test);
+            }
     require(actualTouching == touching, "CSR touching plan differs from exhaustive classification");
     require(actualNear == near,
             "Spatial plan misses near pairs or includes bounding false positives");
@@ -109,13 +119,14 @@ void checkMembership(const Space &space, const InteractionPlan &plan, double rat
             csrNear.emplace(test, trial);
         }
     }
-    require(csrNear == near, "GPU-membership CSR differs from actual near interactions");
+    require(csrNear == patchNear, "GPU-membership CSR differs from adaptive patch jobs");
 }
 
 void comparePlans(const InteractionPlan &a, const InteractionPlan &b) {
     require(a.near.size() == b.near.size() && a.touching.size() == b.touching.size() &&
                 a.patches.size() == b.patches.size() && a.nearOffsets == b.nearOffsets &&
-                a.nearTrials == b.nearTrials && a.maximumDepth == b.maximumDepth &&
+                a.nearTrials == b.nearTrials && a.wholePanelDegrees == b.wholePanelDegrees &&
+                a.maximumDepth == b.maximumDepth &&
                 a.maximumEstimatedRelativeError == b.maximumEstimatedRelativeError,
             "Worker count changes the interaction-plan result");
     for (std::size_t index = 0; index < a.near.size(); ++index) {
@@ -238,7 +249,8 @@ void targetSectorTest() {
     settings.relativeTolerance = 1e-4;
     const auto full = makeInteractionPlan(space, settings, .7, {}, 1);
     const std::vector<std::uint32_t> targets{0, 3, 9};
-    const auto selected = makeInteractionPlan(space, settings, .7, {}, 2, std::size_t{1024} * 1024 * 1024, targets);
+    const auto selected =
+        makeInteractionPlan(space, settings, .7, {}, 2, std::size_t{1024} * 1024 * 1024, targets);
     const auto active = [&](unsigned test) {
         return std::find(targets.begin(), targets.end(), test) != targets.end();
     };
@@ -275,7 +287,8 @@ void targetSectorTest() {
           std::vector<std::uint32_t>{static_cast<std::uint32_t>(space.panels.size())}}) {
         bool rejected{};
         try {
-            (void)makeInteractionPlan(space, settings, .7, {}, 1, std::size_t{1024} * 1024 * 1024, invalid);
+            (void)makeInteractionPlan(space, settings, .7, {}, 1, std::size_t{1024} * 1024 * 1024,
+                                      invalid);
         } catch (const std::invalid_argument &) {
             rejected = true;
         }
@@ -299,6 +312,76 @@ void coordinateRangeTest() {
     const auto plan = makeInteractionPlan(space, {}, .7, {}, 2);
     checkMembership(space, plan, 1);
     require(plan.near.size() == 2, "Large coordinate range hides a true near pair");
+}
+
+void retainedRulesBudgetTest() {
+    SurfaceMesh mesh;
+    // Many individually inexpensive rules must fit independently of how rows
+    // are distributed among workers. Geometric near selection retains patches
+    // even when electrical qualification permits a spatial candidate search.
+    constexpr unsigned panelCount = 40;
+    for (unsigned panel = 0; panel < panelCount; ++panel) {
+        const auto first = static_cast<std::uint32_t>(mesh.vertices.size());
+        const double z = .04 * panel;
+        mesh.vertices.push_back({0, 0, z});
+        mesh.vertices.push_back({.002, 0, z});
+        mesh.vertices.push_back({0, .002, z});
+        mesh.triangles.push_back({{first, first + 1, first + 2}, panel + 1});
+    }
+    const auto space = buildSpace(mesh);
+    PairQuadratureSettings settings;
+    settings.relativeTolerance = 1e-4;
+    settings.maximumSubdivisionDepth = 6;
+    settings.nearDistanceRatio = 1000;
+    constexpr double k = 366.366;
+    constexpr std::size_t budget = 1024 * 1024;
+    const auto serial = makeInteractionPlan(space, settings, k, {}, 1, budget);
+    const auto parallel = makeInteractionPlan(space, settings, k, {}, 8, budget);
+    comparePlans(serial, parallel);
+    require(parallel.near.size() == panelCount * (panelCount - 1),
+            "Memory-bounded planning dropped retained pair rules.");
+    require(parallel.maximumEstimatedRelativeError <= .2 * settings.relativeTolerance,
+            "Memory-bounded planning relaxed the adaptive stopping tolerance.");
+    std::cout << "Retained-rule budget: " << parallel.near.size() / 2 << " pairs, "
+              << parallel.patches.size() << " patches, " << budget << " bytes\n";
+}
+
+void wholePanelRulesBudgetTest() {
+    SurfaceMesh mesh;
+    constexpr unsigned panelCount = 40;
+    for (unsigned panel = 0; panel < panelCount; ++panel) {
+        const auto first = static_cast<std::uint32_t>(mesh.vertices.size());
+        const double z = .04 * panel;
+        mesh.vertices.push_back({0, 0, z});
+        mesh.vertices.push_back({.004, 0, z});
+        mesh.vertices.push_back({0, .004, z});
+        mesh.triangles.push_back({{first, first + 1, first + 2}, panel + 1});
+    }
+    const auto space = buildSpace(mesh);
+    PairQuadratureSettings settings;
+    settings.relativeTolerance = 1e-4;
+    settings.maximumSubdivisionDepth = 6;
+    constexpr double k = 366.366;
+    const auto serial = makeInteractionPlan(space, settings, k, {}, 1, 1024 * 1024);
+    const auto parallel = makeInteractionPlan(space, settings, k, {}, 8, 1024 * 1024);
+    comparePlans(serial, parallel);
+    checkMembership(space, parallel, settings.nearDistanceRatio, k, settings.relativeTolerance);
+    require(parallel.wholePanelDegrees.size() == panelCount * (panelCount - 1) / 2 &&
+                parallel.near.empty() && parallel.patches.empty(),
+            "Unsubdivided rules retain duplicate full-panel patch/job storage.");
+    for (unsigned trial = 1; trial < panelCount; ++trial)
+        for (unsigned test = 0; test < trial; ++test) {
+            const auto rule =
+                makePairQuadrature(space.panels[test], space.panels[trial], settings, k, {}, true);
+            const auto degree = parallel.wholePanelDegrees[unorderedPanelPairIndex(test, trial)];
+            require(rule.patches.size() == 1 && rule.patches.front().degree == degree &&
+                        rule.maximumDepth == 0 && !rule.patches.front().projection,
+                    "Compact degree differs from independently accepted adaptive rule.");
+            require(unorderedPanelPairIndex(test, trial) == unorderedPanelPairIndex(trial, test),
+                    "Compact rule is not symmetric under pair reversal.");
+        }
+    std::cout << "Full-panel rule budget: " << parallel.wholePanelDegrees.size()
+              << " bytes for 780 independently accepted pair rules\n";
 }
 
 void failureAndCancellationTests() {
@@ -358,6 +441,8 @@ int main() {
         sparseCandidateTest();
         targetSectorTest();
         coordinateRangeTest();
+        retainedRulesBudgetTest();
+        wholePanelRulesBudgetTest();
         failureAndCancellationTests();
         std::cout
             << "Interaction membership, shared patches, workers and cancellation tests passed.\n";

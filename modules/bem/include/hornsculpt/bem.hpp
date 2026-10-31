@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <functional>
 #include <hornsculpt/acoustic_domains.hpp>
+#include <hornsculpt/exterior_baffle.hpp>
 #include <hornsculpt/lem.hpp>
 #include <hornsculpt/mesh.hpp>
+#include <hornsculpt/symmetry_planes.hpp>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -161,9 +163,14 @@ enum class BemGeometryMode { threeDimensional, axisymmetric };
 struct BemRequest {
     AcousticMedium medium;
     std::optional<BemSubdomainModel> subdomains;
+    std::optional<OrthogonalSymmetryPlanes> symmetry;
+    std::optional<ExteriorBaffle> exteriorBaffle;
     std::vector<double> frequencies;
     std::vector<BemExcitation> excitations;
     std::vector<Vec3> observers;
+    // Empty means all observers are valid. For the exterior-baffle far field,
+    // a nonempty 0/1 mask must identify exactly the exterior half-space.
+    std::vector<std::uint8_t> observerValidity;
     BemNumerics numerics;
     // World observer points specify directions from origin. Results are the
     // asymptotic outgoing pressure normalized to referenceDistance, not finite
@@ -224,6 +231,8 @@ struct BemSubdomainTrace {
 struct BemExcitationResult {
     std::string name;
     std::vector<std::complex<double>> observerPressure;
+    // Empty means all entries are valid. Masked pressure slots are placeholders.
+    std::vector<std::uint8_t> observerValidity;
     std::vector<FaceImpedance> impedances;
     unsigned refinementSteps{};
     // Relative L2 residual of the unscaled equation identified below. A
@@ -360,6 +369,12 @@ class CudaBemSolver {
     explicit CudaBemSolver(SurfaceMesh mesh);
     CudaBemSolver(SurfaceMesh mesh, CudaStorageOptions storage);
     CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, CudaStorageOptions storage = {});
+    CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, OrthogonalSymmetryPlanes symmetry,
+                  CudaStorageOptions storage = {});
+    CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, OrthogonalSymmetryPlanes symmetry,
+                  ExteriorBaffle baffle, CudaStorageOptions storage = {});
+    CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, ExteriorBaffle baffle,
+                  CudaStorageOptions storage = {});
     ~CudaBemSolver();
     CudaBemSolver(const CudaBemSolver &) = delete;
     CudaBemSolver &operator=(const CudaBemSolver &) = delete;

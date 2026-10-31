@@ -58,7 +58,9 @@ QJsonObject preWidebandArchive(QJsonObject root, unsigned version) {
         }
         return settings;
     };
-    simulation.insert("settings", historicalSettings(simulation["settings"].toObject()));
+    auto oldSettings = historicalSettings(simulation["settings"].toObject());
+    oldSettings.remove("acousticModel");
+    simulation.insert("settings", oldSettings);
     auto request = simulation["request"].toObject();
     if (!request.isEmpty()) {
         request.insert("numerics", historicalSettings(request["numerics"].toObject()));
@@ -796,40 +798,114 @@ void roundTripTests(const QTemporaryDir &directory) {
     {
         auto project = fullTestProject(ProjectSource::draft);
         project.simulation.current = false;
-        project.simulation.settings.acousticRegions = {{7, "Kammer", {1, 2}, {4}},
-                                                       {8, "Hals", {3}, {4}}};
+        project.simulation.settings.acousticModel = {
+            {{7, "Kammer", BemDomainKind::interior, {1, 2}},
+             {8, "Hals", BemDomainKind::interior, {3}},
+             {1, "Außenraum", BemDomainKind::exterior}},
+            {{1, "Kammer / Interface", 7, 8, {4}}},
+            std::nullopt};
+        project.simulation.settings.symmetryXYEnabled = true;
+        project.simulation.settings.symmetryPlaneTolerance = .000002;
         const auto path = directory.filePath("regions.json");
         writeProject(path, project);
-        require(readProject(path).simulation.settings.acousticRegions ==
-                    project.simulation.settings.acousticRegions,
+        require(readProject(path).simulation.settings.acousticModel ==
+                    project.simulation.settings.acousticModel,
                 "Acoustic region definitions did not survive project round trip");
+        const auto restoredSymmetry = readProject(path).simulation.settings;
+        require(restoredSymmetry.symmetryXYEnabled &&
+                    restoredSymmetry.symmetryPlaneTolerance == .000002,
+                "XY symmetry settings did not survive project round trip");
+        auto downgraded = QJsonDocument::fromJson(bytes(path)).object();
+        require(downgraded["version"].toInt() == 18, "Symmetry project did not use format 18.");
+        downgraded.insert("version", 16);
+        saveBytes(path, QJsonDocument(downgraded).toJson());
+        expectRejected([&] { (void)readProject(path); },
+                       "Format 16 accepted new symmetry semantics");
+        auto oldSettings = downgraded["simulation"].toObject();
+        auto settings = oldSettings["settings"].toObject();
+        settings.remove("symmetryXY");
+        settings.remove("acousticModel");
+        settings.insert("acousticRegions",
+                        QJsonArray{QJsonObject{{"id", 7},
+                                               {"name", "Kammer"},
+                                               {"faceIds", QJsonArray{1, 2}},
+                                               {"interfaceFaceIds", QJsonArray{4}}},
+                                   QJsonObject{{"id", 8},
+                                               {"name", "Hals"},
+                                               {"faceIds", QJsonArray{3}},
+                                               {"interfaceFaceIds", QJsonArray{4}}}});
+        oldSettings.insert("settings", settings);
+        downgraded.insert("simulation", oldSettings);
+        saveBytes(path, QJsonDocument(downgraded).toJson());
+        require(readProject(path).simulation.settings.acousticModel ==
+                    project.simulation.settings.acousticModel,
+                "Format 16 with supported acoustic regions was not readable");
+    }
+    {
+        auto project = fullTestProject(ProjectSource::draft);
+        project.simulation.current = false;
+        auto &model = project.simulation.settings.acousticModel;
+        model.domains = {{10, "Treiber", BemDomainKind::interior, {1}},
+                         {11, "Horn", BemDomainKind::interior, {2}},
+                         {12, "Freifeld", BemDomainKind::exterior, {3}}};
+        model.interfaces = {{4, "Treiberöffnung", 10, 11, {4}}, {5, "Mund", 11, 12, {5}}};
+        model.domains[0].groups = {{1, "Driver", {1}}};
+        model.interfaces[1].groups = {{2, "Mundfläche", {5}}};
+        model.exteriorBaffle = ExteriorBaffle{{0, 0, .1}, {0, 0, 1}, 1e-6};
+        const auto path = directory.filePath("named-acoustic-model.json");
+        writeProject(path, project);
+        require(readProject(path).simulation.settings.acousticModel == model,
+                "Named domains, interfaces and exterior baffle did not round trip");
+        auto malformed = QJsonDocument::fromJson(bytes(path)).object();
+        auto simulation = malformed["simulation"].toObject();
+        auto settings = simulation["settings"].toObject();
+        auto encoded = settings["acousticModel"].toObject();
+        auto interfaces = encoded["interfaces"].toArray();
+        auto first = interfaces[0].toObject();
+        first.insert("secondDomainId", 999);
+        interfaces[0] = first;
+        encoded.insert("interfaces", interfaces);
+        settings.insert("acousticModel", encoded);
+        simulation.insert("settings", settings);
+        malformed.insert("simulation", simulation);
+        saveBytes(path, QJsonDocument(malformed).toJson());
+        expectRejected([&] { (void)readProject(path); }, "Dangling interface domain accepted");
     }
     {
         auto previous = *testCad(testMesh());
         auto current = previous;
         const auto id = previous.faces.front().id;
-        std::vector<AcousticRegionDefinition> regions{{7, "Innen", {id}, {}, false}};
-        require(!reconciledCadAcousticRegions(regions, &previous, &current)
-                     .front()
+        AcousticModelDefinition regions{{{7, "Innen", BemDomainKind::interior, {id}},
+                                         {1, "Außenraum", BemDomainKind::exterior}},
+                                        {},
+                                        std::nullopt};
+        require(!reconciledCadAcousticModel(regions, &previous, &current)
+                     .domains.front()
                      .needsAssignmentReview,
                 "Stable CAD region was flagged for review");
         current.documentId += "-different";
-        const auto changed = reconciledCadAcousticRegions(regions, &previous, &current);
-        require(changed.front().needsAssignmentReview &&
-                    changed.front().faceIds == regions.front().faceIds,
+        const auto changed = reconciledCadAcousticModel(regions, &previous, &current);
+        require(changed.domains.front().needsAssignmentReview &&
+                    changed.domains.front().faceIds == regions.domains.front().faceIds,
                 "Document change silently reused a region face ID");
         current = previous;
         current.faces.clear();
-        require(reconciledCadAcousticRegions(regions, &previous, &current)
-                    .front()
+        require(reconciledCadAcousticModel(regions, &previous, &current)
+                    .domains.front()
                     .needsAssignmentReview,
                 "Missing CAD region face was accepted");
         auto project = fullTestProject(ProjectSource::draft);
         project.simulation.current = false;
-        project.simulation.settings.acousticRegions = changed;
+        project.simulation.settings.acousticModel = {
+            {{7, "Innen", BemDomainKind::interior, {id}, {}, true},
+             {1, "Außenraum", BemDomainKind::exterior}},
+            {},
+            std::nullopt};
         const auto path = directory.filePath("regions-review.json");
         writeProject(path, project);
-        require(readProject(path).simulation.settings.acousticRegions.front().needsAssignmentReview,
+        require(readProject(path)
+                    .simulation.settings.acousticModel.domains.front()
+                    .needsAssignmentReview,
                 "CAD region review obligation did not survive project round trip");
     }
     auto stale = fullTestProject(ProjectSource::freecad);
@@ -2790,7 +2866,7 @@ void widebandEvidenceRoundTrip(const QTemporaryDir &directory) {
     writeProject(path, project);
     sameProject(readProject(path), project);
     const auto json = QJsonDocument::fromJson(bytes(path)).object();
-    require(json["version"].toInt() == 16,
+    require(json["version"].toInt() == 18,
             "Automatic evidence was written in a format an old reader can misinterpret.");
     for (const auto *field : {"residualEvaluation", "quadratureEvidence"}) {
         auto missing = json["simulation"]
@@ -2814,6 +2890,9 @@ void widebandEvidenceRoundTrip(const QTemporaryDir &directory) {
     earlierArchive.insert("version", 14);
     earlierArchive.remove("comparisonSnapshots");
     auto earlierSimulation = earlierArchive["simulation"].toObject();
+    auto earlierSettings = earlierSimulation["settings"].toObject();
+    earlierSettings.remove("acousticModel");
+    earlierSimulation.insert("settings", earlierSettings);
     auto earlierResult = earlierSimulation["result"].toObject();
     auto earlierFrequencies = earlierResult["frequencies"].toArray();
     for (qsizetype i = 0; i < earlierFrequencies.size(); ++i) {
@@ -3282,7 +3361,7 @@ void legacyFormatTest(const QTemporaryDir &directory) {
     const auto currentPath = directory.filePath("legacy-source.json");
     writeProject(currentPath, project);
     auto current = QJsonDocument::fromJson(bytes(currentPath)).object();
-    require(current["version"].toInt() == 16, "Projects must use integrated FMM format 16");
+    require(current["version"].toInt() == 18, "Projects must use acoustic model format 18");
     current.remove("slot");
     current = preWidebandArchive(current, 11);
     auto version8 = current;
@@ -3529,8 +3608,7 @@ void diffractionSlotRoundTrip(const QTemporaryDir &directory) {
     missingSlot.remove("slot");
     saveBytes(path, QJsonDocument(missingSlot).toJson());
     expectRejected([&] { (void)readProject(path); }, "Format 14 omitted required slot parameters");
-    auto format13 = original;
-    format13.insert("version", 13);
+    auto format13 = preWidebandArchive(original, 13);
     format13.remove("comparisonSnapshots");
     auto oldSlot = format13["slot"].toObject();
     for (const auto field : {"contour", "cornerRadius", "exit", "exitRadius"})
@@ -3541,8 +3619,7 @@ void diffractionSlotRoundTrip(const QTemporaryDir &directory) {
     expected13.parameters.slot.cornerRadius = DiffractionSlotParameters{}.cornerRadius;
     expected13.parameters.slot.exitRadius = DiffractionSlotParameters{}.exitRadius;
     sameProject(readProject(path), expected13);
-    auto old = missingSlot;
-    old.insert("version", 12);
+    auto old = preWidebandArchive(missingSlot, 12);
     old.remove("comparisonSnapshots");
     saveBytes(path, QJsonDocument(old).toJson());
     auto expected = project;
@@ -3571,8 +3648,7 @@ void asymmetricDraftRoundTrip(const QTemporaryDir &directory) {
         sameDraft(readProject(path).parameters, p);
     }
     auto original = QJsonDocument::fromJson(bytes(path)).object();
-    auto old = original;
-    old.insert("version", 10);
+    auto old = preWidebandArchive(original, 10);
     old.remove("comparisonSnapshots");
     old.remove("slot");
     old.remove("asymmetry");
@@ -3854,6 +3930,44 @@ void ctaExportContract() {
             "CTA export omitted metadata or empty incomplete values");
 }
 
+void symmetryInferenceContract() {
+    SurfaceMesh mesh;
+    mesh.vertices = {{0, 0, 0}, {.1, -.05, 0}, {.02, -.03, .1}};
+    const auto symmetry = inferXYSymmetry(mesh, 1e-6);
+    require(symmetry.firstNormal == Vec3{1, 0, 0} && symmetry.secondNormal == Vec3{0, -1, 0},
+            "Quarter-mesh retained halfspaces were inferred incorrectly.");
+    mesh.vertices.push_back({-.01, -.02, 0});
+    expectRejected([&] { (void)inferXYSymmetry(mesh, 1e-6); },
+                   "Mesh crossing an XY plane was accepted.");
+    mesh.vertices = {{0, 0, 0}, {0, -.05, .1}};
+    expectRejected([&] { (void)inferXYSymmetry(mesh, 1e-6); },
+                   "Ambiguous retained halfspace was accepted.");
+}
+void observerMaskContract() {
+    BemRequest request;
+    request.farField = FarFieldObservation{{}, 1};
+    request.exteriorBaffle = ExteriorBaffle{{}, {0, 0, 1}, 1e-6};
+    request.observers = {{0, 0, 1}, {1, 0, 0}, {0, 0, -1}};
+    request.observerValidity = exteriorObserverValidity(request);
+    require(request.observerValidity == std::vector<std::uint8_t>({1, 1, 0}),
+            "Wrong baffle observer mask.");
+    SimulationArchive archive;
+    archive.request = request;
+    auto result = std::make_shared<BemResult>();
+    BemFrequencyResult frequency;
+    frequency.frequency = 500;
+    BemExcitationResult excitation;
+    excitation.name = "source";
+    excitation.observerPressure = {{1, 0}, {2, 0}, {0, 0}};
+    excitation.observerValidity = request.observerValidity;
+    frequency.excitations.push_back(excitation);
+    result->frequencies.push_back(frequency);
+    archive.result = result;
+    const auto csv = resultCsv(archive);
+    require(csv.contains(";far_field;0;") && csv.contains(";far_field;1;") &&
+                !csv.contains(";far_field;2;"),
+            "CSV exported a masked observer.");
+}
 void resultMemoryEstimateContract() {
     ResultMemoryDimensions d{100, 60, 0, 147, 3, 10, 2, 1};
     const auto base = estimateResultBytes(d);
@@ -3886,15 +4000,27 @@ int main(int argc, char **argv) {
             std::cout << "Exported offline CAD geometry fixture without acoustic results.\n";
             return 0;
         }
+        const bool asymmetricOnly =
+            argc == 2 && QString::fromLocal8Bit(argv[1]) == "--asymmetric-only";
+        const bool slotOnly = argc == 2 && QString::fromLocal8Bit(argv[1]) == "--slot-only";
         const bool legacyOnly = argc == 2 && QString::fromLocal8Bit(argv[1]) == "--legacy-only";
         const bool regionsOnly =
             argc == 2 && QString::fromLocal8Bit(argv[1]) == "--subdomain-settings-only";
         const bool axisymmetricOnly =
             argc == 2 && QString::fromLocal8Bit(argv[1]) == "--axisymmetric-only";
-        require(argc == 1 || axisymmetricOnly || legacyOnly || regionsOnly,
+        require(argc == 1 || axisymmetricOnly || legacyOnly || regionsOnly || asymmetricOnly ||
+                    slotOnly,
                 "Unexpected project test arguments");
         QTemporaryDir directory;
         require(directory.isValid(), "Temporary project directory cannot be created");
+        if (slotOnly) {
+            diffractionSlotRoundTrip(directory);
+            return 0;
+        }
+        if (asymmetricOnly) {
+            asymmetricDraftRoundTrip(directory);
+            return 0;
+        }
         if (legacyOnly) {
             legacyFormatTest(directory);
             previousFormatRoundTrip(directory);
@@ -3918,6 +4044,8 @@ int main(int argc, char **argv) {
                 throw std::runtime_error(std::string(name) + ": " + e.what());
             }
         };
+        runStage("symmetryInferenceContract", [&] { symmetryInferenceContract(); });
+        runStage("observerMaskContract", [&] { observerMaskContract(); });
         runStage("resultMemoryEstimateContract", [&] { resultMemoryEstimateContract(); });
         runStage("roundTripTests", [&] { roundTripTests(directory); });
         runStage("coupledRoundTrip", [&] { coupledRoundTrip(directory); });

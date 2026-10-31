@@ -122,14 +122,21 @@ int main() {
         changed.cadReversedFaceIds = {1};
         require(!sameEditState(original, changed), "CAD orientation must enter history.");
         changed = original;
-        changed.acousticRegions = {{7, "Innen", {1}, {2}, false}};
+        changed.symmetryXYEnabled = true;
+        changed.symmetryPlaneTolerance = .000002;
+        require(!sameEditState(original, changed), "XY symmetry must enter history.");
+        changed = original;
+        changed.acousticModel = {
+            {{7, "Innen", BemDomainKind::interior, {1}}, {8, "Außen", BemDomainKind::exterior}},
+            {{1, "Öffnung", 7, 8, {2}}},
+            std::nullopt};
         require(!sameEditState(original, changed), "Adding an acoustic region must enter history.");
         auto regionEdit = changed;
-        regionEdit.acousticRegions.front().interfaceFaceIds = {3};
+        regionEdit.acousticModel.interfaces.front().faceIds = {3};
         require(!sameEditState(changed, regionEdit),
                 "Changing an interface assignment must enter history.");
         regionEdit = changed;
-        regionEdit.acousticRegions.front().needsAssignmentReview = true;
+        regionEdit.acousticModel.domains.front().needsAssignmentReview = true;
         require(!sameEditState(changed, regionEdit),
                 "Changing region review state must enter history.");
         changed = original;
@@ -140,7 +147,12 @@ int main() {
         changed.meshing.quality = {false, 10, 100};
         changed.draftReversedFaceIds = {5};
         changed.cadReversedFaceIds = {1};
-        changed.acousticRegions = {{7, "Innen", {1}, {2}, true}};
+        changed.acousticModel = {{{7, "Innen", BemDomainKind::interior, {1}, {}, true},
+                                  {8, "Außen", BemDomainKind::exterior}},
+                                 {{1, "Öffnung", 7, 8, {2}}},
+                                 std::nullopt};
+        changed.symmetryXYEnabled = true;
+        changed.symmetryPlaneTolerance = .000002;
         changed.parameters.asymmetricEnabled = true;
         changed.parameters.leftAngle = .3;
         changed.parameters.bottomProfile.k = .8;

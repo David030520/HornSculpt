@@ -270,6 +270,8 @@ __global__ void assembleRegular(const Panel *__restrict__ panels, int fluxCount,
                                 const Complex *__restrict__ flux, int excitationCount, double k,
                                 const unsigned *__restrict__ nearOffsets,
                                 const unsigned *__restrict__ nearTrials,
+                                const std::uint8_t *__restrict__ wholePanelDegrees,
+                                const galerkin::TriangleQuadraturePoint *__restrict__ nearRules,
                                 Complex *__restrict__ matrix, Complex *__restrict__ rhs,
                                 int *__restrict__ error, unsigned firstTrial, double tolerance,
                                 unsigned minimumDegree) {
@@ -298,6 +300,43 @@ __global__ void assembleRegular(const Panel *__restrict__ panels, int fluxCount,
     }
     if (begin < stop && nearTrials[begin] == trialIndex)
         return;
+    const auto acceptedDegree =
+        wholePanelDegrees
+            ? wholePanelDegrees[galerkin::unorderedPanelPairIndex(testIndex, trialIndex)]
+            : 0;
+    if (acceptedDegree) {
+        const auto *rule = nearRules + (acceptedDegree == 14 ? 16 : 0);
+        const unsigned count = acceptedDegree == 14 ? 64 : 16;
+        PairMoments moments{};
+        for (unsigned index = 0; index < count * count; ++index) {
+            const auto &x = rule[index / count], &y = rule[index % count];
+            galerkin::PairQuadraturePoint sample{};
+            for (unsigned i = 0; i < 3; ++i) {
+                sample.test[i] = x.barycentric[i];
+                sample.trial[i] = y.barycentric[i];
+            }
+            sample.weight = x.weight * y.weight;
+            const auto delta = pairDelta(test, trial, sample.test, sample.trial);
+            if (tolerance < 1e-5)
+                pairSample(moments, test, trial, sample, delta, k, false, error);
+            else {
+                MixedMoments one{};
+                mixedSample(one, delta, test, trial, sample.test, sample.trial,
+                            static_cast<float>(sample.weight) *
+                                static_cast<float>(4 * test.area * trial.area),
+                            k, 1.f / static_cast<float>(k), false, error);
+                const auto increment = promotedMoments(one);
+                moments.green = plus(moments.green, increment.green);
+                for (unsigned i = 0; i < 9; ++i)
+                    moments.matrix[i] = plus(moments.matrix[i], increment.matrix[i]);
+                for (unsigned i = 0; i < 3; ++i)
+                    moments.rhs[i] = plus(moments.rhs[i], increment.rhs[i]);
+            }
+        }
+        scatterPair(moments, test, trial, pressureCount, fluxCount, trialIndex, excitationCount, k,
+                    rowScale, flux, matrix, rhs, error);
+        return;
+    }
     const auto degree = galerkin::qualifiedRegularDegreeUnchecked(
         bounds[testIndex], bounds[trialIndex], k, tolerance, minimumDegree);
     if (!degree) {
@@ -703,8 +742,11 @@ std::complex<double> hostComplex(AccurateComplex value) {
 class CudaBemSolver::Implementation {
   public:
     explicit Implementation(SurfaceMesh value, CudaStorageOptions storageOptions,
-                            std::optional<BemSubdomainModel> model = {})
-        : storage(storageOptions), domainModel(std::move(model)), origin{},
+                            std::optional<BemSubdomainModel> model = {},
+                            std::optional<OrthogonalSymmetryPlanes> symmetry = {},
+                            std::optional<ExteriorBaffle> baffle = {})
+        : storage(storageOptions), domainModel(std::move(model)),
+          symmetryModel(std::move(symmetry)), baffleModel(std::move(baffle)), origin{},
           mesh(centered(std::move(value), origin)),
           space(domainModel ? galerkin::buildSpace(mesh) : validatedSpace(mesh)),
           baffledPlanCache(mesh), panels(pack(space)), stream(), blas(stream), solver(stream),
@@ -750,6 +792,7 @@ class CudaBemSolver::Implementation {
         deviceNear.reset();
         deviceNearOffsets.reset();
         deviceNearTrials.reset();
+        deviceWholePanelDegrees.reset();
         devicePatches.reset();
         deviceNearRules.reset();
         deviceGauss.reset();
@@ -840,6 +883,7 @@ class CudaBemSolver::Implementation {
             addBytes(plan.patches.size(), sizeof(galerkin::PairQuadraturePatch));
             addBytes(plan.nearOffsets.size(), sizeof(unsigned));
             addBytes(plan.nearTrials.size(), sizeof(unsigned));
+            addBytes(plan.wholePanelDegrees.size(), sizeof(std::uint8_t));
             addBytes(nearRules.size(), sizeof(galerkin::TriangleQuadraturePoint));
             addBytes(gauss.size(), sizeof(galerkin::GaussPoint));
         }
@@ -870,6 +914,9 @@ class CudaBemSolver::Implementation {
             deviceNearOffsets->upload(plan.nearOffsets, stream);
             deviceNearTrials = std::make_unique<DeviceArray<unsigned>>(plan.nearTrials.size());
             deviceNearTrials->upload(plan.nearTrials, stream);
+            deviceWholePanelDegrees =
+                std::make_unique<DeviceArray<std::uint8_t>>(plan.wholePanelDegrees.size());
+            deviceWholePanelDegrees->upload(plan.wholePanelDegrees, stream);
             devicePatches =
                 std::make_unique<QuadraturePatchArray>(plan.patches, stream, mappedPatches);
             deviceNearRules =
@@ -895,11 +942,14 @@ class CudaBemSolver::Implementation {
         const auto bytes = [](const auto &array) { return array ? array->bytes() : 0; };
         return devicePanels.bytes() + deviceMass.bytes() + deviceRowScale.bytes() +
                bytes(deviceSingular) + bytes(deviceNear) + bytes(deviceNearOffsets) +
-               bytes(deviceNearTrials) + bytes(devicePatches) + bytes(deviceRegular) +
-               bytes(deviceRegularBounds) + bytes(deviceNearRules) + bytes(deviceGauss);
+               bytes(deviceNearTrials) + bytes(deviceWholePanelDegrees) + bytes(devicePatches) +
+               bytes(deviceRegular) + bytes(deviceRegularBounds) + bytes(deviceNearRules) +
+               bytes(deviceGauss);
     }
     CudaStorageOptions storage;
     std::optional<BemSubdomainModel> domainModel;
+    std::optional<OrthogonalSymmetryPlanes> symmetryModel;
+    std::optional<ExteriorBaffle> baffleModel;
     // Declared before the registration so reverse destruction unregisters first.
     galerkin::InteractionPlan interactionPlan;
     Vec3 origin;
@@ -915,6 +965,7 @@ class CudaBemSolver::Implementation {
     std::unique_ptr<DeviceArray<PairJob>> deviceSingular;
     std::unique_ptr<DeviceArray<NearJob>> deviceNear;
     std::unique_ptr<DeviceArray<unsigned>> deviceNearOffsets, deviceNearTrials;
+    std::unique_ptr<DeviceArray<std::uint8_t>> deviceWholePanelDegrees;
     std::unique_ptr<QuadraturePatchArray> devicePatches;
     std::unique_ptr<DeviceArray<galerkin::TriangleQuadraturePoint>> deviceRegular;
     std::unique_ptr<DeviceArray<galerkin::RegularPanelBounds>> deviceRegularBounds;
@@ -941,6 +992,19 @@ CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, CudaStorageOptions storage)
 CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, CudaStorageOptions storage)
     : implementation_(
           std::make_unique<Implementation>(std::move(mesh), storage, std::move(model))) {}
+CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model,
+                             OrthogonalSymmetryPlanes symmetry, CudaStorageOptions storage)
+    : implementation_(std::make_unique<Implementation>(std::move(mesh), storage, std::move(model),
+                                                       std::move(symmetry))) {}
+CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model,
+                             OrthogonalSymmetryPlanes symmetry, ExteriorBaffle baffle,
+                             CudaStorageOptions storage)
+    : implementation_(std::make_unique<Implementation>(std::move(mesh), storage, std::move(model),
+                                                       std::move(symmetry), std::move(baffle))) {}
+CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, ExteriorBaffle baffle,
+                             CudaStorageOptions storage)
+    : implementation_(std::make_unique<Implementation>(std::move(mesh), storage, std::move(model),
+                                                       std::nullopt, std::move(baffle))) {}
 CudaBemSolver::~CudaBemSolver() = default;
 std::string CudaBemSolver::deviceDescription() {
     int count{};
@@ -958,6 +1022,15 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     auto &state = *implementation_;
     std::unique_lock lock(state.mutex);
     cancelled(stop);
+    if (request.symmetry != state.symmetryModel)
+        throw std::invalid_argument("BEM request and solver symmetry snapshots differ.");
+    if (request.exteriorBaffle != state.baffleModel)
+        throw std::invalid_argument("BEM request and solver exterior baffle snapshots differ.");
+    if (!request.observerValidity.empty() &&
+        (!request.subdomains || !request.exteriorBaffle || !request.farField ||
+         request.observerValidity.size() != request.observers.size()))
+        throw std::invalid_argument(
+            "Observer validity requires one entry per exterior-baffle far-field direction.");
     if (request.subdomains != state.domainModel)
         throw std::invalid_argument("BEM request and solver subdomain snapshots differ.");
     if (request.subdomains) {
@@ -1343,6 +1416,7 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
                     state.devicePanels.data(), nt, np, state.deviceRegular->data(),
                     state.deviceRegularBounds->data(), state.deviceRowScale.data(), flux.data(),
                     nrhs, k, state.deviceNearOffsets->data(), state.deviceNearTrials->data(),
+                    state.deviceWholePanelDegrees->data(), state.deviceNearRules->data(),
                     matrix.data(), rhs.data(), integrationError.data(),
                     static_cast<unsigned>(first), options.nearRelativeTolerance,
                     options.quadratureOrder);

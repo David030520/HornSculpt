@@ -206,7 +206,7 @@ class MainWindow final : public QMainWindow {
     std::shared_ptr<const SurfaceMesh> interfaceOverlaySource_;
     std::shared_ptr<const SurfaceMesh> interfaceOverlay_;
     std::set<std::uint32_t> interfaceOverlayFaceIds_;
-    std::vector<AcousticRegionDefinition> displayedAcousticRegions_;
+    AcousticModelDefinition displayedAcousticRegions_;
     bool interfaceOverlayFromResult_{};
     QDockWidget *analysisDock_{};
     QDockWidget *parameterDock_{};

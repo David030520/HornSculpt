@@ -285,7 +285,9 @@ std::vector<AngularLevel> displayedCut(const std::vector<double> &levelsDb, doub
     return levels;
 }
 bool sameDisplayDirections(const BemRequest &a, const BemRequest &b) {
-    if (a.infiniteBaffle != b.infiniteBaffle || a.subdomains != b.subdomains)
+    if (a.observerValidity != b.observerValidity || a.exteriorBaffle != b.exteriorBaffle ||
+        a.infiniteBaffle != b.infiniteBaffle || a.subdomains != b.subdomains ||
+        a.symmetry != b.symmetry)
         return false;
     if (a.observers.size() != b.observers.size() ||
         a.farField.has_value() != b.farField.has_value())
@@ -304,7 +306,9 @@ bool sameDisplayDirections(const BemRequest &a, const BemRequest &b) {
 }
 
 bool sameRequest(const BemRequest &a, const BemRequest &b) {
-    if (a.infiniteBaffle != b.infiniteBaffle || a.axisymmetric != b.axisymmetric)
+    if (a.observerValidity != b.observerValidity || a.exteriorBaffle != b.exteriorBaffle ||
+        a.infiniteBaffle != b.infiniteBaffle || a.axisymmetric != b.axisymmetric ||
+        a.symmetry != b.symmetry)
         return false;
     // An absent raster is the complete solve raster in earlier archives.
     const auto &aPlan =
@@ -368,7 +372,7 @@ struct SimulationDock::SolveJob {
     std::shared_ptr<const SurfaceMesh> mesh;
     std::vector<FaceVelocity> boundaryDefinitions;
     BemRequest request;
-    std::vector<AcousticRegionDefinition> acousticRegions;
+    AcousticModelDefinition acousticModel;
     MeshingOptions partitionOptions;
     std::shared_ptr<const GeometrySource> source;
     std::optional<AxisymmetricSamplingSettings> axisymmetricSampling;
@@ -526,20 +530,31 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
            "Gebiet; bei expliziten Interfaces müssen alle Öffnungen zugeordnet sein."));
     regions->setWhatsThis(regions->toolTip());
     solverControls->addWidget(regions);
-    connect(regions, &QPushButton::clicked, this, [this] {
-        std::map<std::uint32_t, QString> labels;
-        if (geometrySourceCurrent_ && geometrySource_ && geometrySource_->cad)
-            for (const auto &face : geometrySource_->cad->faces)
-                labels.emplace(face.id, face.label);
-        else if (meshCurrent_ && mesh_)
-            for (const auto &triangle : mesh_->triangles)
-                labels.emplace(triangle.faceId, QString::number(triangle.faceId));
-        AcousticRegionsDialog dialog(acousticRegions_, std::move(labels), this);
-        if (dialog.exec() != QDialog::Accepted || dialog.regions() == acousticRegions_)
-            return;
-        setAcousticRegions(dialog.regions());
-        if (onAcousticRegionsChanged)
-            onAcousticRegionsChanged();
+    connect(regions, &QPushButton::clicked, this, [this] { editAcousticRegions(); });
+    symmetryXY_ = new QCheckBox(tr("XY-Symmetrie"));
+    symmetryXY_->setObjectName("symmetryXY");
+    symmetryXY_->setToolTip(tr("Viertelmodell an x=0 und y=0 spiegeln. Die erhaltenen Halbseiten "
+                               "werden aus dem Netz eindeutig bestimmt."));
+    symmetryXY_->setWhatsThis(symmetryXY_->toolTip());
+    symmetryTolerance_ = number(
+        .001, .000001, 10, 6, " mm",
+        tr("Maximaler Abstand eines Knotens zur Symmetrieebene; intern in Metern."), content);
+    symmetryTolerance_->setObjectName("symmetryTolerance");
+    symmetryTolerance_->setEnabled(false);
+    solverControls->addWidget(symmetryXY_);
+    solverControls->addWidget(symmetryTolerance_);
+    connect(symmetryXY_, &QCheckBox::toggled, this, [this](bool enabled) {
+        symmetryTolerance_->setEnabled(enabled);
+        updateDomainControls();
+        controlsChanged();
+        if (onSymmetryChanged)
+            onSymmetryChanged();
+    });
+    connect(symmetryTolerance_, &QDoubleSpinBox::valueChanged, this, [this] {
+        updateDomainControls();
+        controlsChanged();
+        if (onSymmetryChanged)
+            onSymmetryChanged();
     });
     solverControls->addStretch();
     layout->addLayout(solverControls);
@@ -1227,6 +1242,7 @@ SimulationDock::~SimulationDock() {
     for (auto *child : findChildren<QObject *>())
         QObject::disconnect(child, nullptr, this, nullptr);
     onChanged = {};
+    onSymmetryChanged = {};
     onRealtimeChanged = {};
     onLemResultChanged = {};
     onFieldProbeModeChanged = {};
@@ -1394,6 +1410,7 @@ void SimulationDock::setGeometrySource(std::shared_ptr<const DraftGeometry> draf
                                        : nullptr;
     }
     geometrySourceCurrent_ = geometrySource_ && revision == currentRevision_;
+    updateDomainControls();
     updateResultQuality();
     solve_->setEnabled(!busy_ && hasCurrentGeometry() && hasExcitation());
     if (usesAxisymmetricGeometry() && geometrySourceCurrent_ && !busy_ && !result_)
@@ -1462,10 +1479,39 @@ void SimulationDock::setPartitionMeshingOptions(MeshingOptions options) {
     partitionOptions_ = std::move(options);
 }
 
-void SimulationDock::setAcousticRegions(std::vector<AcousticRegionDefinition> regions) {
-    if (acousticRegions_ == regions)
+void SimulationDock::editAcousticRegions(const std::vector<std::uint32_t> &selectedFaces) {
+    std::map<std::uint32_t, QString> labels;
+    if (geometrySourceCurrent_ && geometrySource_ && geometrySource_->cad)
+        for (const auto &face : geometrySource_->cad->faces)
+            labels.emplace(face.id, face.label);
+    else if (meshCurrent_ && mesh_)
+        for (const auto &triangle : mesh_->triangles)
+            labels.emplace(triangle.faceId, QString::number(triangle.faceId));
+    AcousticRegionsDialog dialog(acousticModel_, std::move(labels), this);
+    dialog.selectFaces(selectedFaces);
+    if (dialog.exec() != QDialog::Accepted || dialog.model() == acousticModel_)
         return;
-    acousticRegions_ = std::move(regions);
+    setAcousticModel(dialog.model());
+    if (onAcousticRegionsChanged)
+        onAcousticRegionsChanged();
+}
+void SimulationDock::setSymmetryXY(bool enabled, double toleranceMetres) {
+    if (!std::isfinite(toleranceMetres) || toleranceMetres < 1e-9 || toleranceMetres > .01)
+        throw std::invalid_argument("Symmetrietoleranz muss zwischen 0,000001 und 10 mm liegen.");
+    if (symmetryXY_->isChecked() == enabled &&
+        symmetryTolerance_->value() * .001 == toleranceMetres)
+        return;
+    const QSignalBlocker symmetryBlock(symmetryXY_), toleranceBlock(symmetryTolerance_);
+    symmetryXY_->setChecked(enabled);
+    symmetryTolerance_->setValue(toleranceMetres * 1000);
+    symmetryTolerance_->setEnabled(enabled);
+    updateDomainControls();
+    controlsChanged();
+}
+void SimulationDock::setAcousticModel(AcousticModelDefinition regions) {
+    if (acousticModel_ == regions)
+        return;
+    acousticModel_ = std::move(regions);
     controlsChanged();
 }
 
@@ -1494,6 +1540,24 @@ bool SimulationDock::hasExcitation() const {
 }
 
 void SimulationDock::updateDomainControls() {
+    if (symmetryXY_->isChecked()) {
+        const SurfaceMesh *source =
+            geometrySourceCurrent_ && geometrySource_ && geometrySource_->cad
+                ? &geometrySource_->cad->mesh
+                : (meshCurrent_ ? mesh_.get() : nullptr);
+        if (source) {
+            try {
+                const auto planes = inferXYSymmetry(*source, symmetryTolerance_->value() * .001);
+                symmetryXY_->setText(tr("XY (%1X / %2Y)")
+                                         .arg(planes.firstNormal.x > 0 ? "+" : "−",
+                                              planes.secondNormal.y > 0 ? "+" : "−"));
+            } catch (const std::invalid_argument &) {
+                symmetryXY_->setText(tr("XY · Halbseiten unklar"));
+            }
+        } else
+            symmetryXY_->setText(tr("XY · Netz fehlt"));
+    } else
+        symmetryXY_->setText(tr("XY-Symmetrie"));
     const bool reduced = usesAxisymmetricGeometry();
     axisymmetricControls_->setVisible(reduced);
     for (auto *control : {meridianLength_, meridianTolerance_, rotationalTolerance_})
@@ -1689,7 +1753,9 @@ SimulationArchive SimulationDock::archive() const {
           rotationalTolerance_->value() * 1e-6, static_cast<unsigned>(angularSectors_->value())},
          ctaSelection_,
          static_cast<unsigned>(singularOrder_->value()),
-         acousticRegions_},
+         acousticModel_,
+         symmetryXY_->isChecked(),
+         symmetryTolerance_->value() * .001},
         resultMesh_,
         resultRequest_,
         result_,
@@ -1699,7 +1765,7 @@ SimulationArchive SimulationDock::archive() const {
         resultAxisymmetricSampling_,
         result_ && resultCompletenessKnown_ ? std::optional{resultComplete_} : std::nullopt,
         resultSourceMesh_,
-        resultRegions_};
+        resultModel_};
 }
 
 void SimulationDock::cancelPendingJobs() {
@@ -1773,6 +1839,7 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
         !valid(s.targetToleranceDegrees, targetTolerance_) ||
         !valid(s.normalizationAngleDegrees, normalizationAngle_) ||
         !valid(s.observationDistance, observationDistance_) ||
+        !valid(s.symmetryPlaneTolerance * 1000, symmetryTolerance_) ||
         !valid(s.axisymmetricSampling.maximumLength * 1000, meridianLength_) ||
         !valid(s.axisymmetricSampling.chordTolerance * 1000, meridianTolerance_) ||
         !valid(s.axisymmetricSampling.rotationalTolerance * 1e6, rotationalTolerance_) ||
@@ -1789,12 +1856,17 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
                                        saved.request->interactionPlanFrequencies,
                                        saved.request->medium.soundSpeed);
         if (saved.request->subdomains) {
-            if (!saved.sourceMesh || saved.resultRegions.empty() ||
-                (saved.current && saved.resultRegions != s.acousticRegions))
+            if (!saved.sourceMesh || saved.resultModel.domains.empty() ||
+                (saved.current && saved.resultModel != s.acousticModel))
                 throw std::invalid_argument(
                     "Teilgebietsergebnis besitzt keinen passenden Quellsnapshot.");
-            validateAcousticPartition(*saved.mesh, *saved.request->subdomains);
-        } else if (saved.sourceMesh || !saved.resultRegions.empty())
+            if (saved.request->symmetry)
+                validateSymmetryAcousticPartition(
+                    *saved.mesh, *saved.request->subdomains, *saved.request->symmetry,
+                    saved.request->exteriorBaffle ? &*saved.request->exteriorBaffle : nullptr);
+            else
+                validateAcousticPartition(*saved.mesh, *saved.request->subdomains);
+        } else if (saved.sourceMesh || !saved.resultModel.domains.empty())
             throw std::invalid_argument("Teilgebiets-Quellsnapshot ohne Teilgebietsmodell.");
         const bool reduced = saved.request->axisymmetric.has_value();
         if (saved.axisymmetricSampling.has_value() != reduced ||
@@ -1875,7 +1947,13 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
     couplingNetwork_ = s.couplingNetwork;
     couplingEnabled_ = s.couplingEnabled;
     infiniteBaffle_ = s.infiniteBaffle;
-    acousticRegions_ = s.acousticRegions;
+    {
+        const QSignalBlocker symmetryBlock(symmetryXY_), toleranceBlock(symmetryTolerance_);
+        symmetryXY_->setChecked(s.symmetryXYEnabled);
+        symmetryTolerance_->setValue(s.symmetryPlaneTolerance * 1000);
+        symmetryTolerance_->setEnabled(s.symmetryXYEnabled);
+    }
+    acousticModel_ = s.acousticModel;
     angularResponses_->setSettings(s.angularResponses);
     acousticField_->setSettings(s.fieldDisplay);
     phaseResponses_->setSettings(s.phaseDisplay);
@@ -1897,7 +1975,7 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
     displayBaseline_.clear();
     resultMesh_ = saved.mesh;
     resultSourceMesh_ = saved.sourceMesh;
-    resultRegions_ = saved.resultRegions;
+    resultModel_ = saved.resultModel;
     resultRequest_ = saved.request;
     resultAxisymmetricSampling_ = saved.axisymmetricSampling;
     resultRevision_ = saved.revision;
@@ -1911,7 +1989,7 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
             const bool partitioned = solvedRequest.subdomains.has_value();
             if (partitioned)
                 current = resultSourceMesh_ && mesh_ && *resultSourceMesh_ == *mesh_ &&
-                          resultRegions_ == acousticRegions_;
+                          resultModel_ == acousticModel_;
             solvedRequest.subdomains.reset();
             current = current && sameRequest(solvedRequest, makeRequest());
         } catch (const std::exception &) {
@@ -1955,7 +2033,7 @@ void SimulationDock::updateDisplayEstimate() {
             const auto &excitation = frequency.excitations.front();
             auto &display = computed[frequency.frequency];
             display.onAxisDb =
-                excitation.observerPressure.empty()
+                (excitation.observerPressure.empty() || !observerValid(*resultRequest_, 0))
                     ? missing
                     : decibels(std::abs(excitation.observerPressure[0]), pressureReference);
             for (const auto &z : excitation.impedances)
@@ -1967,11 +2045,13 @@ void SimulationDock::updateDisplayEstimate() {
             if (angularSamples && excitation.observerPressure.size() == 1 + 2 * angularSamples) {
                 const auto offset = (angularCount - angularSamples) / 2;
                 for (std::size_t i = 0; i < angularSamples; ++i) {
-                    display.horizontalDb[offset + i] =
-                        decibels(std::abs(excitation.observerPressure[1 + i]), pressureReference);
-                    display.verticalDb[offset + i] =
-                        decibels(std::abs(excitation.observerPressure[1 + angularSamples + i]),
-                                 pressureReference);
+                    if (observerValid(*resultRequest_, 1 + i))
+                        display.horizontalDb[offset + i] = decibels(
+                            std::abs(excitation.observerPressure[1 + i]), pressureReference);
+                    if (observerValid(*resultRequest_, 1 + angularSamples + i))
+                        display.verticalDb[offset + i] =
+                            decibels(std::abs(excitation.observerPressure[1 + angularSamples + i]),
+                                     pressureReference);
                 }
             }
         }
@@ -2171,9 +2251,14 @@ void SimulationDock::updateFieldAndPhase(bool current) {
                 const auto &pressure = frequency.excitations.front().observerPressure;
                 if (pressure.size() == 1 + 2 * count)
                     for (std::size_t i = 0; i < count; ++i) {
-                        row.horizontal.push_back(angles[i] == 0 ? pressure[0] : pressure[1 + i]);
-                        row.vertical.push_back(angles[i] == 0 ? pressure[0]
-                                                              : pressure[1 + count + i]);
+                        const auto h = angles[i] == 0 ? 0 : 1 + i;
+                        const auto v = angles[i] == 0 ? 0 : 1 + count + i;
+                        const auto missing =
+                            std::complex<double>{std::numeric_limits<double>::quiet_NaN(), 0};
+                        row.horizontal.push_back(observerValid(*resultRequest_, h) ? pressure[h]
+                                                                                   : missing);
+                        row.vertical.push_back(observerValid(*resultRequest_, v) ? pressure[v]
+                                                                                 : missing);
                     }
             }
             rows.push_back(std::move(row));
@@ -2198,10 +2283,17 @@ void SimulationDock::updateAngularFrequencyPlots(bool current) {
                 if (pressure.size() == 1 + 2 * count) {
                     for (std::size_t i = 0; i < count; ++i) {
                         // The dedicated on-axis sample defines zero in both planes.
-                        const auto h = angles[i] == 0 ? pressure[0] : pressure[1 + i];
-                        const auto v = angles[i] == 0 ? pressure[0] : pressure[1 + count + i];
-                        row.horizontal.push_back({angles[i], soundPressureLevelDecibels(h)});
-                        row.vertical.push_back({angles[i], soundPressureLevelDecibels(v)});
+                        const auto h = angles[i] == 0 ? 0 : 1 + i;
+                        const auto v = angles[i] == 0 ? 0 : 1 + count + i;
+                        const auto missing = std::numeric_limits<double>::quiet_NaN();
+                        row.horizontal.push_back(
+                            {angles[i], observerValid(*resultRequest_, h)
+                                            ? soundPressureLevelDecibels(pressure[h])
+                                            : missing});
+                        row.vertical.push_back(
+                            {angles[i], observerValid(*resultRequest_, v)
+                                            ? soundPressureLevelDecibels(pressure[v])
+                                            : missing});
                     }
                 }
             }
@@ -2249,9 +2341,14 @@ BemRequest SimulationDock::makeRequest() const {
         infiniteBaffle_ ? infiniteBaffle_->exteriorDrivenMesh.triangles.size() : 0,
         velocities_.size(), static_cast<std::size_t>(count),
         couplingEnabled_ ? std::max<std::size_t>(1, lem::bemPorts(couplingNetwork_).size()) : 1,
-        realtimeEnabled_, acousticRegions_.empty() ? 0 : acousticRegions_.size() + 1);
+        realtimeEnabled_, acousticModel_.domains.empty() ? 0 : acousticModel_.domains.size());
     const auto settings = archive().settings;
     auto built = makeSimulationRequest(settings, velocities_, origin_, axis_);
+    if (settings.symmetryXYEnabled) {
+        if (!mesh_)
+            throw std::invalid_argument("XY-Symmetrie benötigt ein aktuelles Viertelnetz.");
+        built.symmetry = inferXYSymmetry(*mesh_, settings.symmetryPlaneTolerance);
+    }
     if (usesAxisymmetricGeometry() && resultRequest_ && resultRequest_->axisymmetric &&
         resultAxisymmetricSampling_ == settings.axisymmetricSampling &&
         resultRevision_ == currentRevision_) {
@@ -2278,7 +2375,7 @@ void SimulationDock::requestSolve() {
         std::sort(job->boundaryDefinitions.begin(), job->boundaryDefinitions.end(),
                   [](const FaceVelocity &a, const FaceVelocity &b) { return a.faceId < b.faceId; });
         job->request = std::move(request);
-        job->acousticRegions = acousticRegions_;
+        job->acousticModel = acousticModel_;
         job->partitionOptions = partitionOptions_;
         if (usesAxisymmetricGeometry()) {
             job->source = geometrySource_;
@@ -2414,12 +2511,13 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                     actualRequest.excitations.size() + (actualRequest.coupling ? 1 : 0),
                     job->realtime);
             }
-            if (!job->acousticRegions.empty()) {
+            if (!job->acousticModel.domains.empty()) {
                 if (!actualMesh)
                     throw std::invalid_argument(
                         "Teilgebiete benötigen ein aktuelles Qualitätsnetz.");
-                auto partition = partitionAcousticSurface(*actualMesh, job->acousticRegions,
-                                                          job->partitionOptions, stop);
+                auto partition = partitionAcousticSurface(
+                    *actualMesh, job->acousticModel, job->partitionOptions, stop,
+                    actualRequest.symmetry ? &*actualRequest.symmetry : nullptr);
                 actualMesh = std::make_shared<SurfaceMesh>(std::move(partition.mesh));
                 actualRequest.subdomains = std::move(partition.model);
                 requireResultMemory(
@@ -2441,11 +2539,24 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 solver.reset();
                 cachedMesh = actualMesh;
                 cachedDefinitions = job->boundaryDefinitions;
-                if (!stop.stop_requested())
-                    solver = actualRequest.subdomains
-                                 ? std::make_unique<CudaBemSolver>(*cachedMesh,
-                                                                   *actualRequest.subdomains)
-                                 : std::make_unique<CudaBemSolver>(*cachedMesh);
+                if (!stop.stop_requested()) {
+                    if (actualRequest.subdomains && actualRequest.symmetry &&
+                        actualRequest.exteriorBaffle)
+                        solver = std::make_unique<CudaBemSolver>(
+                            *cachedMesh, *actualRequest.subdomains, *actualRequest.symmetry,
+                            *actualRequest.exteriorBaffle);
+                    else if (actualRequest.subdomains && actualRequest.symmetry)
+                        solver = std::make_unique<CudaBemSolver>(
+                            *cachedMesh, *actualRequest.subdomains, *actualRequest.symmetry);
+                    else if (actualRequest.subdomains && actualRequest.exteriorBaffle)
+                        solver = std::make_unique<CudaBemSolver>(
+                            *cachedMesh, *actualRequest.subdomains, *actualRequest.exteriorBaffle);
+                    else if (actualRequest.subdomains)
+                        solver =
+                            std::make_unique<CudaBemSolver>(*cachedMesh, *actualRequest.subdomains);
+                    else
+                        solver = std::make_unique<CudaBemSolver>(*cachedMesh);
+                }
             }
             if (stop.stop_requested())
                 throw std::runtime_error("Berechnung abgebrochen");
@@ -2493,8 +2604,8 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                                 result_ = std::move(latest->result);
                                 resultMesh_ = actualMesh;
                                 resultSourceMesh_ =
-                                    job->acousticRegions.empty() ? nullptr : job->mesh;
-                                resultRegions_ = job->acousticRegions;
+                                    job->acousticModel.domains.empty() ? nullptr : job->mesh;
+                                resultModel_ = job->acousticModel;
                                 resultRequest_ = std::move(latest->request);
                                 resultAxisymmetricSampling_ = job->axisymmetricSampling;
                                 resultRevision_ = job->revision;
@@ -2585,8 +2696,8 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 }
                 result_ = result;
                 resultMesh_ = actualMesh;
-                resultSourceMesh_ = job->acousticRegions.empty() ? nullptr : job->mesh;
-                resultRegions_ = job->acousticRegions;
+                resultSourceMesh_ = job->acousticModel.domains.empty() ? nullptr : job->mesh;
+                resultModel_ = job->acousticModel;
                 resultRequest_ = actualRequest;
                 resultAxisymmetricSampling_ = job->axisymmetricSampling;
                 resultRevision_ = revision;

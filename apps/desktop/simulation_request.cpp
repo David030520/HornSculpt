@@ -2,6 +2,7 @@
 #include "baffle_exterior.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <set>
 #include <stdexcept>
@@ -35,6 +36,30 @@ long double estimateResultBytes(const ResultMemoryDimensions &d) {
                                      (sizeof(std::complex<double>) + sizeof(std::uint32_t));
     return static_cast<long double>(d.frequencies) *
            (boundary + domainTraces + static_cast<long double>(d.snapshots) * snapshot);
+}
+OrthogonalSymmetryPlanes inferXYSymmetry(const SurfaceMesh &mesh, double toleranceMetres) {
+    if (mesh.vertices.empty() || !std::isfinite(toleranceMetres) || toleranceMetres < 1e-9 ||
+        toleranceMetres > .01)
+        throw std::invalid_argument(
+            "Symmetrie benötigt ein gültiges Netz und eine gültige Toleranz.");
+    double minX = std::numeric_limits<double>::infinity(), maxX = -minX;
+    double minY = minX, maxY = -minX;
+    for (const auto &v : mesh.vertices) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+            throw std::invalid_argument("Symmetrienetz enthält nicht endliche Koordinaten.");
+        minX = std::min(minX, v.x);
+        maxX = std::max(maxX, v.x);
+        minY = std::min(minY, v.y);
+        maxY = std::max(maxY, v.y);
+    }
+    const auto side = [toleranceMetres](double low, double high) {
+        const bool positive = high > toleranceMetres, negative = low < -toleranceMetres;
+        if (positive == negative)
+            throw std::invalid_argument(
+                "Das Netz muss je Symmetrieebene eindeutig auf genau einer Seite liegen.");
+        return positive ? 1. : -1.;
+    };
+    return {{0, 0, 0}, {side(minX, maxX), 0, 0}, {0, side(minY, maxY), 0}, toleranceMetres};
 }
 bool hasBoundInterfacePorts(const lem::Network &network) {
     return std::any_of(network.elements.begin(), network.elements.end(), [](const auto &element) {
@@ -78,14 +103,48 @@ AcousticFrame simulationFrame(const SimulationSettings &settings, Vec3 sourceOri
                                      : defaultAcousticFrame(sourceOrigin, sourceAxis);
 }
 
+std::vector<std::uint8_t> exteriorObserverValidity(const BemRequest &request) {
+    if (!request.exteriorBaffle)
+        return {};
+    if (!request.farField)
+        throw std::invalid_argument("Schallwand benötigt Fernfeldbeobachter.");
+    const auto n = request.exteriorBaffle->normal;
+    const double nLength = std::hypot(n.x, n.y, n.z);
+    if (!std::isfinite(nLength) || std::abs(nLength - 1.) > 1e-8)
+        throw std::invalid_argument("Ungültige Schallwandnormale.");
+    std::vector<std::uint8_t> mask;
+    mask.reserve(request.observers.size());
+    for (const auto &point : request.observers) {
+        const auto direction = added(point, scaled(request.farField->origin, -1));
+        const double length = std::hypot(direction.x, direction.y, direction.z);
+        if (!std::isfinite(length) || length <= 0)
+            throw std::invalid_argument("Ungültige Fernfeldrichtung.");
+        const double projection =
+            (direction.x * n.x + direction.y * n.y + direction.z * n.z) / length;
+        mask.push_back(projection >= -64 * std::numeric_limits<double>::epsilon() ? 1 : 0);
+    }
+    return mask;
+}
 BemRequest makeSimulationRequest(const SimulationSettings &s,
                                  std::span<const FaceVelocity> velocities, Vec3 origin, Vec3 axis) {
     validateAxisymmetricSamplingSettings(s.axisymmetricSampling);
-    if (std::any_of(s.acousticRegions.begin(), s.acousticRegions.end(),
-                    [](const auto &r) { return r.needsAssignmentReview; }))
+    if (!std::isfinite(s.symmetryPlaneTolerance) || s.symmetryPlaneTolerance < 1e-9 ||
+        s.symmetryPlaneTolerance > .01)
+        throw std::invalid_argument("Ungültige Symmetrietoleranz.");
+    if (s.symmetryXYEnabled &&
+        (s.acousticModel.domains.empty() || s.geometryMode != BemGeometryMode::threeDimensional ||
+         s.acceleration != BemAcceleration::dense || !s.farField || s.couplingEnabled))
+        throw std::invalid_argument("XY-Symmetrie benötigt Teilgebiete, 3D, dichten Solver und "
+                                    "Fernfeld ohne LEM-Kopplung.");
+    if (s.acousticModel.exteriorBaffle && !s.symmetryXYEnabled)
+        throw std::invalid_argument("Die Außenraum-Schallwand benötigt XY-Symmetrie.");
+    if ((std::any_of(s.acousticModel.domains.begin(), s.acousticModel.domains.end(),
+                     [](const auto &r) { return r.needsAssignmentReview; }) ||
+         std::any_of(s.acousticModel.interfaces.begin(), s.acousticModel.interfaces.end(),
+                     [](const auto &i) { return i.needsAssignmentReview; })))
         throw std::invalid_argument(
             "Teilgebietsflächen müssen nach dem Geometriewechsel geprüft werden.");
-    if (!s.acousticRegions.empty() &&
+    if (!s.acousticModel.domains.empty() &&
         (s.infiniteBaffle || s.geometryMode != BemGeometryMode::threeDimensional ||
          s.acceleration != BemAcceleration::dense))
         throw std::invalid_argument("Teilgebiete unterstützen derzeit nur 3D mit dichtem Solver "
@@ -130,6 +189,7 @@ BemRequest makeSimulationRequest(const SimulationSettings &s,
     axis = frame.forward;
     BemRequest request;
     request.infiniteBaffle = s.infiniteBaffle;
+    request.exteriorBaffle = s.acousticModel.exteriorBaffle;
     if (s.farField)
         request.farField = FarFieldObservation{origin, s.observationDistance};
     request.medium = s.medium;
@@ -187,6 +247,7 @@ BemRequest makeSimulationRequest(const SimulationSettings &s,
                 added(origin, added(scaled(axis, s.observationDistance * std::cos(angle)),
                                     scaled(transverse, s.observationDistance * std::sin(angle)))));
         }
+    request.observerValidity = exteriorObserverValidity(request);
     return request;
 }
 } // namespace hornsculpt

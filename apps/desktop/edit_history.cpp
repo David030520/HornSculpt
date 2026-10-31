@@ -61,7 +61,9 @@ bool sameCadGeometry(const std::optional<CadAssignmentState> &a,
                       std::tie(b->documentId, b->sessionId, b->revision));
 }
 bool sameEditState(const EditState &a, const EditState &b) {
-    if (a.acousticRegions != b.acousticRegions || a.couplingEnabled != b.couplingEnabled ||
+    if (a.symmetryXYEnabled != b.symmetryXYEnabled ||
+        a.symmetryPlaneTolerance != b.symmetryPlaneTolerance ||
+        a.acousticModel != b.acousticModel || a.couplingEnabled != b.couplingEnabled ||
         a.couplingNetwork != b.couplingNetwork)
         return false;
     if (a.assembly != b.assembly || !sameParameters(a.parameters, b.parameters) ||

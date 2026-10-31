@@ -53,7 +53,10 @@ class SimulationDock final : public QDockWidget {
     AcousticFrame observationFrame() const;
     void setCoupling(lem::Network network, bool enabled);
     void setInfiniteBaffle(std::optional<InfiniteBaffle> baffle);
-    void setAcousticRegions(std::vector<AcousticRegionDefinition> regions);
+    void setAcousticModel(AcousticModelDefinition regions);
+    void editAcousticRegions(const std::vector<std::uint32_t> &selectedFaces = {});
+    void setSymmetryXY(bool enabled, double toleranceMetres);
+    std::function<void()> onSymmetryChanged;
     void setPartitionMeshingOptions(MeshingOptions options);
     std::function<void()> onAcousticRegionsChanged;
     void setFrequencySweep(double minimum, double maximum, std::size_t count);
@@ -137,7 +140,7 @@ class SimulationDock final : public QDockWidget {
     std::shared_ptr<const BemResult> result_;
     std::shared_ptr<const SurfaceMesh> resultMesh_;
     std::shared_ptr<const SurfaceMesh> resultSourceMesh_;
-    std::vector<AcousticRegionDefinition> resultRegions_;
+    AcousticModelDefinition resultModel_;
     std::optional<BemRequest> resultRequest_;
     std::optional<AxisymmetricSamplingSettings> resultAxisymmetricSampling_;
     std::shared_ptr<const GeometrySource> geometrySource_;
@@ -148,7 +151,7 @@ class SimulationDock final : public QDockWidget {
     lem::Network couplingNetwork_;
     bool couplingEnabled_{};
     std::optional<InfiniteBaffle> infiniteBaffle_;
-    std::vector<AcousticRegionDefinition> acousticRegions_;
+    AcousticModelDefinition acousticModel_;
     MeshingOptions partitionOptions_;
     FastMultipoleSettings fastMultipoleSettings_;
     std::uint64_t currentRevision_{};
@@ -175,6 +178,8 @@ class SimulationDock final : public QDockWidget {
     QDoubleSpinBox *minimumFrequency_{};
     QDoubleSpinBox *maximumFrequency_{};
     QSpinBox *frequencyCount_{};
+    QCheckBox *symmetryXY_{};
+    QDoubleSpinBox *symmetryTolerance_{};
     QCheckBox *fastMultipole_{};
     QSpinBox *multipoleLeafCapacity_{};
     QComboBox *multipoleJacobiBlock_{};

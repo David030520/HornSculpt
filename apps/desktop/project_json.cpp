@@ -276,7 +276,7 @@ void decodeDraft(const QJsonObject &root, Project &project) {
     const auto os = object(root["profile"]);
     auto horizontal = os;
     horizontal.remove("vertical");
-    const auto version = integer(root["version"], 16);
+    const auto version = integer(root["version"], 18);
     const bool oldFormat = version < 4;
     if (oldFormat) {
         keys(horizontal, {"throatRadius", "length", "throatAngle", "k", "terminationScale",

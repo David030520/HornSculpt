@@ -12,8 +12,8 @@
 #include <cmath>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
-#include <hornsculpt/meshing.hpp>
 #include <hornsculpt/field_evaluation.hpp>
+#include <hornsculpt/meshing.hpp>
 #include <hornsculpt/surface_measures.hpp>
 #include <limits>
 #include <map>
@@ -152,7 +152,8 @@ assemblePairs(const Panel *panels, unsigned panelCount, unsigned pressureCount, 
               double k, const galerkin::TriangleQuadraturePoint *regular, unsigned regularCount,
               const galerkin::GaussPoint *gauss, unsigned singularOrder,
               const galerkin::NearInteraction *near, const unsigned *nearOffsets,
-              const unsigned *nearTrials, const galerkin::PairQuadraturePatch *patches,
+              const unsigned *nearTrials, const std::uint8_t *wholePanelDegrees,
+              const galerkin::PairQuadraturePatch *patches,
               const galerkin::TriangleQuadraturePoint *nearRules, unsigned baseCount,
               unsigned highCount, Complex *matrix, Complex *rhs, int *error, unsigned firstTrial) {
     const unsigned ti = blockIdx.x, si = firstTrial + blockIdx.y;
@@ -215,9 +216,15 @@ assemblePairs(const Panel *panels, unsigned panelCount, unsigned pressureCount, 
                 }
             }
         } else {
-            for (unsigned index = threadIdx.x; index < regularCount * regularCount;
-                 index += blockDim.x) {
-                const auto &x = regular[index / regularCount], &y = regular[index % regularCount];
+            const auto acceptedDegree =
+                wholePanelDegrees ? wholePanelDegrees[galerkin::unorderedPanelPairIndex(ti, si)]
+                                  : 0;
+            const auto *rule =
+                acceptedDegree ? nearRules + (acceptedDegree == 14 ? baseCount : 0) : regular;
+            const auto count =
+                acceptedDegree ? (acceptedDegree == 14 ? highCount : baseCount) : regularCount;
+            for (unsigned index = threadIdx.x; index < count * count; index += blockDim.x) {
+                const auto &x = rule[index / count], &y = rule[index % count];
                 galerkin::PairQuadraturePoint point{};
                 for (unsigned i = 0; i < 3; ++i) {
                     point.test[i] = x.barycentric[i];
@@ -472,8 +479,8 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
     const bool hasExterior = !exteriorMesh.triangles.empty();
     if (hasExterior && request.axisymmetric)
         throw std::invalid_argument("Separate exterior sources currently require full 3D BEM.");
-    bem_detail::validateBaffleExteriorMesh(mesh, exteriorMesh,
-                                         sub(plane.origin, worldOrigin), plane.normal);
+    bem_detail::validateBaffleExteriorMesh(mesh, exteriorMesh, sub(plane.origin, worldOrigin),
+                                           plane.normal);
     const auto exteriorSpace = hasExterior ? galerkin::buildSpace(exteriorMesh) : galerkin::Space{};
     const auto exteriorCount = exteriorSpace.panels.size();
     std::vector<unsigned> pressureDofs(space.vertices.size()), fluxDofs(space.panels.size());
@@ -718,6 +725,8 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
     dno.upload(plan.nearOffsets);
     Device<unsigned> dnt(plan.nearTrials.size());
     dnt.upload(plan.nearTrials);
+    Device<std::uint8_t> dwhole(plan.wholePanelDegrees.size());
+    dwhole.upload(plan.wholePanelDegrees);
     Device<galerkin::PairQuadraturePatch> dpatch(plan.patches.size());
     dpatch.upload(plan.patches);
     Device<Vec3> dob(observers.size());
@@ -774,10 +783,10 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
         request.axisymmetric ? BemGeometryMode::axisymmetric : BemGeometryMode::threeDimensional;
     output.peakDeviceBytes =
         dp.bytes() + da.bytes() + ds.bytes() + dr.bytes() + dnr.bytes() + dfr.bytes() + dg.bytes() +
-        dn.bytes() + dno.bytes() + dnt.bytes() + dpatch.bytes() + dob.bytes() + matrix.bytes() +
-        factor.bytes() + rhs.bytes() + solution.bytes() + residual.bytes() + correction.bytes() +
-        flux.bytes() + fields.bytes() + pivots.bytes() + info.bytes() + error.bytes() +
-        workspace.bytes() + (ringAssembly ? ringAssembly->bytes() : 0);
+        dn.bytes() + dno.bytes() + dnt.bytes() + dwhole.bytes() + dpatch.bytes() + dob.bytes() +
+        matrix.bytes() + factor.bytes() + rhs.bytes() + solution.bytes() + residual.bytes() +
+        correction.bytes() + flux.bytes() + fields.bytes() + pivots.bytes() + info.bytes() +
+        error.bytes() + workspace.bytes() + (ringAssembly ? ringAssembly->bytes() : 0);
     const unsigned pc = static_cast<unsigned>(pressureCount),
                    tc = static_cast<unsigned>(panelCount), dim = static_cast<unsigned>(count),
                    nrhs = static_cast<unsigned>(rhsCount);
@@ -801,11 +810,12 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                 }
             }
         const auto assemblyStart = Clock::now();
-        const auto exteriorOperator = hasExterior
-            ? bem_detail::baffleExteriorOperator(space, aperturePanels, exteriorSpace, n, k, stop)
-            : bem_detail::BaffleExteriorOperator{};
+        const auto exteriorOperator =
+            hasExterior ? bem_detail::baffleExteriorOperator(space, aperturePanels, exteriorSpace,
+                                                             n, k, stop)
+                        : bem_detail::BaffleExteriorOperator{};
         const auto exteriorPressure = [&](const std::vector<Complex> &values, std::size_t r,
-                                         const auto &sourceVelocities) {
+                                          const auto &sourceVelocities) {
             std::vector<std::complex<double>> pressure(exteriorCount);
             for (std::size_t e = 0; e < exteriorCount; ++e) {
                 for (std::size_t a = 0; a < aperturePanels.size(); ++a)
@@ -834,7 +844,7 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                 assemblePairs<<<dim3(tc, std::min(16u, tc - first)), 64>>>(
                     dp.data(), tc, pc, dim, da.data(), ds.data(), flux.data(), nrhs, k, dr.data(),
                     static_cast<unsigned>(regular.size()), dg.data(), n.singularOrder, dn.data(),
-                    dno.data(), dnt.data(), dpatch.data(), dnr.data(),
+                    dno.data(), dnt.data(), dwhole.data(), dpatch.data(), dnr.data(),
                     static_cast<unsigned>(baseCount), static_cast<unsigned>(high.size()),
                     matrix.data(), rhs.data(), error.data(), first);
                 check(cudaDeviceSynchronize(), "Baffled pair assembly");
@@ -855,7 +865,8 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                         const auto found = velocities[r].find(exteriorSpace.panels[e].faceId);
                         if (found != velocities[r].end())
                             value += exteriorSpace.panels[e].area *
-                                exteriorOperator.cross[e * aperturePanels.size() + a] * found->second;
+                                     exteriorOperator.cross[e * aperturePanels.size() + a] *
+                                     found->second;
                     }
                     value *= std::complex<double>{0, 2 * request.medium.density * omega} *
                              scales[pressureCount + a];
@@ -987,11 +998,13 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                     const auto port = couplingBasis->panelPorts[t];
                     if (port < 0)
                         continue;
-                    const auto weighted = panelAreas[t] * couplingBasis->panelVelocities[t] * pressure[e];
+                    const auto weighted =
+                        panelAreas[t] * couplingBasis->panelVelocities[t] * pressure[e];
                     if (r < knownCount)
                         load.blockedPressure[port] += weighted;
                     else
-                        load.impedance[static_cast<std::size_t>(port) * portCount + r - knownCount] += weighted;
+                        load.impedance[static_cast<std::size_t>(port) * portCount + r -
+                                       knownCount] += weighted;
                 }
             }
             lemSolution = lem::solve(*request.coupling, frequency.frequency, load,
@@ -1084,7 +1097,7 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                 boundary.surfacePressure.push_back(mean);
                 if (apertureIndex[t] >= 0)
                     boundary.normalDerivative.push_back(k *
-                                                      host(x[pc + apertureIndex[t] + r * count]));
+                                                        host(x[pc + apertureIndex[t] + r * count]));
                 else {
                     const auto found = actualVelocities.find(space.panels[t].faceId);
                     boundary.normalDerivative.push_back(
@@ -1127,32 +1140,38 @@ BemResult solveBaffledCavity(const SurfaceMesh &mesh, Vec3 worldOrigin, const Be
                         throw std::runtime_error("Coupled exterior field quadrature failed.");
                     result.observerPressure.push_back(sample.pressure);
                 }
-            } else for (std::size_t o = 0; o < observers.size(); ++o) {
-                auto value = host(field[o + r * observers.size()]);
-                if (hasExterior) {
-                    const auto direction = mul(sub(observers[o], farOrigin),
-                                               1 / length(sub(observers[o], farOrigin)));
-                    if (dot(direction, plane.normal) >= 0) {
-                        std::complex<double> direct{};
-                        for (const auto &panel : exteriorSpace.panels) {
-                            const auto found = actualVelocities.find(panel.faceId);
-                            if (found == actualVelocities.end())
-                                continue;
-                            for (const auto &point : fieldRule) {
-                                Vec3 y{};
-                                for (unsigned i = 0; i < 3; ++i)
-                                    y = add(y, mul(panel.vertices[i], point.barycentric[i]));
-                                direct += panel.area * point.weight / std::numbers::pi *
-                                          std::exp(std::complex<double>{0, k * dot(direction, sub(y, farOrigin))}) *
-                                          std::complex<double>{0, request.medium.density * omega} * found->second;
+            } else
+                for (std::size_t o = 0; o < observers.size(); ++o) {
+                    auto value = host(field[o + r * observers.size()]);
+                    if (hasExterior) {
+                        const auto direction = mul(sub(observers[o], farOrigin),
+                                                   1 / length(sub(observers[o], farOrigin)));
+                        if (dot(direction, plane.normal) >= 0) {
+                            std::complex<double> direct{};
+                            for (const auto &panel : exteriorSpace.panels) {
+                                const auto found = actualVelocities.find(panel.faceId);
+                                if (found == actualVelocities.end())
+                                    continue;
+                                for (const auto &point : fieldRule) {
+                                    Vec3 y{};
+                                    for (unsigned i = 0; i < 3; ++i)
+                                        y = add(y, mul(panel.vertices[i], point.barycentric[i]));
+                                    direct +=
+                                        panel.area * point.weight / std::numbers::pi *
+                                        std::exp(std::complex<double>{
+                                            0, k * dot(direction, sub(y, farOrigin))}) *
+                                        std::complex<double>{0, request.medium.density * omega} *
+                                        found->second;
+                                }
                             }
+                            value += direct *
+                                     std::exp(std::complex<double>{
+                                         0, -k * request.farField->referenceDistance}) /
+                                     request.farField->referenceDistance;
                         }
-                        value += direct * std::exp(std::complex<double>{0, -k * request.farField->referenceDistance}) /
-                                 request.farField->referenceDistance;
                     }
+                    result.observerPressure.push_back(value);
                 }
-                result.observerPressure.push_back(value);
-            }
             for (const auto &[face, port] : ports) {
                 const auto velocity = actualVelocities.at(face);
                 if (std::abs(velocity) == 0)

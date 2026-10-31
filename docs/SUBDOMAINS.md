@@ -9,7 +9,9 @@ eine vorgeschriebene Anregung: Der Druck ist stetig und die nach außen
 orientierten Normalableitungen sind gegensinnig.
 
 Ein gemeinsames konformes Dreiecksnetz beschreibt beide Seiten. Physische
-Flächen gehören genau einem Gebiet. Der gemeinsame Partitionsprüfer kontrolliert
+Flächen gehören einem Gebiet oder sind ausdrücklich als beidseitige physische
+Flächen zugeordnet. Deren Drücke bleiben auf beiden Seiten unabhängig.
+Der gemeinsame Partitionsprüfer kontrolliert
 Gebietszuordnung, Schnittflächen, Orientierung, geschlossene Gebietsränder und
 geometrische Überschneidungen. Eine Schnittfläche muss ausdrücklich vorgegeben
 sein: Der Abschluss einer Modelllücke wird nicht stillschweigend als Interface
@@ -47,12 +49,17 @@ Wall; Antriebsflächen werden in der Flächentabelle bewusst auf Driven gesetzt.
 Eine bestehende FreeCAD-Verbindung wird nicht automatisch beendet; vor dem
 Wechsel auf eine Gmsh-Quelle ist sie zu trennen.
 
-Unter **Akustik → Berechnung → Teilgebiete …** werden benannte endliche
-Innenräume definiert. Die native Tabelle enthält physische Wand-/Antriebsflächen
-und getrennte Interfaceflächen; die Flächenliste übernimmt Mehrfachauswahlen
-in die gewählte Zeile. Vorhandene Gebiets-IDs bleiben beim Bearbeiten erhalten.
-Abbrechen übernimmt keine Eingaben. Nicht zugeordnete physische Flächen gehören
-zum Außenraum. Numerisch gleiche Face-IDs eines anderen CAD-Dokuments sind
+Unter **Akustik → Berechnung → Teilgebiete …** oder **BEM-Teilgebiete …**
+in der Flächenansicht wird der Modellbaum bearbeitet. Innenräume, Außenraum
+und Interfaces besitzen eigene Namen und IDs. Jedes Interface nennt zwei
+verschiedene Gebiete. Benannte Elementgruppen unter diesen Einträgen fassen
+mehrere Flächen zusammen. Die Mehrfachauswahl aus der Flächentabelle wird
+vorselektiert; übernommen wird sie erst durch die ausdrückliche Zuordnung.
+Gruppennamen ändern keine Randbedingung. Gruppen bleiben disjunkte Teilmengen
+der tatsächlichen Flächenzuordnung.
+
+Abbrechen übernimmt keine Eingaben. Vorhandene IDs bleiben beim Bearbeiten
+erhalten. Numerisch gleiche Face-IDs eines anderen CAD-Dokuments sind
 keine Identität: Nach einem unklaren Flächenwechsel bleibt die Zuordnung
 sichtbar zur Prüfung markiert und blockiert die neue Rechnung.
 
@@ -61,8 +68,8 @@ sichtbar zur Prüfung markiert und blockiert die neue Rechnung.
   gemeinsame, konturtreu vernetzte transparente Schnittflächen. Die physische
   Quelle muss vorher bereits geschlossen und schnittfrei sein.
 - **Schon im Netz enthaltene Interfaceflächen:** Ihre IDs getrennt zuordnen.
-  Eine Zuordnung verbindet Innenraum und Außenraum, zwei Zuordnungen die
-  beiden Innenräume. Die Dreiecksnormale zeigt in das zuerst aufgeführte Gebiet;
+  Das Interface verbindet seine explizit gewählten Gebiete. Die Dreiecksnormale
+  zeigt in das als Gebiet 1 gewählte Gebiet;
   Normalenanzeige und bewusste Flächenumkehr verwenden. Alle Gebietsränder müssen
   einschließlich der angegebenen Interfaces vollständig geschlossen sein.
   Verbleibende Lücken werden nicht automatisch ergänzt.
@@ -85,6 +92,38 @@ Druck; die Fläche ist keine Materialwand. Physische LEM-Anschlüsse können
 nach dem unten beschriebenen Vertrag an verschiedene Gebiete gekoppelt werden.
 
 ## Numerischer Vertrag
+
+### Viertelsymmetrie und Außenraum-Schallwand
+
+**XY-Symmetrie** verwendet ein Viertelnetz mit Ebenen x=0 und y=0. Die
+behaltenen Halbseiten werden eindeutig aus dem Netz bestimmt und angezeigt;
+ein Netz auf beiden Seiten einer Ebene wird abgewiesen. Die metrische
+Ebenentoleranz ist ausdrücklich einstellbar. Nur interne Arbeitskoordinaten
+innerhalb dieses Budgets werden an einer Naht projiziert; die importierte
+Quelle bleibt erhalten. Es werden keine künstlichen Abschlussdreiecke erzeugt.
+
+Die **Schallwand des Außenraums** ist ein eigenes Objekt mit Ursprung,
+Normale in den abstrahlenden Halbraum und Ebenentoleranz. Sie erlaubt räumliche
+Interfaces mit offenem Rand auf der Ebene und ist vom bisherigen Vertrag einer
+planaren Rayleigh-Apertur zu unterscheiden. Der Außenraum verwendet zusätzlich
+den schallharten Spiegeloperator. Innenräume erhalten vier XY-Bildbeiträge,
+der Außenraum mit Schallwand bis zu acht. Singular- und Nahpaare an Ebenennaht
+und Kreuzungsachse berücksichtigen gemeinsame Bildknoten. Druckfreiheitsgrade
+bleiben im Sektor; ein vervierfachtes Solvernetz wird nicht aufgebaut.
+
+Der Desktoppfad unterstützt diese Kombination für 3D, dichten CUDA-Solver und
+Fernfeld mit symmetrischer vorgegebener Anregung. Endliche Feldpunkte und
+LEM-Kopplung werden für diesen speziellen Symmetrie-/Schallwandpfad abgewiesen.
+Die übrigen Einraum- und Mehrgebietsverträge behalten ihre jeweils dokumentierten
+Funktionen. Projektformat 18 speichert Gebiete, Interfaces, Gruppen, Ebenen und
+Ergebnissnapshot; ältere Formate werden beim Lesen migriert.
+
+Explizit beidseitige starre Driven-Flächen bewegen sich körperlich gemeinsam:
+die in die Luft gerichtete Geschwindigkeit der zweiten Seite erhält das
+Gegenzeichen. Ihre Last ist die Druckdifferenz, ihre Fläche wird physisch einmal
+gezählt. Im Viertelmodell beziehen sich Gesamtfluss und Volumenimpedanz auf
+das vollständige symmetrische Modell. Eine LEM-Druckdifferenzkopplung solcher
+beidseitigen Ports ist nicht freigegeben.
 
 Die Zeitkonvention ist `exp(+i ωt)`, die auslaufende Grundlösung lautet
 `G(r) = exp(−ikr)/(4πr)`. Die Normale `n` zeigt jeweils aus dem betrachteten
@@ -166,6 +205,21 @@ System; eine Leistungszusage folgt daraus nicht. AKABAK dient ausschließlich
 als externe Funktions- und Bedienreferenz und ist keine Produktabhängigkeit.
 
 ## Bisheriger Nachweis
+
+Für die neue Modellsteuerung bestanden native Dialog-/Undo-Prüfungen und der
+Windows-Ablauf eines Viertelmodells mit räumlichem Interface und Außenraum-
+Schallwand bis zur CUDA-Rechnung, Speicherung und aktuellen Wiederöffnung.
+Der Archivtest prüft alle 147 H/V-Beobachterplätze einschließlich gültiger
+und ungültiger Halbraumrichtungen. Maskierte Richtungen werden in Diagrammen
+und Export ausgelassen. Die vollständigen früheren Projektdateifälle blieben
+nach der Formatmigration lesbar.
+
+Ein offener Außenrand direkt auf der Schallwand wurde mit 64 Sektordreiecken
+gegen ein Vollmodell mit 256 Dreiecken bei 180, 550 und 1.200 Hz geprüft:
+komplexer Druck, Fernfeld und Impedanz stimmen innerhalb 0,1 % überein.
+Zusätzliche Prüfungen betreffen getrennte Drücke an beidseitigen Flächen,
+Sektorrandtopologie und unzulässige Masken. Die Übereinstimmung mit dem
+Vollmodell ersetzt keinen unabhängigen absoluten Netzkonvergenznachweis.
 
 Die folgenden Werte stammen aus tatsächlich ausgeführten Prüfungen des
 jeweiligen Entwicklungsstands auf einer NVIDIA RTX 5070 Laptop GPU:

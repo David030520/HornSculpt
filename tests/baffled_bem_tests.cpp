@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <galerkin/interaction_plan.hpp>
+#include <galerkin/space.hpp>
 #include <hornsculpt/axisymmetric_mesh.hpp>
 #include <hornsculpt/bem.hpp>
 #include <hornsculpt/field_evaluation.hpp>
@@ -137,7 +139,8 @@ void checkTrace(const SurfaceMesh &mesh, const BemExcitationResult &value,
                         (measures.pressureIntegrals[t][local] / measures.areas[t]);
             else
                 mean += value.boundary()->pressureTrace[triangle.vertices[local]] / 3.0;
-        require(mean == value.boundary()->surfacePressure[t], "Triangle mean loses its solved P1 trace.");
+        require(mean == value.boundary()->surfacePressure[t],
+                "Triangle mean loses its solved P1 trace.");
         if (triangle.faceId != apertureFace) {
             const auto found = velocities.find(triangle.faceId);
             const auto q =
@@ -145,7 +148,8 @@ void checkTrace(const SurfaceMesh &mesh, const BemExcitationResult &value,
                     ? std::complex<double>{}
                     : std::complex<double>{0, 2 * std::numbers::pi * frequency * medium.density} *
                           found->second;
-            require(std::abs(q - value.boundary()->normalDerivative[t]) <= 1e-14 * std::max(1.0, std::abs(q)),
+            require(std::abs(q - value.boundary()->normalDerivative[t]) <=
+                        1e-14 * std::max(1.0, std::abs(q)),
                     "Physical derivative trace uses an incorrect air-cavity normal.");
         }
     }
@@ -351,7 +355,8 @@ void interfaceCoupling() {
         Complex pressure{};
         for (std::size_t t = 0; t < mesh.triangles.size(); ++t)
             if (mesh.triangles[t].faceId == face)
-                pressure += panelArea(mesh.triangles[t]) * result.boundary()->surfacePressure[t] / areas[face];
+                pressure += panelArea(mesh.triangles[t]) * result.boundary()->surfacePressure[t] /
+                            areas[face];
         return pressure;
     };
     auto close = [&](Complex actual, Complex expected, double tolerance, const char *message) {
@@ -1054,6 +1059,43 @@ void axisymmetricSpace() {
     bad.excitations = {{"Azimuthal velocity", {{1, {1, 0}}, {4, {.5, 0}}}}};
     expectRejected(asymmetric, bad);
 }
+void compactQuadrature() {
+    const auto mesh = cylinder(8, 1, .006);
+    auto input = request();
+    input.frequencies = {5000};
+    galerkin::PairQuadratureSettings settings;
+    settings.relativeTolerance = input.numerics.nearRelativeTolerance;
+    settings.maximumSubdivisionDepth = input.numerics.nearMaximumDepth;
+    const double k = 2 * std::numbers::pi * input.frequencies.front() / input.medium.soundSpeed;
+    const auto plan = galerkin::makeInteractionPlan(galerkin::buildSpace(mesh), settings, k);
+    const auto count = std::count_if(plan.wholePanelDegrees.begin(), plan.wholePanelDegrees.end(),
+                                     [](auto degree) { return degree != 0; });
+    require(count > 0, "Baffled regression does not exercise compact full-panel rules.");
+    CudaBemSolver solver(mesh);
+    const auto actual = solver.solve(input);
+    auto strict = input;
+    strict.numerics.nearRelativeTolerance = 1e-6;
+    const auto reference = solver.solve(strict);
+    double worst{};
+    for (std::size_t e = 0; e < input.excitations.size(); ++e) {
+        const auto &a = actual.frequencies.front().excitations[e];
+        const auto &b = reference.frequencies.front().excitations[e];
+        require(a.boundaryResidual <= input.numerics.relativeResidualTolerance &&
+                    b.boundaryResidual <= strict.numerics.relativeResidualTolerance,
+                "Compact baffled rules failed the unchanged original-system residual.");
+        for (std::size_t i = 0; i < a.observerPressure.size(); ++i)
+            if (std::abs(b.observerPressure[i]) > 0)
+                worst =
+                    std::max(worst, std::abs(a.observerPressure[i] / b.observerPressure[i] - 1.));
+        worst = std::max(worst, std::abs(a.impedances.front().volumeImpedance /
+                                             b.impedances.front().volumeImpedance -
+                                         1.));
+    }
+    require(worst < 1e-4, "Compact baffled rules disagree with stricter adaptive quadrature.");
+    std::cout << "Compact baffled CUDA: " << count << " pairs, " << mesh.triangles.size()
+              << " triangles, complex field/impedance difference " << worst << '\n';
+}
+
 void rejectInvalid() {
     const auto mesh = cylinder(12, 2, .005);
     auto expect = [&](BemRequest input) {
@@ -1087,6 +1129,10 @@ void rejectInvalid() {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--compact-quadrature") {
+            compactQuadrature();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--plan-cache-only") {
             planCacheLifecycle();
             return 0;

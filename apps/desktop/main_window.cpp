@@ -12,6 +12,7 @@
 #include "project_assembly.hpp"
 #include "result_comparison.hpp"
 #include "simulation_dock.hpp"
+#include "simulation_request.hpp"
 #include "step_export_dialog.hpp"
 #include "step_import.hpp"
 #include <QAbstractItemDelegate>
@@ -811,6 +812,11 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         if (gmsh_)
             meshingChanged();
     };
+    simulationDock_->onSymmetryChanged = [this] {
+        rememberEdit(true);
+        if (gmsh_)
+            meshingChanged();
+    };
     simulationDock_->onObservationFrameChanged = [this] {
         viewport_->setObservationFrame(simulationDock_->observationFrame());
     };
@@ -835,6 +841,9 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         acceptCadSnapshot(std::move(snapshot));
     };
     cadDock_->onAssignmentEditStarted = [this] { flushEdit(); };
+    cadDock_->onEditBemRegions = [this] {
+        simulationDock_->editAcousticRegions(cadDock_->selectedFaces());
+    };
     cadDock_->onAvailabilityChanged = [this](bool available) { cadAvailabilityChanged(available); };
     cadDock_->onError = [this](QString error) {
         if (cadMode())
@@ -994,12 +1003,14 @@ MainWindow::~MainWindow() {
     meshPanel_->onFaceOrientationChanged = {};
     cadDock_->onSnapshotChanged = {};
     cadDock_->onAssignmentEditStarted = {};
+    cadDock_->onEditBemRegions = {};
     cadDock_->onAvailabilityChanged = {};
     cadDock_->onError = {};
     cadDock_->onFacesSelected = {};
     cadDock_->onFaceTargetChanged = {};
     simulationDock_->onChanged = {};
     simulationDock_->onAcousticRegionsChanged = {};
+    simulationDock_->onSymmetryChanged = {};
     simulationDock_->onRealtimeChanged = {};
     simulationDock_->onObservationFrameChanged = {};
     simulationDock_->onLemResultChanged = {};
@@ -1219,7 +1230,8 @@ void MainWindow::requestMesh() {
         const auto cad = cadMode() ? cadSnapshot_ : nullptr;
         const bool importedGmsh =
             gmsh_.has_value() && cad && cad->sessionId == "gmsh-import-offline";
-        const auto regions = simulationDock_->archive().settings.acousticRegions;
+        const auto simulationSettings = simulationDock_->archive().settings;
+        const auto regions = simulationSettings.acousticModel;
         if (cad)
             options.geometry = cad->geometry;
         meshBusy_ = true;
@@ -1228,7 +1240,8 @@ void MainWindow::requestMesh() {
         cancelAction_->setEnabled(true);
         setDiagnostic(importedGmsh ? tr("Importnetz prüfen …") : tr("Isotrope Vernetzung …"));
         meshWorker_.submit([this, snapshot, revision, epoch, jobId, options, reversed, cad,
-                            assemblyProject, importedGmsh, regions](std::stop_token stop) {
+                            assemblyProject, importedGmsh, regions,
+                            simulationSettings](std::stop_token stop) {
             std::shared_ptr<const MeshingResult> result;
             QString error;
             try {
@@ -1240,16 +1253,23 @@ void MainWindow::requestMesh() {
                             makeCadMeshingSource(*cad, options.adaptive.geometricTolerance, stop);
                         jobOptions.parameterization = source->parameters;
                     }
-                    auto generated =
+                    const auto importedMesh =
                         importedGmsh
-                            ? validateGmshMesh(reversed.empty()
-                                                   ? source->mesh
-                                                   : applyFaceOrientation(source->mesh, reversed),
-                                               regions, jobOptions, stop)
-                            : (assemblyProject
-                                   ? meshDraftAssembly(*assemblyProject, *snapshot, stop)
-                                   : remeshIsotropic(source ? source->mesh : *snapshot, jobOptions,
-                                                     stop));
+                            ? (reversed.empty() ? source->mesh
+                                                : applyFaceOrientation(source->mesh, reversed))
+                            : SurfaceMesh{};
+                    const auto symmetry =
+                        importedGmsh && simulationSettings.symmetryXYEnabled
+                            ? std::optional{inferXYSymmetry(
+                                  importedMesh, simulationSettings.symmetryPlaneTolerance)}
+                            : std::nullopt;
+                    auto generated =
+                        importedGmsh ? validateGmshMesh(importedMesh, regions, jobOptions, stop,
+                                                        symmetry ? &*symmetry : nullptr)
+                                     : (assemblyProject
+                                            ? meshDraftAssembly(*assemblyProject, *snapshot, stop)
+                                            : remeshIsotropic(source ? source->mesh : *snapshot,
+                                                              jobOptions, stop));
                     if (!importedGmsh && !assemblyProject && !reversed.empty()) {
                         try {
                             generated.mesh = applyFaceOrientation(generated.mesh, reversed);
@@ -1351,8 +1371,8 @@ void MainWindow::updateDisplay() {
             interfaceFaces.insert(port.faceIds.begin(), port.faceIds.end());
     }
     std::set<std::uint32_t> beInterfaces;
-    for (const auto &region : simulationState.settings.acousticRegions)
-        beInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+    for (const auto &interface : simulationState.settings.acousticModel.interfaces)
+        beInterfaces.insert(interface.faceIds.begin(), interface.faceIds.end());
     const bool computedInterfaces = simulationState.current && simulationState.request &&
                                     simulationState.request->subdomains.has_value();
     showInterfaces_->setEnabled(!interfaceFaces.empty() || !beInterfaces.empty() ||
@@ -1746,7 +1766,7 @@ void MainWindow::updateMeshStatus() {
             .arg(mesh_->mesh.triangles.size())
             .arg(meshRevision_ != revision_
                      ? tr(" · veraltet")
-                     : (gmsh_ && !simulationDock_->archive().settings.acousticRegions.empty()
+                     : (gmsh_ && !simulationDock_->archive().settings.acousticModel.domains.empty()
                             ? tr(" · Gebiete geprüft")
                             : tr(" · geschlossen")))
             .arg(locale().toString(mesh_->quality.minimumEdgeLength * 1000, 'f', 3)));
@@ -2850,9 +2870,9 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
     auto network =
         reconciledCadBemAssignments(lemEditor_->network(), cadSnapshot_.get(), snapshot.get());
     const bool removedPorts = !lem::samePhysics(network, lemEditor_->network());
-    auto regions = reconciledCadAcousticRegions(simulationDock_->archive().settings.acousticRegions,
-                                                cadSnapshot_.get(), snapshot.get());
-    const bool changedRegions = regions != simulationDock_->archive().settings.acousticRegions;
+    auto regions = reconciledCadAcousticModel(simulationDock_->archive().settings.acousticModel,
+                                              cadSnapshot_.get(), snapshot.get());
+    const bool changedRegions = regions != simulationDock_->archive().settings.acousticModel;
     cadFaceColors_ = retainedCadFaceColors(cadFaceColors_, cadSnapshot_.get(), snapshot.get());
     if (cadSnapshot_ && cadSnapshot_->documentId == snapshot->documentId) {
         // FreeCadLink carries an ID forward only after unique mapped-name,
@@ -2885,7 +2905,7 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
                           .arg(colorsBefore - cadFaceColors_.size()));
     cadSnapshot_ = snapshot;
     if (changedRegions) {
-        simulationDock_->setAcousticRegions(std::move(regions));
+        simulationDock_->setAcousticModel(std::move(regions));
         setDiagnostic(tr("Gebietszuordnungen nach CAD-Änderung prüfen."), true);
     }
     if (removedPorts) {
@@ -2921,7 +2941,7 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
     }
     const bool reusableMesh =
         sameGeometry && !changedRegions && mesh_ && meshRevision_ == revision_ &&
-        !(gmsh_ && !simulationDock_->archive().settings.acousticRegions.empty());
+        !(gmsh_ && !simulationDock_->archive().settings.acousticModel.domains.empty());
     ++revision_;
     geometryPending_ = false;
     meshWorker_.request_stop();
@@ -2957,9 +2977,11 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
     updateDisplay();
     if (newDocument)
         viewport_->fitView();
-    const auto currentRegions = simulationDock_->archive().settings.acousticRegions;
-    if (std::any_of(currentRegions.begin(), currentRegions.end(),
-                    [](const auto &region) { return region.needsAssignmentReview; }))
+    const auto currentRegions = simulationDock_->archive().settings.acousticModel;
+    if (std::any_of(currentRegions.domains.begin(), currentRegions.domains.end(),
+                    [](const auto &region) { return region.needsAssignmentReview; }) ||
+        std::any_of(currentRegions.interfaces.begin(), currentRegions.interfaces.end(),
+                    [](const auto &interface) { return interface.needsAssignmentReview; }))
         setDiagnostic(tr("Gebietszuordnungen nach CAD-Änderung prüfen."), true);
     else if (cadSnapshot_->hasUnresolvedAssignments())
         setDiagnostic(tr("Flächenzuordnungen prüfen."), true);
@@ -3211,8 +3233,8 @@ void MainWindow::configureLemFaces() {
     const auto simulationState = simulationDock_->archive();
     const auto baffle = simulationState.settings.infiniteBaffle;
     std::set<std::uint32_t> bemInterfaces;
-    for (const auto &region : simulationState.settings.acousticRegions)
-        bemInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+    for (const auto &interface : simulationState.settings.acousticModel.interfaces)
+        bemInterfaces.insert(interface.faceIds.begin(), interface.faceIds.end());
     for (const auto &[id, boundary] : groups) {
         if (bemInterfaces.contains(id))
             continue;
@@ -3246,8 +3268,8 @@ void MainWindow::updateInterfacePresentation() {
     }
     cadDock_->setInterfaceFaces(interfaces, lemEditor_->couplingEnabled());
     std::set<std::uint32_t> beInterfaces;
-    for (const auto &region : simulationDock_->archive().settings.acousticRegions)
-        beInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+    for (const auto &interface : simulationDock_->archive().settings.acousticModel.interfaces)
+        beInterfaces.insert(interface.faceIds.begin(), interface.faceIds.end());
     cadDock_->setBemInterfaceFaces(beInterfaces);
     if (cadMode()) {
         while (facesItem_->childCount())
@@ -3278,14 +3300,16 @@ void MainWindow::updateInterfacePresentation() {
 }
 
 void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
-    const auto &regions = archive.settings.acousticRegions;
+    const auto &regions = archive.settings.acousticModel;
     const bool computed = archive.current && archive.revision == revision_ && archive.mesh &&
                           archive.request && archive.request->subdomains;
     std::set<std::uint32_t> faces;
     bool review = false;
-    for (const auto &region : regions) {
-        faces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
-        review |= region.needsAssignmentReview;
+    for (const auto &domain : regions.domains)
+        review |= domain.needsAssignmentReview;
+    for (const auto &interface : regions.interfaces) {
+        faces.insert(interface.faceIds.begin(), interface.faceIds.end());
+        review |= interface.needsAssignmentReview;
     }
     const auto source =
         computed
@@ -3321,35 +3345,72 @@ void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
         }
         while (domainsItem_->childCount())
             delete domainsItem_->takeChild(0);
-        domainsItem_->setHidden(regions.empty());
-        if (computed) {
-            const auto &model = *archive.request->subdomains;
-            for (const auto &domain : model.domains)
-                new QTreeWidgetItem(domainsItem_, {tr("%1 · %2 · ID %3")
-                                                       .arg(QString::fromStdString(domain.name))
-                                                       .arg(domain.kind == BemDomainKind::interior
-                                                                ? tr("Innenraum")
-                                                                : tr("Außenraum"))
-                                                       .arg(domain.id)});
-            for (const auto &interface : model.interfaces)
-                new QTreeWidgetItem(domainsItem_, {tr("%1 · %2 ↔ %3")
-                                                       .arg(QString::fromStdString(interface.name))
-                                                       .arg(interface.firstDomainId)
-                                                       .arg(interface.secondDomainId)});
-        } else {
-            for (const auto &region : regions) {
+        domainsItem_->setHidden(regions.domains.empty());
+        {
+            for (const auto &domain : regions.domains) {
                 auto *item = new QTreeWidgetItem(
-                    domainsItem_, {QString::fromStdString(region.name) +
-                                   (region.needsAssignmentReview ? tr(" · Zuordnung prüfen")
-                                                                 : tr(" · noch nicht gerechnet"))});
-                QStringList physical, interfaces;
-                for (auto id : region.faceIds)
+                    domainsItem_,
+                    {QString::fromStdString(domain.name) +
+                     (domain.kind == BemDomainKind::interior ? tr(" · Innenraum")
+                                                             : tr(" · Außenraum")) +
+                     (domain.needsAssignmentReview ? tr(" · Zuordnung prüfen") : QString{})});
+                QStringList physical, twoSided;
+                for (auto id : domain.faceIds)
                     physical << QString::number(id);
-                for (auto id : region.interfaceFaceIds)
-                    interfaces << QString::number(id);
-                new QTreeWidgetItem(item, {tr("Wall / Driven: %1").arg(physical.join(", "))});
-                if (!interfaces.empty())
-                    new QTreeWidgetItem(item, {tr("Interface: %1").arg(interfaces.join(", "))});
+                for (auto id : domain.twoSidedFaceIds)
+                    twoSided << QString::number(id);
+                if (domain.kind == BemDomainKind::exterior && regions.exteriorBaffle) {
+                    const auto &b = *regions.exteriorBaffle;
+                    new QTreeWidgetItem(item, {tr("Unendliche Schallwand · Ursprung %1 / %2 / %3 "
+                                                  "mm · Normale %4 / %5 / %6 · Toleranz %7 mm")
+                                                   .arg(b.origin.x * 1000)
+                                                   .arg(b.origin.y * 1000)
+                                                   .arg(b.origin.z * 1000)
+                                                   .arg(b.normal.x)
+                                                   .arg(b.normal.y)
+                                                   .arg(b.normal.z)
+                                                   .arg(b.planeDistanceTolerance * 1000)});
+                }
+                if (!physical.empty())
+                    new QTreeWidgetItem(item, {tr("Wall / Driven: %1").arg(physical.join(", "))});
+                if (!twoSided.empty())
+                    new QTreeWidgetItem(item, {tr("Beidseitig: %1").arg(twoSided.join(", "))});
+                for (const auto &group : domain.groups) {
+                    QStringList members;
+                    for (auto id : group.faceIds)
+                        members << QString::number(id);
+                    new QTreeWidgetItem(item, {tr("%1: %2").arg(QString::fromStdString(group.name),
+                                                                members.join(", "))});
+                }
+            }
+            for (const auto &interface : regions.interfaces) {
+                const auto domainName = [&](std::uint32_t id) {
+                    const auto found = std::find_if(regions.domains.begin(), regions.domains.end(),
+                                                    [id](const auto &d) { return d.id == id; });
+                    return found == regions.domains.end() ? QString::number(id)
+                                                          : QString::fromStdString(found->name);
+                };
+                auto *item = new QTreeWidgetItem(
+                    domainsItem_,
+                    {tr("%1 · Subdomain 1: %2 · Subdomain 2: %3%4")
+                         .arg(QString::fromStdString(interface.name))
+                         .arg(domainName(interface.firstDomainId),
+                              domainName(interface.secondDomainId))
+                         .arg(interface.needsAssignmentReview ? tr(" · Zuordnung prüfen")
+                                                              : QString{})});
+                item->setToolTip(0, tr("Flächennormale zeigt in Subdomain 1; die zweite Seite "
+                                       "verwendet die Gegenrichtung."));
+                QStringList faces;
+                for (auto id : interface.faceIds)
+                    faces << QString::number(id);
+                new QTreeWidgetItem(item, {tr("Flächen: %1").arg(faces.join(", "))});
+                for (const auto &group : interface.groups) {
+                    QStringList members;
+                    for (auto id : group.faceIds)
+                        members << QString::number(id);
+                    new QTreeWidgetItem(item, {tr("%1: %2").arg(QString::fromStdString(group.name),
+                                                                members.join(", "))});
+                }
             }
         }
         domainsItem_->setExpanded(true);
@@ -3908,7 +3969,9 @@ EditState MainWindow::editState() const {
     state.cadReversedFaceIds = cadReversedFaceIds_;
     state.couplingNetwork = lemEditor_->network();
     state.couplingEnabled = lemEditor_->couplingEnabled();
-    state.acousticRegions = simulationDock_->archive().settings.acousticRegions;
+    state.acousticModel = simulationDock_->archive().settings.acousticModel;
+    state.symmetryXYEnabled = simulationDock_->archive().settings.symmetryXYEnabled;
+    state.symmetryPlaneTolerance = simulationDock_->archive().settings.symmetryPlaneTolerance;
     if (const auto cad = cadDock_->snapshot()) {
         state.cad = CadAssignmentState{
             cad->documentId, cad->sessionId, cad->revision, {}, cad->unresolvedPreviousFaces};
@@ -3976,10 +4039,15 @@ void MainWindow::resetEditHistory() {
 }
 void MainWindow::applyEditState(const EditState &state) {
     auto withoutCoupling = editState();
-    const bool regionsChanged = withoutCoupling.acousticRegions != state.acousticRegions;
+    const bool regionsChanged = withoutCoupling.acousticModel != state.acousticModel;
+    const bool symmetryChanged =
+        withoutCoupling.symmetryXYEnabled != state.symmetryXYEnabled ||
+        withoutCoupling.symmetryPlaneTolerance != state.symmetryPlaneTolerance;
     withoutCoupling.couplingNetwork = state.couplingNetwork;
     withoutCoupling.couplingEnabled = state.couplingEnabled;
-    withoutCoupling.acousticRegions = state.acousticRegions;
+    withoutCoupling.acousticModel = state.acousticModel;
+    withoutCoupling.symmetryXYEnabled = state.symmetryXYEnabled;
+    withoutCoupling.symmetryPlaneTolerance = state.symmetryPlaneTolerance;
     const bool onlyCoupling = sameEditState(withoutCoupling, state);
     const auto current = cadDock_->snapshot();
     if (state.cad.has_value() != static_cast<bool>(current) ||
@@ -3999,10 +4067,11 @@ void MainWindow::applyEditState(const EditState &state) {
         lemEditor_->setCouplingEnabled(state.couplingEnabled);
     }
     simulationDock_->setCoupling(state.couplingNetwork, state.couplingEnabled);
-    simulationDock_->setAcousticRegions(state.acousticRegions);
+    simulationDock_->setAcousticModel(state.acousticModel);
+    simulationDock_->setSymmetryXY(state.symmetryXYEnabled, state.symmetryPlaneTolerance);
     updateInterfacePresentation();
     if (onlyCoupling) {
-        if (gmsh_ && regionsChanged)
+        if (gmsh_ && (regionsChanged || symmetryChanged))
             meshingChanged();
         markDirty();
         historyState_ = state;

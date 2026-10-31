@@ -14,9 +14,9 @@
 #include <stdexcept>
 
 namespace hornsculpt {
-MeshingResult validateGmshMesh(const SurfaceMesh &mesh,
-                               std::span<const AcousticRegionDefinition> regions,
-                               const MeshingOptions &options, std::stop_token stop) {
+MeshingResult validateGmshMesh(const SurfaceMesh &mesh, const AcousticModelDefinition &model,
+                               const MeshingOptions &options, std::stop_token stop,
+                               const OrthogonalSymmetryPlanes *symmetry) {
     if (stop.stop_requested())
         throw std::runtime_error("Netzprüfung abgebrochen.");
     const auto quality = inspectMesh(mesh);
@@ -27,13 +27,16 @@ MeshingResult validateGmshMesh(const SurfaceMesh &mesh,
          quality.maximumAspectRatio > options.quality.maximumAspectRatio))
         throw std::invalid_argument(
             "Importnetz verletzt die eingestellten Winkel- oder Seitenverhältnisgrenzen.");
-    if (regions.empty()) {
+    if (model.domains.empty()) {
+        if (symmetry)
+            throw std::invalid_argument(
+                "XY-Symmetrie benötigt ausdrücklich zugeordnete Teilgebiete.");
         if (!quality.watertight() || quality.selfIntersectionPairs)
             throw std::invalid_argument(
                 "Importnetz ist nicht geschlossen, konsistent orientiert und überschneidungsfrei.");
         galerkin::validateExteriorComponents(mesh);
     } else {
-        (void)partitionAcousticSurface(mesh, regions, options, stop);
+        (void)partitionAcousticSurface(mesh, model, options, stop, symmetry);
     }
     return {mesh, quality};
 }

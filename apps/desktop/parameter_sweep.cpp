@@ -221,7 +221,7 @@ Project calculateVariant(const SweepStudy &study, std::size_t index, std::stop_t
     }
     checkStop(stop);
     auto settings = project.simulation.settings;
-    if (!settings.acousticRegions.empty())
+    if (!settings.acousticModel.domains.empty())
         throw std::invalid_argument("Parameterstudien unterstützen derzeit keine Teilgebiete.");
     if (!study.frequencyOverride.empty()) {
         settings.minimumFrequency = study.frequencyOverride.front();

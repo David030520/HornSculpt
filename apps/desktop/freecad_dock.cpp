@@ -203,6 +203,16 @@ FreeCadDock::FreeCadDock(QMainWindow *parent)
     assignments->addWidget(apply_);
     assignments->addWidget(confirm_);
     layout->addLayout(assignments);
+    bemRegions_ = new QPushButton(tr("BEM-Teilgebiete …"));
+    bemRegions_->setObjectName(QStringLiteral("cadBemRegions"));
+    bemRegions_->setToolTip(
+        tr("Teilgebiete und transparente BEM-Interfaces für diese Flächen zuordnen."));
+    bemRegions_->setWhatsThis(bemRegions_->toolTip());
+    layout->addWidget(bemRegions_);
+    connect(bemRegions_, &QPushButton::clicked, this, [this] {
+        if (onEditBemRegions)
+            onEditBemRegions();
+    });
     mapping_ = new QLabel;
     layout->addWidget(mapping_);
     missing_ = new QPushButton(tr("Entfallene Flächen bestätigen"));
@@ -398,6 +408,7 @@ void FreeCadDock::refresh() {
                      : link_.isListening() ? tr("Wartet auf FreeCAD · Port %1").arg(link_.port())
                                            : tr("FreeCAD · getrennt"));
     const auto current = link_.snapshot();
+    bemRegions_->setEnabled(bool(current) && isSourceAvailable());
     if (current && current->sessionId == "gmsh-import-offline")
         status_->setText(tr("Gmsh · importierte Polygonquelle · offline"));
     const auto selection = current && current->documentId == selectionDocumentId_

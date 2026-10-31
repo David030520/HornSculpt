@@ -105,9 +105,20 @@ int main(int argc, char **argv) {
         elapsed.start();
         const auto plan = galerkin::makeInteractionPlan(space, settings, maximumK);
         const auto planningMilliseconds = elapsed.nsecsElapsed() * 1e-6;
-        QJsonArray pairs;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> directedPairs;
         for (const auto &job : plan.near)
-            pairs.append(QJsonArray{static_cast<qint64>(job.test), static_cast<qint64>(job.trial)});
+            directedPairs.emplace_back(job.test, job.trial);
+        if (!plan.wholePanelDegrees.empty())
+            for (std::uint32_t trial = 1; trial < space.panels.size(); ++trial)
+                for (std::uint32_t test = 0; test < trial; ++test)
+                    if (plan.wholePanelDegrees[galerkin::unorderedPanelPairIndex(test, trial)]) {
+                        directedPairs.emplace_back(test, trial);
+                        directedPairs.emplace_back(trial, test);
+                    }
+        std::sort(directedPairs.begin(), directedPairs.end());
+        QJsonArray pairs;
+        for (const auto &[test, trial] : directedPairs)
+            pairs.append(QJsonArray{static_cast<qint64>(test), static_cast<qint64>(trial)});
         const QJsonObject report{
             {"schema", "hornsculpt-near-interaction-plan-1"},
             {"fixture_sha256",
@@ -122,7 +133,7 @@ int main(int argc, char **argv) {
             {"maximum_subdivision_depth", static_cast<int>(settings.maximumSubdivisionDepth)},
             {"planning_ms", planningMilliseconds},
             {"touching_jobs", static_cast<qint64>(plan.touching.size())},
-            {"directed_near_jobs", static_cast<qint64>(plan.near.size())},
+            {"directed_near_jobs", static_cast<qint64>(directedPairs.size())},
             {"shared_patches", static_cast<qint64>(plan.patches.size())},
             {"maximum_estimated_relative_error", plan.maximumEstimatedRelativeError}};
         QSaveFile output(parser.value("output"));
@@ -131,7 +142,7 @@ int main(int argc, char **argv) {
         require(output.write(serialized) == serialized.size() && output.commit(),
                 "Cannot write plan.");
         std::printf("Exported %zu directed near pairs, %zu shared patches in %.3f ms.\n",
-                    plan.near.size(), plan.patches.size(), planningMilliseconds);
+                    directedPairs.size(), plan.patches.size(), planningMilliseconds);
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

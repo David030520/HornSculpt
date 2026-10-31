@@ -1,4 +1,5 @@
 #include "subdomain_solver.hpp"
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
@@ -71,8 +72,9 @@ __global__ void assembleSamples(const SubdomainPanel *panels, const SubdomainPai
         }
     }
 }
-__global__ void assembleMass(const SubdomainPanel *panels, std::size_t count, unsigned dimension,
-                             double k, unsigned excitationCount, const cuDoubleComplex *knownFlux,
+__global__ void assembleMass(const SubdomainPanel *panels, std::size_t count,
+                             std::size_t fluxStride, unsigned dimension, double k,
+                             unsigned excitationCount, const cuDoubleComplex *knownFlux,
                              const double *rowScale, cuDoubleComplex *matrix, cuDoubleComplex *rhs,
                              int *error) {
     const auto t = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -91,7 +93,7 @@ __global__ void assembleMass(const SubdomainPanel *panels, std::size_t count, un
         }
         if (p.fluxColumns[0] < 0) {
             for (unsigned e = 0; e < excitationCount; ++e) {
-                const auto q = promoted(knownFlux[t + e * count]);
+                const auto q = promoted(knownFlux[t + e * fluxStride]);
                 const DoubleComplex coefficient{0, -rowScale[row] * p.panel.area / (6 * k)};
                 addValue(rhs + row + static_cast<std::size_t>(e) * dimension,
                          product(coefficient, q), error);
@@ -117,14 +119,16 @@ void assembleSubdomainSamples(const SubdomainPanel *panels, const SubdomainPairS
         rhs, error);
     checkLaunch("Subdomain pair assembly");
 }
-void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t count, unsigned dimension,
-                           double k, unsigned excitationCount, const cuDoubleComplex *knownFlux,
-                           const double *scale, cuDoubleComplex *matrix, cuDoubleComplex *rhs,
-                           int *error, cudaStream_t stream) {
+void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t count, std::size_t fluxStride,
+                           unsigned dimension, double k, unsigned excitationCount,
+                           const cuDoubleComplex *knownFlux, const double *scale,
+                           cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
+                           cudaStream_t stream) {
     if (!count)
         return;
     assembleMass<<<static_cast<unsigned>((count + 127) / 128), 128, 0, stream>>>(
-        panels, count, dimension, k, excitationCount, knownFlux, scale, matrix, rhs, error);
+        panels, count, fluxStride, dimension, k, excitationCount, knownFlux, scale, matrix, rhs,
+        error);
     checkLaunch("Subdomain mass assembly");
 }
 } // namespace hornsculpt::cuda_detail
@@ -140,6 +144,7 @@ void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t count, unsi
 #include <algorithm>
 #include <complex>
 #include <cusolverDn.h>
+#include <hornsculpt/acoustic_dof_map.hpp>
 #include <hornsculpt/acoustic_partition.hpp>
 #include <hornsculpt/bem.hpp>
 #include <hornsculpt/field_evaluation.hpp>
@@ -192,7 +197,10 @@ struct DomainHost {
     const BemSubdomain *domain{};
     SurfaceMesh mesh;
     galerkin::Space space;
+    std::vector<galerkin::Space> imageSpaces;
+    std::vector<unsigned> imageOffsets;
     std::vector<std::uint32_t> globalVertices;
+    std::vector<std::uint32_t> pressureDofs;
     std::vector<std::uint32_t> globalTriangles;
     unsigned rowOffset{}, panelOffset{};
 };
@@ -205,6 +213,12 @@ BemResult solveCoupledSubdomains(const SurfaceMesh &, Vec3, const BemRequest &, 
 BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRequest &request,
                           std::stop_token stop, std::function<void(const BemProgress &)> progress,
                           bool allowZero) {
+    if ((request.symmetry || request.exteriorBaffle) && request.coupling)
+        throw std::invalid_argument(
+            "LEM coupling with symmetry or an exterior baffle is not yet supported.");
+    if ((request.symmetry || request.exteriorBaffle) && !request.farField &&
+        !request.observers.empty())
+        throw std::invalid_argument("Finite field evaluation with symmetry is not yet supported.");
     if (request.coupling)
         return solveCoupledSubdomains(mesh, worldOrigin, request, stop, progress);
     if (stop.stop_requested())
@@ -215,7 +229,8 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         request.numerics.acceleration != BemAcceleration::dense)
         throw std::invalid_argument("Subdomain BEM requires 3D dense mode without baffle or LEM.");
     const auto &model = *request.subdomains;
-    validateAcousticPartition(mesh, model);
+    if (!request.symmetry && !request.exteriorBaffle)
+        validateAcousticPartition(mesh, model);
     if (model.domains.size() < 2 || model.interfaces.empty() || request.excitations.empty() ||
         request.frequencies.empty() || !std::isfinite(request.medium.density) ||
         !(request.medium.density > 0) || !std::isfinite(request.medium.soundSpeed) ||
@@ -242,6 +257,74 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
     if (mesh.vertices.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         request.excitations.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("Subdomain system exceeds cuSOLVER index capacity.");
+    // Working copy only: the archived source coordinates are untouched. A
+    // validated seam is projected by at most the explicitly saved tolerance.
+    auto workingMesh = mesh;
+    std::optional<OrthogonalSymmetryPlanes> localSymmetry = request.symmetry;
+    auto localBaffle = request.exteriorBaffle;
+    if (localBaffle) {
+        localBaffle->origin = sub(localBaffle->origin, worldOrigin);
+        constexpr double directionRoundoff = 64 * std::numeric_limits<double>::epsilon();
+        if (!std::isfinite(localBaffle->planeDistanceTolerance) ||
+            localBaffle->planeDistanceTolerance < 0 ||
+            !std::isfinite(dot(localBaffle->normal, localBaffle->normal)) ||
+            std::abs(dot(localBaffle->normal, localBaffle->normal) - 1) > directionRoundoff ||
+            (localSymmetry &&
+             (std::abs(dot(localBaffle->normal, localSymmetry->firstNormal)) > directionRoundoff ||
+              std::abs(dot(localBaffle->normal, localSymmetry->secondNormal)) > directionRoundoff)))
+            throw std::invalid_argument(
+                "Exterior baffle requires a unit normal orthogonal to both symmetry normals.");
+    }
+    if (!request.observerValidity.empty()) {
+        for (std::size_t i = 0; i < request.observers.size(); ++i) {
+            const auto direction = sub(request.observers[i], request.farField->origin);
+            const auto magnitude = length(direction);
+            if (!std::isfinite(magnitude) || !(magnitude > 0) || request.observerValidity[i] > 1 ||
+                static_cast<bool>(request.observerValidity[i]) !=
+                    (dot(mul(direction, 1 / magnitude), localBaffle->normal) >=
+                     -64 * std::numeric_limits<double>::epsilon()))
+                throw std::invalid_argument(
+                    "Observer validity does not match the baffle half-space.");
+        }
+    }
+    if (localBaffle && !localSymmetry)
+        validateAcousticPartition(mesh, model, &*localBaffle);
+    if (localSymmetry) {
+        localSymmetry->origin = sub(localSymmetry->origin, worldOrigin);
+        validateSymmetryAcousticPartition(mesh, model, *localSymmetry,
+                                          localBaffle ? &*localBaffle : nullptr);
+        // The finite four-image reflection group requires genuinely orthogonal
+        // unit normals. A looser geometry check would leave ghost seam points
+        // separated while assigning them the same singular-pair node identity.
+        constexpr double directionRoundoff = 64 * std::numeric_limits<double>::epsilon();
+        if (std::abs(dot(localSymmetry->firstNormal, localSymmetry->secondNormal)) >
+                directionRoundoff ||
+            std::abs(dot(localSymmetry->firstNormal, localSymmetry->firstNormal) - 1) >
+                directionRoundoff ||
+            std::abs(dot(localSymmetry->secondNormal, localSymmetry->secondNormal) - 1) >
+                directionRoundoff)
+            throw std::invalid_argument("Symmetry solver requires orthonormal plane normals within "
+                                        "floating-point roundoff.");
+        for (auto &vertex : workingMesh.vertices) {
+            if (localBaffle) {
+                const auto height = dot(sub(vertex, localBaffle->origin), localBaffle->normal);
+                if (std::abs(height) <= localBaffle->planeDistanceTolerance)
+                    vertex = sub(vertex, mul(localBaffle->normal, height));
+            }
+            for (const auto normal : {localSymmetry->firstNormal, localSymmetry->secondNormal}) {
+                const double distance = dot(sub(vertex, localSymmetry->origin), normal);
+                if (std::abs(distance) <= localSymmetry->planeDistanceTolerance)
+                    vertex = sub(vertex, mul(normal, distance));
+            }
+        }
+    }
+    if (localBaffle && !localSymmetry) {
+        for (auto &vertex : workingMesh.vertices) {
+            const auto height = dot(sub(vertex, localBaffle->origin), localBaffle->normal);
+            if (std::abs(height) <= localBaffle->planeDistanceTolerance)
+                vertex = sub(vertex, mul(localBaffle->normal, height));
+        }
+    }
     std::map<std::uint32_t, std::size_t> triangleInterface;
     std::map<std::uint32_t, unsigned> interfaceNode;
     std::vector<std::vector<std::uint32_t>> interfaceVertices(model.interfaces.size());
@@ -259,6 +342,10 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
             interfaceVertices[n].push_back(v);
         }
     }
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> twoSided;
+    for (const auto &surface : model.twoSidedSurfaces)
+        for (auto triangle : surface.triangleIndices)
+            twoSided.emplace(triangle, std::pair{surface.firstDomainId, surface.secondDomainId});
     std::vector<DomainHost> domains;
     unsigned rowCount = 0, panelCount = 0;
     for (const auto &domain : model.domains) {
@@ -278,7 +365,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     local.emplace(v, static_cast<std::uint32_t>(local.size()));
                 if (inserted) {
                     h.globalVertices.push_back(v);
-                    h.mesh.vertices.push_back(mesh.vertices[v]);
+                    h.mesh.vertices.push_back(workingMesh.vertices[v]);
                 }
                 v = pos->second;
             }
@@ -294,10 +381,19 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         panelCount += static_cast<unsigned>(h.space.panels.size());
         domains.push_back(std::move(h));
     }
-    if (interfaceNode.size() >
-        static_cast<std::size_t>(std::numeric_limits<int>::max()) - mesh.vertices.size())
+    const auto pressureMap = makeAcousticPressureDofMap(mesh, model);
+    for (std::size_t d = 0; d < domains.size(); ++d) {
+        auto &domain = domains[d];
+        domain.pressureDofs.reserve(domain.globalVertices.size());
+        for (auto vertex : domain.globalVertices)
+            domain.pressureDofs.push_back(pressureMap.domains[d].at(vertex));
+    }
+    const auto pressureCount = static_cast<std::size_t>(pressureMap.count);
+    if (pressureCount > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        interfaceNode.size() >
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) - pressureCount)
         throw std::invalid_argument("Subdomain unknown count exceeds index capacity.");
-    const auto dimension = static_cast<unsigned>(mesh.vertices.size() + interfaceNode.size());
+    const auto dimension = static_cast<unsigned>(pressureCount + interfaceNode.size());
     if (dimension != rowCount || !dimension)
         throw std::invalid_argument(
             "Subdomain P1 interface topology has unsupported shared vertices.");
@@ -323,14 +419,104 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                 dst.panel.nodes[j] = src.nodes[j];
                 dst.panel.curls[j] = src.curls[j];
                 dst.rows[j] = static_cast<int>(h.rowOffset + src.nodes[j]);
-                dst.pressureColumns[j] = static_cast<int>(h.globalVertices[src.nodes[j]]);
+                dst.pressureColumns[j] = static_cast<int>(h.pressureDofs[src.nodes[j]]);
                 dst.fluxColumns[j] =
-                    isInterface ? static_cast<int>(mesh.vertices.size() +
+                    isInterface ? static_cast<int>(pressureCount +
                                                    interfaceNode.at(h.globalVertices[src.nodes[j]]))
                                 : -1;
             }
         }
     }
+    // Each reflected source panel shares physical unknowns with its sector
+    // original. Synthetic node identities preserve exact seam/axis incidence
+    // for the existing singular-pair classifier without expanding the mesh.
+    std::vector<unsigned> originalPanel(panelCount);
+    std::iota(originalPanel.begin(), originalPanel.end(), 0u);
+    if (localSymmetry || localBaffle)
+        for (auto &h : domains) {
+            const auto vertexCount = h.mesh.vertices.size();
+            const bool mirrorBaffle = localBaffle && h.domain->kind == BemDomainKind::exterior;
+            if (vertexCount > std::numeric_limits<std::uint32_t>::max() / 8)
+                throw std::invalid_argument("Symmetry image node index capacity exceeded.");
+            std::vector<unsigned> fixed(vertexCount);
+            for (std::size_t v = 0; v < vertexCount; ++v) {
+                if (localSymmetry) {
+                    const auto delta = sub(h.mesh.vertices[v], localSymmetry->origin);
+                    if (std::abs(dot(delta, localSymmetry->firstNormal)) <=
+                        localSymmetry->planeDistanceTolerance)
+                        fixed[v] |= 1;
+                    if (std::abs(dot(delta, localSymmetry->secondNormal)) <=
+                        localSymmetry->planeDistanceTolerance)
+                        fixed[v] |= 2;
+                }
+                if (mirrorBaffle) {
+                    const auto height =
+                        dot(sub(h.mesh.vertices[v], localBaffle->origin), localBaffle->normal);
+                    if (height < -localBaffle->planeDistanceTolerance)
+                        throw std::invalid_argument(
+                            "Exterior panel crosses the baffle half-space.");
+                    if (std::abs(height) <= localBaffle->planeDistanceTolerance)
+                        fixed[v] |= 4;
+                }
+            }
+            const unsigned allowedMask = (localSymmetry ? 3u : 0u) | (mirrorBaffle ? 4u : 0u);
+            for (unsigned mask = 1; mask < 8; ++mask) {
+                if (mask & ~allowedMask)
+                    continue;
+                auto image = h.mesh;
+                for (auto &v : image.vertices) {
+                    if (mask & 1)
+                        v = sub(v, mul(localSymmetry->firstNormal,
+                                       2 * dot(sub(v, localSymmetry->origin),
+                                               localSymmetry->firstNormal)));
+                    if (mask & 2)
+                        v = sub(v, mul(localSymmetry->secondNormal,
+                                       2 * dot(sub(v, localSymmetry->origin),
+                                               localSymmetry->secondNormal)));
+                    if (mask & 4)
+                        v = sub(v, mul(localBaffle->normal,
+                                       2 * dot(sub(v, localBaffle->origin), localBaffle->normal)));
+                }
+                if (std::popcount(mask) % 2 != 0)
+                    for (auto &triangle : image.triangles)
+                        std::swap(triangle.vertices[1], triangle.vertices[2]);
+                auto imageSpace = galerkin::buildSpace(image);
+                h.imageOffsets.push_back(static_cast<unsigned>(panels.size()));
+                for (unsigned t = 0; t < imageSpace.panels.size(); ++t) {
+                    auto &src = imageSpace.panels[t];
+                    SubdomainPanel dst{};
+                    dst.panel.centroid = src.centroid;
+                    dst.panel.normal = src.normal;
+                    dst.panel.area = src.area;
+                    dst.panel.edge = src.maximumEdgeLength;
+                    const auto found = triangleInterface.find(h.globalTriangles[t]);
+                    const bool isInterface = found != triangleInterface.end();
+                    dst.fluxSign =
+                        isInterface && model.interfaces[found->second].firstDomainId != h.domain->id
+                            ? -1
+                            : 1;
+                    for (unsigned j = 0; j < 3; ++j) {
+                        const auto v = src.nodes[j];
+                        dst.panel.vertices[j] = src.vertices[j];
+                        dst.panel.curls[j] = src.curls[j];
+                        const auto orbit = mask & ~fixed[v];
+                        dst.panel.nodes[j] = static_cast<unsigned>(v + orbit * vertexCount);
+                        dst.pressureColumns[j] = static_cast<int>(h.pressureDofs[v]);
+                        dst.fluxColumns[j] =
+                            isInterface ? static_cast<int>(pressureCount +
+                                                           interfaceNode.at(h.globalVertices[v]))
+                                        : -1;
+                        src.nodes[j] = dst.panel.nodes[j];
+                    }
+                    panels.push_back(dst);
+                    originalPanel.push_back(h.panelOffset + t);
+                }
+                h.imageSpaces.push_back(std::move(imageSpace));
+            }
+        }
+    if (panels.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("Symmetry image panel count exceeds index capacity.");
+    const auto totalPanelCount = static_cast<unsigned>(panels.size());
     const unsigned nrhs = static_cast<unsigned>(request.excitations.size());
     const auto checkedMultiply = [](std::size_t a, std::size_t b) {
         if (a && b > std::numeric_limits<std::size_t>::max() / a)
@@ -343,14 +529,14 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         return a + b;
     };
     constexpr std::size_t batchCapacity = 32768;
-    auto bytes = checkedMultiply(sizeof(SubdomainPanel), panelCount);
+    auto bytes = checkedMultiply(sizeof(SubdomainPanel), totalPanelCount);
     bytes = checkedAdd(bytes, checkedMultiply(sizeof(double), scales.size()));
     bytes = checkedAdd(
         bytes, checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(dimension, dimension)));
     bytes = checkedAdd(bytes,
                        checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(dimension, nrhs)));
-    bytes = checkedAdd(bytes,
-                       checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(panelCount, nrhs)));
+    bytes = checkedAdd(
+        bytes, checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(totalPanelCount, nrhs)));
     bytes = checkedAdd(bytes, checkedMultiply(sizeof(SubdomainPairSample), batchCapacity));
     bytes =
         checkedAdd(bytes, checkedMultiply(sizeof(int), static_cast<std::size_t>(dimension) + 2));
@@ -359,13 +545,13 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         throw std::runtime_error("Cannot query GPU memory for subdomain BEM.");
     if (bytes > freeBytes)
         throw std::runtime_error("Insufficient GPU memory for subdomain BEM buffers.");
-    DomainDevice<SubdomainPanel> dp(panelCount);
+    DomainDevice<SubdomainPanel> dp(totalPanelCount);
     dp.upload(panels);
     DomainDevice<double> ds(scales.size());
     ds.upload(scales);
     DomainDevice<cuDoubleComplex> matrix(static_cast<std::size_t>(dimension) * dimension),
         rhs(static_cast<std::size_t>(dimension) * nrhs);
-    DomainDevice<cuDoubleComplex> dq(static_cast<std::size_t>(panelCount) * nrhs);
+    DomainDevice<cuDoubleComplex> dq(static_cast<std::size_t>(totalPanelCount) * nrhs);
     DomainDevice<SubdomainPairSample> db(batchCapacity);
     DomainDevice<int> error(1), info(1), pivots(dimension);
     cusolverDnHandle_t solver{};
@@ -379,7 +565,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
     } guard{solver};
     BemResult result;
     result.triangleCount = mesh.triangles.size();
-    result.pressureDofCount = mesh.vertices.size();
+    result.pressureDofCount = pressureCount;
     result.device = CudaBemSolver::deviceDescription();
     result.acceleration = BemAcceleration::dense;
     galerkin::PairQuadratureSettings qs;
@@ -405,7 +591,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
             throw std::invalid_argument("Invalid BEM frequency.");
         const double omega = 2 * std::numbers::pi * frequency,
                      k = omega / request.medium.soundSpeed;
-        std::vector<cuDoubleComplex> q(static_cast<std::size_t>(panelCount) * nrhs);
+        std::vector<cuDoubleComplex> q(static_cast<std::size_t>(totalPanelCount) * nrhs);
         for (unsigned e = 0; e < nrhs; ++e) {
             std::map<std::uint32_t, std::complex<double>> values;
             for (const auto &v : request.excitations[e].faces) {
@@ -430,15 +616,23 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                             "Subdomain excitation references a non-driven face.");
                     usedFaces.insert(triangle.faceId);
                     nonzero = nonzero || std::abs(it->second) > 0;
-                    const auto value =
-                        std::complex<double>{0, request.medium.density * omega} * it->second;
-                    q[h.panelOffset + t + static_cast<std::size_t>(e) * panelCount] =
+                    const auto side = twoSided.find(g);
+                    const double polarity =
+                        side != twoSided.end() && h.domain->id == side->second.second ? -1.0 : 1.0;
+                    const auto value = polarity *
+                                       std::complex<double>{0, request.medium.density * omega} *
+                                       it->second;
+                    q[h.panelOffset + t + static_cast<std::size_t>(e) * totalPanelCount] =
                         make_cuDoubleComplex(value.real(), value.imag());
                 }
             if (usedFaces.size() != values.size() || usedFaces.empty() || (!allowZero && !nonzero))
                 throw std::invalid_argument(
                     "Subdomain excitation contains unknown faces or is empty.");
         }
+        for (unsigned e = 0; e < nrhs; ++e)
+            for (std::size_t t = panelCount; t < panels.size(); ++t)
+                q[t + static_cast<std::size_t>(e) * totalPanelCount] =
+                    q[originalPanel[t] + static_cast<std::size_t>(e) * totalPanelCount];
         dq.upload(q);
         matrix.zero();
         rhs.zero();
@@ -456,14 +650,23 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     galerkin::minimumEndpointDegree(k * panel.maximumEdgeLength, qs.regularOrder));
             }
         }
+        std::vector<std::vector<std::vector<galerkin::RegularPanelBounds>>> imageBounds;
+        for (const auto &h : domains) {
+            auto &perDomain = imageBounds.emplace_back();
+            for (const auto &image : h.imageSpaces) {
+                auto &perImage = perDomain.emplace_back();
+                for (const auto &panel : image.panels)
+                    perImage.push_back(galerkin::makeRegularPanelBounds(panel));
+            }
+        }
         const auto regular4 = galerkin::triangleRule(4), regular6 = galerkin::triangleRule(6),
                    regular8 = galerkin::triangleRule(8);
         const auto flush = [&]() {
             if (batch.empty())
                 return;
             db.upload(batch);
-            assembleSubdomainSamples(dp.data(), db.data(), batch.size(), panelCount, dimension, k,
-                                     nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(),
+            assembleSubdomainSamples(dp.data(), db.data(), batch.size(), totalPanelCount, dimension,
+                                     k, nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(),
                                      error.data(), nullptr);
             if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
                 throw std::runtime_error("Subdomain quadrature assembly failed.");
@@ -477,56 +680,62 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         };
         for (std::size_t domainIndex = 0; domainIndex < domains.size(); ++domainIndex) {
             const auto &h = domains[domainIndex];
-            for (unsigned i = 0; i < h.space.panels.size(); ++i)
-                for (unsigned j = 0; j < h.space.panels.size(); ++j) {
-                    if (stop.stop_requested())
-                        throw std::runtime_error("Subdomain solve cancelled.");
-                    const auto &test = h.space.panels[i], &trial = h.space.panels[j];
-                    const auto topology = galerkin::classifyPair(test, trial).topology;
-                    const auto degree = topology == galerkin::PairTopology::disjoint
-                                            ? galerkin::qualifiedRegularDegree(
-                                                  bounds[domainIndex][i], bounds[domainIndex][j], k,
-                                                  qs.relativeTolerance, minimumDegree)
-                                            : 0;
-                    const bool near = topology == galerkin::PairTopology::disjoint &&
-                                      galerkin::isNearPair(test, trial, qs.nearDistanceRatio);
-                    if (degree && !near) {
-                        const auto &rule = degree == 4   ? regular4
-                                           : degree == 6 ? regular6
-                                                         : regular8;
-                        for (const auto &x : rule)
-                            for (const auto &y : rule) {
-                                galerkin::PairQuadraturePoint point{};
-                                for (unsigned z = 0; z < 3; ++z) {
-                                    point.test[z] = x.barycentric[z];
-                                    point.trial[z] = y.barycentric[z];
+            for (std::size_t image = 0; image <= h.imageSpaces.size(); ++image) {
+                const auto &trialSpace = image == 0 ? h.space : h.imageSpaces[image - 1];
+                const auto trialOffset = image == 0 ? h.panelOffset : h.imageOffsets[image - 1];
+                const auto &trialBounds =
+                    image == 0 ? bounds[domainIndex] : imageBounds[domainIndex][image - 1];
+                for (unsigned i = 0; i < h.space.panels.size(); ++i)
+                    for (unsigned j = 0; j < trialSpace.panels.size(); ++j) {
+                        if (stop.stop_requested())
+                            throw std::runtime_error("Subdomain solve cancelled.");
+                        const auto &test = h.space.panels[i], &trial = trialSpace.panels[j];
+                        const auto topology = galerkin::classifyPair(test, trial).topology;
+                        const auto degree = topology == galerkin::PairTopology::disjoint
+                                                ? galerkin::qualifiedRegularDegree(
+                                                      bounds[domainIndex][i], trialBounds[j], k,
+                                                      qs.relativeTolerance, minimumDegree)
+                                                : 0;
+                        const bool near = topology == galerkin::PairTopology::disjoint &&
+                                          galerkin::isNearPair(test, trial, qs.nearDistanceRatio);
+                        if (degree && !near) {
+                            const auto &rule = degree == 4   ? regular4
+                                               : degree == 6 ? regular6
+                                                             : regular8;
+                            for (const auto &x : rule)
+                                for (const auto &y : rule) {
+                                    galerkin::PairQuadraturePoint point{};
+                                    for (unsigned z = 0; z < 3; ++z) {
+                                        point.test[z] = x.barycentric[z];
+                                        point.trial[z] = y.barycentric[z];
+                                    }
+                                    point.weight = x.weight * y.weight;
+                                    push(h.panelOffset + i, trialOffset + j, point);
                                 }
-                                point.weight = x.weight * y.weight;
-                                push(h.panelOffset + i, h.panelOffset + j, point);
-                            }
-                        continue;
+                            continue;
+                        }
+                        const auto rule = galerkin::makePairQuadrature(
+                            test, trial, qs, k, stop,
+                            topology == galerkin::PairTopology::disjoint && !degree);
+                        for (const auto &point : rule.points)
+                            push(h.panelOffset + i, trialOffset + j, point);
+                        for (const auto &patch : rule.patches) {
+                            const auto &tr = patch.degree == 14 ? high : low;
+                            const auto count = galerkin::nearPatchPointCount(
+                                patch, static_cast<unsigned>(tr.size()));
+                            for (unsigned x = 0; x < count; ++x)
+                                push(h.panelOffset + i, trialOffset + j,
+                                     galerkin::mapNearPatchPoint(
+                                         tr.data(), static_cast<unsigned>(tr.size()), patch, x,
+                                         panels[h.panelOffset + i].panel,
+                                         panels[trialOffset + j].panel));
+                        }
                     }
-                    const auto rule = galerkin::makePairQuadrature(
-                        test, trial, qs, k, stop,
-                        topology == galerkin::PairTopology::disjoint && !degree);
-                    for (const auto &point : rule.points)
-                        push(h.panelOffset + i, h.panelOffset + j, point);
-                    for (const auto &patch : rule.patches) {
-                        const auto &tr = patch.degree == 14 ? high : low;
-                        const auto count =
-                            galerkin::nearPatchPointCount(patch, static_cast<unsigned>(tr.size()));
-                        for (unsigned x = 0; x < count; ++x)
-                            push(h.panelOffset + i, h.panelOffset + j,
-                                 galerkin::mapNearPatchPoint(
-                                     tr.data(), static_cast<unsigned>(tr.size()), patch, x,
-                                     panels[h.panelOffset + i].panel,
-                                     panels[h.panelOffset + j].panel));
-                    }
-                }
+            }
         }
         flush();
-        assembleSubdomainMass(dp.data(), panelCount, dimension, k, nrhs, dq.data(), ds.data(),
-                              matrix.data(), rhs.data(), error.data(), nullptr);
+        assembleSubdomainMass(dp.data(), panelCount, totalPanelCount, dimension, k, nrhs, dq.data(),
+                              ds.data(), matrix.data(), rhs.data(), error.data(), nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
             throw std::runtime_error("Subdomain mass assembly failed.");
         const double assemblyMs = elapsed(assemblyStart);
@@ -603,7 +812,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                 BemSubdomainTrace trace;
                 trace.domainId = h.domain->id;
                 trace.vertexIndices = h.globalVertices;
-                for (auto v : h.globalVertices) {
+                for (auto v : h.pressureDofs) {
                     const auto z = solved[v + static_cast<std::size_t>(e) * dimension];
                     trace.pressureTrace.emplace_back(z.x, z.y);
                 }
@@ -619,7 +828,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                         }
                     else {
                         const auto z =
-                            q[h.panelOffset + t + static_cast<std::size_t>(e) * panelCount];
+                            q[h.panelOffset + t + static_cast<std::size_t>(e) * totalPanelCount];
                         derivative = {z.x, z.y};
                     }
                     trace.normalDerivative.push_back(derivative);
@@ -633,7 +842,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     flux.vertexIndices = interfaceVertices[i];
                     const double sign = it.firstDomainId == h.domain->id ? 1 : -1;
                     for (auto v : flux.vertexIndices) {
-                        const auto z = solved[mesh.vertices.size() + interfaceNode.at(v) +
+                        const auto z = solved[pressureCount + interfaceNode.at(v) +
                                               static_cast<std::size_t>(e) * dimension];
                         flux.normalDerivative.emplace_back(sign * k * z.x, sign * k * z.y);
                     }
@@ -684,52 +893,77 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     throw std::invalid_argument("Invalid far-field reference distance.");
                 std::vector<Vec3> directions;
                 directions.reserve(request.observers.size());
-                for (const auto worldPoint : request.observers) {
-                    auto direction = sub(sub(worldPoint, worldOrigin), origin);
+                for (std::size_t i = 0; i < request.observers.size(); ++i) {
+                    auto direction = sub(sub(request.observers[i], worldOrigin), origin);
                     const auto directionLength = length(direction);
                     if (!std::isfinite(directionLength) || !(directionLength > 0))
                         throw std::invalid_argument("Invalid far-field observation.");
-                    directions.push_back(mul(direction, 1 / directionLength));
+                    direction = mul(direction, 1 / directionLength);
+                    const bool inHalfSpace =
+                        !localBaffle || dot(direction, localBaffle->normal) >=
+                                            -64 * std::numeric_limits<double>::epsilon();
+                    if (!request.observerValidity.empty()) {
+                        const auto valid = request.observerValidity[i];
+                        if (valid > 1 || static_cast<bool>(valid) != inHalfSpace)
+                            throw std::invalid_argument(
+                                "Observer validity does not match the baffle half-space.");
+                    } else if (!inHalfSpace) {
+                        throw std::invalid_argument(
+                            "Far-field direction is outside the baffle half-space.");
+                    }
+                    directions.push_back(direction);
                 }
                 const auto evaluate = [&](unsigned degree) {
                     const auto rule = galerkin::triangleRule(degree);
                     std::vector<std::complex<double>> values(directions.size());
                     for (std::size_t observer = 0; observer < directions.size(); ++observer) {
+                        if (!request.observerValidity.empty() &&
+                            !request.observerValidity[observer])
+                            continue;
                         const auto direction = directions[observer];
-                        for (unsigned t = 0; t < selected->space.panels.size(); ++t) {
-                            if (stop.stop_requested())
-                                throw std::runtime_error("Subdomain solve cancelled.");
-                            const auto &panel = selected->space.panels[t];
-                            const auto &sp = panels[selected->panelOffset + t];
-                            for (const auto &sample : rule) {
-                                Vec3 y{};
-                                std::complex<double> pressure{}, flux{};
-                                for (unsigned j = 0; j < 3; ++j) {
-                                    y = add(y, mul(panel.vertices[j], sample.barycentric[j]));
-                                    const auto p = solved[sp.pressureColumns[j] +
-                                                          static_cast<std::size_t>(e) * dimension];
-                                    pressure +=
-                                        sample.barycentric[j] * std::complex<double>{p.x, p.y};
-                                    if (sp.fluxColumns[j] >= 0) {
-                                        const auto v =
-                                            solved[sp.fluxColumns[j] +
+                        for (std::size_t image = 0; image <= selected->imageSpaces.size();
+                             ++image) {
+                            const auto &source =
+                                image == 0 ? selected->space : selected->imageSpaces[image - 1];
+                            const auto offset = image == 0 ? selected->panelOffset
+                                                           : selected->imageOffsets[image - 1];
+                            for (unsigned t = 0; t < source.panels.size(); ++t) {
+                                if (stop.stop_requested())
+                                    throw std::runtime_error("Subdomain solve cancelled.");
+                                const auto &panel = source.panels[t];
+                                const auto &sp = panels[offset + t];
+                                for (const auto &sample : rule) {
+                                    Vec3 y{};
+                                    std::complex<double> pressure{}, flux{};
+                                    for (unsigned j = 0; j < 3; ++j) {
+                                        y = add(y, mul(panel.vertices[j], sample.barycentric[j]));
+                                        const auto p =
+                                            solved[sp.pressureColumns[j] +
                                                    static_cast<std::size_t>(e) * dimension];
-                                        flux += sample.barycentric[j] * sp.fluxSign * k *
-                                                std::complex<double>{v.x, v.y};
+                                        pressure +=
+                                            sample.barycentric[j] * std::complex<double>{p.x, p.y};
+                                        if (sp.fluxColumns[j] >= 0) {
+                                            const auto v =
+                                                solved[sp.fluxColumns[j] +
+                                                       static_cast<std::size_t>(e) * dimension];
+                                            flux += sample.barycentric[j] * sp.fluxSign * k *
+                                                    std::complex<double>{v.x, v.y};
+                                        }
                                     }
+                                    if (sp.fluxColumns[0] < 0) {
+                                        const auto v =
+                                            q[offset + t +
+                                              static_cast<std::size_t>(e) * totalPanelCount];
+                                        flux = {v.x, v.y};
+                                    }
+                                    const auto kernel = std::polar(
+                                        1.0 / (4 * std::numbers::pi * distance),
+                                        -k * distance + k * dot(direction, sub(y, origin)));
+                                    const auto derivative =
+                                        std::complex<double>{0, k * dot(direction, panel.normal)};
+                                    values[observer] += kernel * (flux - derivative * pressure) *
+                                                        (2 * panel.area * sample.weight);
                                 }
-                                if (sp.fluxColumns[0] < 0) {
-                                    const auto v = q[selected->panelOffset + t +
-                                                     static_cast<std::size_t>(e) * panelCount];
-                                    flux = {v.x, v.y};
-                                }
-                                const auto kernel =
-                                    std::polar(1.0 / (4 * std::numbers::pi * distance),
-                                               -k * distance + k * dot(direction, sub(y, origin)));
-                                const auto derivative =
-                                    std::complex<double>{0, k * dot(direction, panel.normal)};
-                                values[observer] += kernel * (flux - derivative * pressure) *
-                                                    (2 * panel.area * sample.weight);
                             }
                         }
                     }
@@ -742,6 +976,8 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     auto refined = evaluate(next);
                     double differenceSquared = 0, normSquared = 0;
                     for (std::size_t i = 0; i < refined.size(); ++i) {
+                        if (!request.observerValidity.empty() && !request.observerValidity[i])
+                            continue;
                         differenceSquared += std::norm(refined[i] - observed[i]);
                         normSquared += std::norm(refined[i]);
                     }
@@ -762,6 +998,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                     degree = next;
                 }
                 excitation.observerPressure = std::move(observed);
+                excitation.observerValidity = request.observerValidity;
             }
             output.fieldMilliseconds += elapsed(fieldStart);
             excitation.solvedVelocities = request.excitations[e].faces;
@@ -777,18 +1014,23 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                         const auto &panel = h.space.panels[t];
                         std::complex<double> mean{};
                         for (unsigned j = 0; j < 3; ++j) {
-                            const auto z = solved[h.globalVertices[panel.nodes[j]] +
+                            const auto z = solved[h.pressureDofs[panel.nodes[j]] +
                                                   static_cast<std::size_t>(e) * dimension];
                             mean += std::complex<double>{z.x, z.y} / 3.;
                         }
-                        area += panel.area;
-                        integratedPressure += panel.area * mean;
+                        const auto side = twoSided.find(global);
+                        const bool second =
+                            side != twoSided.end() && h.domain->id == side->second.second;
+                        if (!second)
+                            area += panel.area;
+                        integratedPressure += (second ? -panel.area : panel.area) * mean;
                     }
-                const auto volume = area * face.normalVelocity;
+                const auto fullArea = area * (request.symmetry ? 4.0 : 1.0);
+                const auto volume = fullArea * face.normalVelocity;
                 if (area > 0 && std::abs(volume) > 0) {
                     const auto mean = integratedPressure / area;
                     excitation.impedances.push_back(
-                        {face.faceId, area, mean, volume, mean / volume});
+                        {face.faceId, fullArea, mean, volume, mean / volume});
                 }
             }
             output.excitations.push_back(std::move(excitation));
@@ -821,6 +1063,16 @@ BemResult solveCoupledSubdomains(const SurfaceMesh &mesh, Vec3 origin, const Bem
         if (!frequencies.insert(f).second)
             throw std::invalid_argument("Coupled subdomain frequencies must be unique.");
     const auto measures = surfaceMeasures(mesh);
+    std::set<std::uint32_t> twoSidedDrivenFaces;
+    for (const auto &surface : model.twoSidedSurfaces)
+        for (auto triangle : surface.triangleIndices)
+            if (mesh.triangles[triangle].boundary == BoundaryCondition::driven)
+                twoSidedDrivenFaces.insert(mesh.triangles[triangle].faceId);
+    for (const auto *element : lem::bemPorts(*request.coupling))
+        for (auto face : std::get<lem::BemPort>(element->component).faceIds)
+            if (twoSidedDrivenFaces.contains(face))
+                throw std::invalid_argument(
+                    "LEM ports on two-sided driven membranes are not supported.");
     const auto basis = bem_detail::makeCouplingBasis(*request.coupling, mesh, measures.areas);
     const auto ports = lem::bemPorts(*request.coupling);
     std::set<std::uint32_t> interfaceTriangles, interfaceFaces;

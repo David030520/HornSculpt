@@ -1,6 +1,7 @@
 #include "galerkin/exterior_domain.hpp"
 #include "gmsh_source.hpp"
 #include "project_json.hpp"
+#include "simulation_request.hpp"
 #include <QFile>
 #include <QJsonDocument>
 #include <QSaveFile>
@@ -165,7 +166,7 @@ void validateFaceSizes(const Project &p) {
 Project decode(const QJsonObject &root, bool allowComparisons = true) {
     if (text(root["format"]) != "HornSculpt" || text(root["units"]) != "SI")
         invalid(QStringLiteral("Unbekanntes Format oder Einheit."));
-    const auto version = integer(root["version"], 16);
+    const auto version = integer(root["version"], 18);
     auto structural = root;
     if (version >= 15) {
         if (!structural.contains("comparisonSnapshots"))
@@ -355,6 +356,16 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
         bool(project.mesh) != (project.meshRevision != 0))
         invalid(QStringLiteral("Netz und Revision passen nicht zusammen."));
     project.simulation = decodeSimulation(root["simulation"], version);
+    if (version < 17 && (std::any_of(
+                             project.simulation.settings.acousticModel.domains.begin(),
+                             project.simulation.settings.acousticModel.domains.end(),
+                             [](const auto &r) { return !r.twoSidedFaceIds.empty(); }) ||
+                         (project.simulation.request && project.simulation.request->subdomains &&
+                          !project.simulation.request->subdomains->twoSidedSurfaces.empty()) ||
+                         project.simulation.settings.symmetryXYEnabled ||
+                         project.simulation.settings.symmetryPlaneTolerance != 1e-6 ||
+                         (project.simulation.request && project.simulation.request->symmetry)))
+        invalid(QStringLiteral("XY-Symmetrie und beidseitige Flächen benötigen Projektformat 17."));
     if (project.gmsh && project.mesh && project.meshRevision == project.revision) {
         const auto orientedSource =
             applyFaceOrientation(project.cad->mesh, project.cadReversedFaceIds);
@@ -365,8 +376,13 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
         options.adaptive = project.meshing.adaptive;
         options.quality = project.meshing.quality;
         options.faceTargetEdgeLengths = project.cadFaceTargetEdgeLengths;
-        (void)validateGmshMesh(project.mesh->mesh, project.simulation.settings.acousticRegions,
-                               options);
+        const auto &settings = project.simulation.settings;
+        const auto symmetry = settings.symmetryXYEnabled
+                                  ? std::optional{inferXYSymmetry(project.mesh->mesh,
+                                                                  settings.symmetryPlaneTolerance)}
+                                  : std::nullopt;
+        (void)validateGmshMesh(project.mesh->mesh, settings.acousticModel, options, {},
+                               symmetry ? &*symmetry : nullptr);
     }
     const auto &a = project.simulation;
     if (a.revision > project.revision)
@@ -382,7 +398,7 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
                                          ? project.draftReversedFaceIds
                                          : project.cadReversedFaceIds;
     if (!activeOrientations.empty() &&
-        !(project.gmsh && !project.simulation.settings.acousticRegions.empty()) &&
+        !(project.gmsh && !project.simulation.settings.acousticModel.domains.empty()) &&
         ((project.mesh && project.meshRevision == project.revision) || (a.current && reduced))) {
         if (!project.preview || project.geometryRevision != project.revision ||
             !inspectMesh(*project.preview).watertight())
@@ -442,7 +458,7 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
 QJsonObject encode(const Project &p) {
     auto root = encodeDraft(p);
     root.insert("format", "HornSculpt");
-    root.insert("version", 16);
+    root.insert("version", 18);
     root.insert("assembly", encodeAssembly(p.assembly));
     root.insert("units", "SI");
     switch (p.source) {
@@ -554,9 +570,9 @@ FaceColors retainedCadFaceColors(const FaceColors &colors, const CadSnapshot *pr
     return retained;
 }
 
-std::vector<AcousticRegionDefinition>
-reconciledCadAcousticRegions(std::vector<AcousticRegionDefinition> regions,
-                             const CadSnapshot *previous, const CadSnapshot *current) {
+AcousticModelDefinition reconciledCadAcousticModel(AcousticModelDefinition model,
+                                                   const CadSnapshot *previous,
+                                                   const CadSnapshot *current) {
     const bool sameDocument = previous && current && previous->documentId == current->documentId;
     const bool sameGeometry = sameDocument && previous->sessionId == current->sessionId &&
                               previous->revision == current->revision;
@@ -572,12 +588,14 @@ reconciledCadAcousticRegions(std::vector<AcousticRegionDefinition> regions,
                before->objectId != after->objectId || after->state == CadFaceState::needsReview ||
                (!sameGeometry && after->state == CadFaceState::newFace);
     };
-    for (auto &region : regions)
-        region.needsAssignmentReview |=
-            std::any_of(region.faceIds.begin(), region.faceIds.end(), needsReview) ||
-            std::any_of(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end(),
-                        needsReview);
-    return regions;
+    for (auto &domain : model.domains)
+        domain.needsAssignmentReview |=
+            std::any_of(domain.faceIds.begin(), domain.faceIds.end(), needsReview) ||
+            std::any_of(domain.twoSidedFaceIds.begin(), domain.twoSidedFaceIds.end(), needsReview);
+    for (auto &interface : model.interfaces)
+        interface.needsAssignmentReview |=
+            std::any_of(interface.faceIds.begin(), interface.faceIds.end(), needsReview);
+    return model;
 }
 lem::Network reconciledCadBemAssignments(lem::Network network, const CadSnapshot *previous,
                                          const CadSnapshot *current) {

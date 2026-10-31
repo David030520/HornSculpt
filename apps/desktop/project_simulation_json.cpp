@@ -5,6 +5,7 @@
 #include "simulation_request.hpp"
 #include <algorithm>
 #include <cmath>
+#include <hornsculpt/acoustic_dof_map.hpp>
 #include <hornsculpt/surface_measures.hpp>
 #include <limits>
 #include <set>
@@ -30,32 +31,16 @@ BemGeometryMode decodeGeometryMode(const QJsonValue &value) {
     return mode == "axisymmetric" ? BemGeometryMode::axisymmetric
                                   : BemGeometryMode::threeDimensional;
 }
-QJsonArray encodeAcousticRegions(const std::vector<AcousticRegionDefinition> &regions) {
-    QJsonArray result;
-    for (const auto &region : regions) {
-        QJsonArray faces;
-        for (auto id : region.faceIds)
-            faces.append(double(id));
-        QJsonArray interfaces;
-        for (auto id : region.interfaceFaceIds)
-            interfaces.append(double(id));
-        result.append(QJsonObject{{"id", double(region.id)},
-                                  {"name", QString::fromStdString(region.name)},
-                                  {"faceIds", faces},
-                                  {"interfaceFaceIds", interfaces},
-                                  {"needsAssignmentReview", region.needsAssignmentReview}});
-    }
-    return result;
-}
 std::vector<AcousticRegionDefinition> decodeAcousticRegions(const QJsonValue &value) {
     std::vector<AcousticRegionDefinition> result;
     std::set<std::uint32_t> ids, faces;
-    std::map<std::uint32_t, unsigned> interfaces;
+    std::map<std::uint32_t, unsigned> interfaces, twoSidedSurfaces;
     for (const auto &item : array(value, 10000)) {
         const auto o = object(item);
         auto required = o;
         required.remove("interfaceFaceIds");
         required.remove("needsAssignmentReview");
+        required.remove("twoSidedFaceIds");
         keys(required, {"id", "name", "faceIds"});
         AcousticRegionDefinition region;
         region.id = integer(o["id"], std::numeric_limits<std::uint32_t>::max());
@@ -76,13 +61,220 @@ std::vector<AcousticRegionDefinition> decodeAcousticRegions(const QJsonValue &va
                 region.interfaceFaceIds.push_back(id);
             }
         }
-        require(!region.faceIds.empty() || !region.interfaceFaceIds.empty());
+        if (o.contains("twoSidedFaceIds")) {
+            std::set<std::uint32_t> local;
+            for (const auto &f : array(o["twoSidedFaceIds"], 1000000)) {
+                const auto id = integer(f, std::numeric_limits<std::uint32_t>::max());
+                require(id != 0 && local.insert(id).second && ++twoSidedSurfaces[id] <= 2);
+                region.twoSidedFaceIds.push_back(id);
+            }
+        }
+        require(!region.faceIds.empty() || !region.interfaceFaceIds.empty() ||
+                !region.twoSidedFaceIds.empty());
         result.push_back(std::move(region));
     }
     for (const auto &[id, count] : interfaces) {
         (void)count;
         require(!faces.contains(id));
     }
+    for (const auto &[id, count] : twoSidedSurfaces) {
+        (void)count;
+        require(!faces.contains(id) && !interfaces.contains(id));
+    }
+    return result;
+}
+AcousticModelDefinition
+migrateAcousticRegions(const std::vector<AcousticRegionDefinition> &regions) {
+    AcousticModelDefinition model;
+    if (regions.empty())
+        return model;
+    std::set<std::uint32_t> used;
+    for (const auto &r : regions) {
+        used.insert(r.id);
+        model.domains.push_back({r.id, r.name, BemDomainKind::interior, r.faceIds,
+                                 r.twoSidedFaceIds, r.needsAssignmentReview});
+    }
+    std::uint32_t exterior = 1;
+    while (used.contains(exterior)) {
+        require(exterior < std::numeric_limits<std::uint32_t>::max());
+        ++exterior;
+    }
+    model.domains.push_back({exterior, "Außenraum", BemDomainKind::exterior, {}, {}, false});
+    std::map<std::uint32_t, std::vector<std::size_t>> owners;
+    for (std::size_t i = 0; i < regions.size(); ++i)
+        for (auto face : regions[i].interfaceFaceIds)
+            owners[face].push_back(i);
+    std::map<std::pair<std::size_t, std::size_t>, std::vector<std::uint32_t>> grouped;
+    for (const auto &[face, indices] : owners) {
+        require(!indices.empty() && indices.size() <= 2);
+        grouped[{indices[0], indices.size() == 2 ? indices[1] : regions.size()}].push_back(face);
+    }
+    for (const auto &[pair, faces] : grouped) {
+        const auto id = static_cast<std::uint32_t>(model.interfaces.size() + 1);
+        model.interfaces.push_back(
+            {id, regions[pair.first].name + " / Interface", regions[pair.first].id,
+             pair.second == regions.size() ? exterior : regions[pair.second].id, faces,
+             regions[pair.first].needsAssignmentReview ||
+                 (pair.second != regions.size() && regions[pair.second].needsAssignmentReview)});
+    }
+    return model;
+}
+QJsonArray encodeElementGroups(const std::vector<AcousticElementGroup> &groups) {
+    QJsonArray result;
+    for (const auto &group : groups) {
+        QJsonArray faces;
+        for (auto id : group.faceIds)
+            faces.append(double(id));
+        result.append(QJsonObject{{"id", double(group.id)},
+                                  {"name", QString::fromStdString(group.name)},
+                                  {"faceIds", faces}});
+    }
+    return result;
+}
+std::vector<AcousticElementGroup> decodeElementGroups(const QJsonValue &value,
+                                                      const std::vector<std::uint32_t> &allowed) {
+    std::vector<AcousticElementGroup> result;
+    std::set<std::uint32_t> ids, used;
+    const std::set<std::uint32_t> source(allowed.begin(), allowed.end());
+    for (const auto &item : array(value, 100000)) {
+        const auto o = object(item);
+        keys(o, {"id", "name", "faceIds"});
+        AcousticElementGroup group;
+        group.id = integer(o["id"], std::numeric_limits<std::uint32_t>::max());
+        group.name = text(o["name"]).toStdString();
+        require(group.id && !group.name.empty() && ids.insert(group.id).second);
+        for (const auto &face : array(o["faceIds"], 1000000, 1)) {
+            auto id = integer(face, std::numeric_limits<std::uint32_t>::max());
+            require(source.contains(id) && used.insert(id).second);
+            group.faceIds.push_back(id);
+        }
+        result.push_back(std::move(group));
+    }
+    return result;
+}
+QJsonObject encodeAcousticModel(const AcousticModelDefinition &model) {
+    QJsonArray domains, interfaces;
+    for (const auto &d : model.domains) {
+        QJsonArray faces, twoSided;
+        for (auto id : d.faceIds)
+            faces.append(double(id));
+        for (auto id : d.twoSidedFaceIds)
+            twoSided.append(double(id));
+        domains.append(
+            QJsonObject{{"id", double(d.id)},
+                        {"name", QString::fromStdString(d.name)},
+                        {"kind", d.kind == BemDomainKind::interior ? "interior" : "exterior"},
+                        {"faceIds", faces},
+                        {"twoSidedFaceIds", twoSided},
+                        {"needsAssignmentReview", d.needsAssignmentReview},
+                        {"groups", encodeElementGroups(d.groups)}});
+    }
+    for (const auto &i : model.interfaces) {
+        QJsonArray faces;
+        for (auto id : i.faceIds)
+            faces.append(double(id));
+        interfaces.append(QJsonObject{{"id", double(i.id)},
+                                      {"name", QString::fromStdString(i.name)},
+                                      {"firstDomainId", double(i.firstDomainId)},
+                                      {"secondDomainId", double(i.secondDomainId)},
+                                      {"faceIds", faces},
+                                      {"needsAssignmentReview", i.needsAssignmentReview},
+                                      {"groups", encodeElementGroups(i.groups)}});
+    }
+    QJsonValue baffle(QJsonValue::Null);
+    if (model.exteriorBaffle) {
+        const auto &b = *model.exteriorBaffle;
+        baffle = QJsonObject{{"origin", encodeVector(b.origin)},
+                             {"normal", encodeVector(b.normal)},
+                             {"planeDistanceTolerance", b.planeDistanceTolerance}};
+    }
+    return {{"domains", domains}, {"interfaces", interfaces}, {"exteriorBaffle", baffle}};
+}
+AcousticModelDefinition decodeAcousticModel(const QJsonValue &value) {
+    const auto o = object(value);
+    keys(o, {"domains", "interfaces", "exteriorBaffle"});
+    AcousticModelDefinition result;
+    std::set<std::uint32_t> domainIds, interfaceIds, physicalFaces, interfaceFaces;
+    std::map<std::uint32_t, unsigned> twoSidedFaces;
+    unsigned exteriorCount = 0;
+    auto readFaces = [](const QJsonValue &v) {
+        std::vector<std::uint32_t> faces;
+        std::set<std::uint32_t> seen;
+        for (const auto &item : array(v, 1000000)) {
+            const auto id = integer(item, std::numeric_limits<std::uint32_t>::max());
+            require(id && seen.insert(id).second);
+            faces.push_back(id);
+        }
+        return faces;
+    };
+    for (const auto &item : array(o["domains"], 10000)) {
+        const auto d = object(item);
+        auto required = d;
+        required.remove("groups");
+        keys(required,
+             {"id", "name", "kind", "faceIds", "twoSidedFaceIds", "needsAssignmentReview"});
+        AcousticDomainDefinition domain;
+        domain.id = integer(d["id"], std::numeric_limits<std::uint32_t>::max());
+        domain.name = text(d["name"]).toStdString();
+        const auto kind = text(d["kind"]);
+        require(kind == "interior" || kind == "exterior");
+        domain.kind = kind == "interior" ? BemDomainKind::interior : BemDomainKind::exterior;
+        exteriorCount += domain.kind == BemDomainKind::exterior;
+        require(domain.id && !domain.name.empty() && domainIds.insert(domain.id).second);
+        domain.faceIds = readFaces(d["faceIds"]);
+        domain.twoSidedFaceIds = readFaces(d["twoSidedFaceIds"]);
+        domain.needsAssignmentReview = boolean(d["needsAssignmentReview"]);
+        if (d.contains("groups")) {
+            auto allowed = domain.faceIds;
+            allowed.insert(allowed.end(), domain.twoSidedFaceIds.begin(),
+                           domain.twoSidedFaceIds.end());
+            domain.groups = decodeElementGroups(d["groups"], allowed);
+        }
+        for (auto id : domain.faceIds)
+            require(physicalFaces.insert(id).second);
+        for (auto id : domain.twoSidedFaceIds)
+            require(++twoSidedFaces[id] <= 2);
+        result.domains.push_back(std::move(domain));
+    }
+    require(result.domains.empty() ? exteriorCount == 0 : exteriorCount == 1);
+    for (const auto &item : array(o["interfaces"], 10000)) {
+        const auto i = object(item);
+        auto required = i;
+        required.remove("groups");
+        keys(required,
+             {"id", "name", "firstDomainId", "secondDomainId", "faceIds", "needsAssignmentReview"});
+        AcousticInterfaceDefinition interface;
+        interface.id = integer(i["id"], std::numeric_limits<std::uint32_t>::max());
+        interface.name = text(i["name"]).toStdString();
+        interface.firstDomainId =
+            integer(i["firstDomainId"], std::numeric_limits<std::uint32_t>::max());
+        interface.secondDomainId =
+            integer(i["secondDomainId"], std::numeric_limits<std::uint32_t>::max());
+        interface.faceIds = readFaces(i["faceIds"]);
+        interface.needsAssignmentReview = boolean(i["needsAssignmentReview"]);
+        if (i.contains("groups"))
+            interface.groups = decodeElementGroups(i["groups"], interface.faceIds);
+        require(interface.id && !interface.name.empty() &&
+                interfaceIds.insert(interface.id).second &&
+                domainIds.contains(interface.firstDomainId) &&
+                domainIds.contains(interface.secondDomainId) &&
+                interface.firstDomainId != interface.secondDomainId && !interface.faceIds.empty());
+        for (auto id : interface.faceIds)
+            require(!physicalFaces.contains(id) && interfaceFaces.insert(id).second);
+        result.interfaces.push_back(std::move(interface));
+    }
+    if (!o["exteriorBaffle"].isNull()) {
+        const auto b = object(o["exteriorBaffle"]);
+        keys(b, {"origin", "normal", "planeDistanceTolerance"});
+        ExteriorBaffle baffle{vector(b["origin"]), vector(b["normal"]),
+                              range(b["planeDistanceTolerance"], 1e-9, .01)};
+        const double length = std::hypot(baffle.normal.x, baffle.normal.y, baffle.normal.z);
+        require(std::isfinite(length) && std::abs(length - 1.) < 1e-8 && exteriorCount == 1);
+        result.exteriorBaffle = baffle;
+    }
+    for (const auto &d : result.domains)
+        for (auto id : d.twoSidedFaceIds)
+            require(!physicalFaces.contains(id) && !interfaceFaces.contains(id));
     return result;
 }
 QJsonObject encodeAxisymmetricSampling(const AxisymmetricSamplingSettings &s) {
@@ -470,7 +662,7 @@ std::vector<std::uint32_t> decodeIndices(const QJsonValue &value, std::size_t li
     return result;
 }
 QJsonObject encodeSubdomains(const BemSubdomainModel &model) {
-    QJsonArray domains, interfaces;
+    QJsonArray domains, interfaces, twoSidedSurfaces;
     for (const auto &d : model.domains) {
         QJsonArray panels;
         for (const auto &p : d.panels)
@@ -487,11 +679,18 @@ QJsonObject encodeSubdomains(const BemSubdomainModel &model) {
                                       {"first", double(i.firstDomainId)},
                                       {"second", double(i.secondDomainId)},
                                       {"triangles", encodeIndices(i.triangleIndices)}});
-    return {{"domains", domains}, {"interfaces", interfaces}};
+    for (const auto &wall : model.twoSidedSurfaces)
+        twoSidedSurfaces.append(QJsonObject{{"first", double(wall.firstDomainId)},
+                                            {"second", double(wall.secondDomainId)},
+                                            {"triangles", encodeIndices(wall.triangleIndices)}});
+    return {
+        {"domains", domains}, {"interfaces", interfaces}, {"twoSidedSurfaces", twoSidedSurfaces}};
 }
 BemSubdomainModel decodeSubdomains(const QJsonValue &value, const SurfaceMesh &mesh) {
     const auto o = object(value);
-    keys(o, {"domains", "interfaces"});
+    auto required = o;
+    required.remove("twoSidedSurfaces");
+    keys(required, {"domains", "interfaces"});
     BemSubdomainModel result;
     std::set<std::uint32_t> domains, interfaces;
     for (const auto &v : array(o["domains"], 10000, 1)) {
@@ -529,7 +728,37 @@ BemSubdomainModel decodeSubdomains(const QJsonValue &value, const SurfaceMesh &m
         require(!face.triangleIndices.empty());
         result.interfaces.push_back(std::move(face));
     }
+    if (o.contains("twoSidedSurfaces"))
+        for (const auto &v : array(o["twoSidedSurfaces"], 10000)) {
+            const auto w = object(v);
+            keys(w, {"first", "second", "triangles"});
+            BemTwoSidedSurface wall;
+            wall.firstDomainId = integer(w["first"], UINT32_MAX);
+            wall.secondDomainId = integer(w["second"], UINT32_MAX);
+            require(wall.firstDomainId != wall.secondDomainId &&
+                    domains.contains(wall.firstDomainId) && domains.contains(wall.secondDomainId));
+            wall.triangleIndices = decodeIndices(w["triangles"], mesh.triangles.size());
+            require(!wall.triangleIndices.empty());
+            result.twoSidedSurfaces.push_back(std::move(wall));
+        }
     return result;
+}
+QJsonObject encodeSymmetry(const OrthogonalSymmetryPlanes &s) {
+    return {{"origin", encodeVector(s.origin)},
+            {"firstNormal", encodeVector(s.firstNormal)},
+            {"secondNormal", encodeVector(s.secondNormal)},
+            {"planeDistanceTolerance", s.planeDistanceTolerance}};
+}
+OrthogonalSymmetryPlanes decodeSymmetry(const QJsonValue &value) {
+    const auto o = object(value);
+    keys(o, {"origin", "firstNormal", "secondNormal", "planeDistanceTolerance"});
+    OrthogonalSymmetryPlanes s{vector(o["origin"]), vector(o["firstNormal"]),
+                               vector(o["secondNormal"]),
+                               range(o["planeDistanceTolerance"], 1e-9, .01)};
+    require(s.origin == Vec3{} &&
+            (s.firstNormal == Vec3{1, 0, 0} || s.firstNormal == Vec3{-1, 0, 0}) &&
+            (s.secondNormal == Vec3{0, 1, 0} || s.secondNormal == Vec3{0, -1, 0}));
+    return s;
 }
 QJsonObject encodeRequest(const BemRequest &r) {
     QJsonArray frequencies, observers, excitations;
@@ -555,6 +784,22 @@ QJsonObject encodeRequest(const BemRequest &r) {
                                   {"referenceDistance", r.farField->referenceDistance}});
     if (r.coupling)
         result.insert("coupling", encodeLemNetwork(*r.coupling));
+    require(r.observerValidity == exteriorObserverValidity(r));
+    if (!r.observerValidity.empty()) {
+        QJsonArray validity;
+        for (auto value : r.observerValidity)
+            validity.append(int(value));
+        result.insert("observerValidity", validity);
+    }
+    if (r.symmetry)
+        result.insert("symmetry", encodeSymmetry(*r.symmetry));
+    if (r.exteriorBaffle) {
+        const auto &b = *r.exteriorBaffle;
+        result.insert("exteriorBaffle",
+                      QJsonObject{{"origin", encodeVector(b.origin)},
+                                  {"normal", encodeVector(b.normal)},
+                                  {"planeDistanceTolerance", b.planeDistanceTolerance}});
+    }
     if (r.subdomains)
         result.insert("subdomains", encodeSubdomains(*r.subdomains));
     if (r.infiniteBaffle)
@@ -578,11 +823,26 @@ BemRequest decodeRequest(const QJsonValue &requestValue, const SurfaceMesh &mesh
     required.remove("infiniteBaffle");
     required.remove("axisymmetric");
     required.remove("subdomains");
+    required.remove("symmetry");
+    required.remove("exteriorBaffle");
+    required.remove("observerValidity");
     keys(required, {"medium", "frequencies", "observers", "excitations", "numerics"});
     BemRequest r;
+    if (o.contains("symmetry"))
+        r.symmetry = decodeSymmetry(o["symmetry"]);
+    if (o.contains("exteriorBaffle")) {
+        const auto b = object(o["exteriorBaffle"]);
+        keys(b, {"origin", "normal", "planeDistanceTolerance"});
+        r.exteriorBaffle = ExteriorBaffle{vector(b["origin"]), vector(b["normal"]),
+                                          range(b["planeDistanceTolerance"], 1e-9, .01)};
+    }
     if (o.contains("subdomains")) {
         r.subdomains = decodeSubdomains(o["subdomains"], mesh);
-        validateAcousticPartition(mesh, *r.subdomains);
+        if (r.symmetry)
+            validateSymmetryAcousticPartition(mesh, *r.subdomains, *r.symmetry,
+                                              r.exteriorBaffle ? &*r.exteriorBaffle : nullptr);
+        else
+            validateAcousticPartition(mesh, *r.subdomains);
     }
     r.medium = decodeMedium(o["medium"]);
     r.numerics = decodeNumerics(o["numerics"]);
@@ -672,6 +932,12 @@ BemRequest decodeRequest(const QJsonValue &requestValue, const SurfaceMesh &mesh
         }
         r.excitations.push_back(std::move(e));
     }
+    if (o.contains("observerValidity")) {
+        for (const auto &value :
+             array(o["observerValidity"], r.observers.size(), r.observers.size()))
+            r.observerValidity.push_back(static_cast<std::uint8_t>(integer(value, 1)));
+    }
+    require(r.observerValidity == exteriorObserverValidity(r));
     return r;
 }
 QJsonArray encodeLevelEvidence(const std::vector<BemFastMultipoleLevelEvidence> &levels) {
@@ -1147,7 +1413,8 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
         request.axisymmetric
             ? bem_detail::validateAxisymmetricReduction(mesh, {}, *request.axisymmetric)
                   .pressureCount
-            : mesh.vertices.size();
+            : (request.subdomains ? makeAcousticPressureDofMap(mesh, *request.subdomains).count
+                                  : mesh.vertices.size());
     require(r.triangleCount == mesh.triangles.size() && r.pressureDofCount == pressureCount);
     const auto measures = surfaceMeasures(mesh, request.axisymmetric);
     const auto exteriorMesh =
@@ -1413,6 +1680,7 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                 }
             }
             e.observerPressure = decodePressure(item["observerPressure"], request.observers.size());
+            e.observerValidity = request.observerValidity;
             const unsigned couplingPasses =
                 e.lemSolution ? static_cast<unsigned>(e.lemSolution->ports.size()) + 1u : 1u;
             std::uint64_t auditPasses = 1;
@@ -1548,27 +1816,53 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                                               interface.triangleIndices.end());
                 std::map<std::uint32_t, FaceIntegral> integrals;
                 std::map<std::uint32_t, std::complex<double>> panelMeans;
+                std::map<std::pair<std::uint32_t, std::uint32_t>, std::complex<double>> sideMeans;
+                std::map<std::uint32_t, std::vector<std::uint32_t>> owners;
                 for (const auto &trace : e.subdomainTraces()) {
                     std::map<std::uint32_t, std::complex<double>> pressure;
                     for (std::size_t i = 0; i < trace.vertexIndices.size(); ++i)
                         pressure.emplace(trace.vertexIndices[i], trace.pressureTrace[i]);
                     for (auto index : trace.triangleIndices) {
-                        const auto &triangle = mesh.triangles[index];
                         if (interfaceTriangles.contains(index))
                             continue;
+                        const auto &triangle = mesh.triangles[index];
                         const auto mean =
                             (pressure.at(triangle.vertices[0]) + pressure.at(triangle.vertices[1]) +
                              pressure.at(triangle.vertices[2])) /
                             3.;
-                        require(panelMeans.emplace(index, mean).second);
-                        if (!assigned.contains(triangle.faceId))
-                            continue;
-                        auto &sum = integrals[triangle.faceId];
-                        const auto area = measures.areas[index];
-                        sum.area += area;
-                        sum.pressure += area * mean;
-                        sum.absolutePressure += area * std::abs(mean);
+                        require(
+                            sideMeans.emplace(std::make_pair(index, trace.domainId), mean).second);
+                        owners[index].push_back(trace.domainId);
                     }
+                }
+                std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> twoSided;
+                for (const auto &surface : request.subdomains->twoSidedSurfaces)
+                    for (auto index : surface.triangleIndices)
+                        require(twoSided
+                                    .emplace(index, std::make_pair(surface.firstDomainId,
+                                                                   surface.secondDomainId))
+                                    .second);
+                const double symmetryFactor = request.symmetry ? 4. : 1.;
+                for (const auto &[index, domainIds] : owners) {
+                    const auto &triangle = mesh.triangles[index];
+                    std::complex<double> mean{};
+                    if (twoSided.contains(index)) {
+                        const auto [first, second] = twoSided.at(index);
+                        require(domainIds.size() == 2 && sideMeans.contains({index, first}) &&
+                                sideMeans.contains({index, second}));
+                        mean = sideMeans.at({index, first}) - sideMeans.at({index, second});
+                    } else {
+                        require(domainIds.size() == 1);
+                        mean = sideMeans.at({index, domainIds.front()});
+                        panelMeans.emplace(index, mean);
+                    }
+                    if (!assigned.contains(triangle.faceId))
+                        continue;
+                    auto &sum = integrals[triangle.faceId];
+                    const auto area = symmetryFactor * measures.areas[index];
+                    sum.area += area;
+                    sum.pressure += area * mean;
+                    sum.absolutePressure += area * std::abs(mean);
                 }
                 if (request.coupling) {
                     const auto ports = lem::bemPorts(*request.coupling);
@@ -1637,6 +1931,12 @@ QJsonObject encodeSimulation(const SimulationArchive &a) {
     require(!a.resultComplete.has_value() || bool(a.result));
     require(!a.current || a.resultComplete.value_or(true));
     const auto &s = a.settings;
+    (void)decodeAcousticModel(encodeAcousticModel(s.acousticModel));
+    (void)decodeAcousticModel(encodeAcousticModel(a.resultModel));
+    if (a.result && a.request)
+        for (const auto &frequency : a.result->frequencies)
+            for (const auto &excitation : frequency.excitations)
+                require(excitation.observerValidity == a.request->observerValidity);
     QJsonArray measurements;
     for (const auto &curve : a.measurements) {
         validateMeasuredResponse(curve);
@@ -1680,16 +1980,21 @@ QJsonObject encodeSimulation(const SimulationArchive &a) {
          a.request ? QJsonValue(encodeRequest(*a.request)) : QJsonValue(QJsonValue::Null)},
         {"result", a.result ? QJsonValue(encodeResult(*a.result)) : QJsonValue(QJsonValue::Null)}};
     if (a.request && a.request->subdomains) {
-        require(bool(a.sourceMesh) && !a.resultRegions.empty());
+        require(bool(a.sourceMesh) && !a.resultModel.domains.empty());
         result.insert("sourceMesh", encodeMesh(*a.sourceMesh));
-        result.insert("resultRegions", encodeAcousticRegions(a.resultRegions));
+        result.insert("resultModel", encodeAcousticModel(a.resultModel));
     } else
-        require(!a.sourceMesh && a.resultRegions.empty());
+        require(!a.sourceMesh && a.resultModel.domains.empty());
     if (a.result && a.resultComplete)
         result.insert("resultComplete", *a.resultComplete);
     auto couplingSettings = result["settings"].toObject();
     require(s.ctaExcitationIndex >= -1 && s.ctaExcitationIndex <= 10000);
-    couplingSettings.insert("acousticRegions", encodeAcousticRegions(s.acousticRegions));
+    couplingSettings.insert("acousticModel", encodeAcousticModel(s.acousticModel));
+    require(std::isfinite(s.symmetryPlaneTolerance) && s.symmetryPlaneTolerance >= 1e-9 &&
+            s.symmetryPlaneTolerance <= .01);
+    couplingSettings.insert("symmetryXY",
+                            QJsonObject{{"enabled", s.symmetryXYEnabled},
+                                        {"planeDistanceTolerance", s.symmetryPlaneTolerance}});
     couplingSettings.insert("ctaExcitationIndex", s.ctaExcitationIndex);
     couplingSettings.insert("couplingEnabled", s.couplingEnabled);
     couplingSettings.insert("couplingNetwork", encodeLemNetwork(s.couplingNetwork));
@@ -1722,6 +2027,7 @@ SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) 
     required.remove("resultComplete");
     required.remove("sourceMesh");
     required.remove("resultRegions");
+    required.remove("resultModel");
     keys(required, {"settings", "revision", "current", "solvedMesh", "request", "result"});
     SimulationArchive a;
     if (o.contains("axisymmetricSampling"))
@@ -1745,6 +2051,8 @@ SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) 
     const auto settings = object(o["settings"]);
     auto requiredSettings = settings;
     requiredSettings.remove("acousticRegions");
+    requiredSettings.remove("acousticModel");
+    requiredSettings.remove("symmetryXY");
     requiredSettings.remove("ctaExcitationIndex");
     requiredSettings.remove("beamwidthTarget");
     requiredSettings.remove("normAngle");
@@ -1767,8 +2075,20 @@ SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) 
     keys(requiredSettings, {"minimumFrequency", "maximumFrequency", "frequencyCount", "medium",
                             "velocityScale", "phaseDegrees", "normalizeToOnAxis"});
     auto &s = a.settings;
+    if (settings.contains("symmetryXY")) {
+        const auto symmetry = object(settings["symmetryXY"]);
+        keys(symmetry, {"enabled", "planeDistanceTolerance"});
+        s.symmetryXYEnabled = boolean(symmetry["enabled"]);
+        s.symmetryPlaneTolerance = range(symmetry["planeDistanceTolerance"], 1e-9, .01);
+    }
+    require(!(settings.contains("acousticRegions") && settings.contains("acousticModel")));
+    require(formatVersion < 18 ? !settings.contains("acousticModel")
+                               : settings.contains("acousticModel"));
     if (settings.contains("acousticRegions"))
-        s.acousticRegions = decodeAcousticRegions(settings["acousticRegions"]);
+        s.acousticModel =
+            migrateAcousticRegions(decodeAcousticRegions(settings["acousticRegions"]));
+    if (settings.contains("acousticModel"))
+        s.acousticModel = decodeAcousticModel(settings["acousticModel"]);
     if (settings.contains("ctaExcitationIndex")) {
         const double selection = range(settings["ctaExcitationIndex"], -1, 10000);
         require(std::floor(selection) == selection);
@@ -1855,11 +2175,16 @@ SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) 
     require(!a.current || a.resultComplete.value_or(false));
     require(!a.current || s.couplingEnabled || !hasBoundInterfacePorts(s.couplingNetwork));
     const bool partitioned = !o["request"].isNull() && object(o["request"]).contains("subdomains");
-    require(o.contains("sourceMesh") == partitioned && o.contains("resultRegions") == partitioned);
+    require(o.contains("sourceMesh") == partitioned);
+    require(!(o.contains("resultRegions") && o.contains("resultModel")));
+    require((formatVersion < 18 ? o.contains("resultRegions") : o.contains("resultModel")) ==
+            partitioned);
     if (partitioned) {
         a.sourceMesh = std::make_shared<SurfaceMesh>(decodeMesh(o["sourceMesh"], false));
-        a.resultRegions = decodeAcousticRegions(o["resultRegions"]);
-        require(!a.resultRegions.empty());
+        a.resultModel = formatVersion < 18
+                            ? migrateAcousticRegions(decodeAcousticRegions(o["resultRegions"]))
+                            : decodeAcousticModel(o["resultModel"]);
+        require(!a.resultModel.domains.empty());
     }
     if (!o["solvedMesh"].isNull())
         a.mesh = std::make_shared<SurfaceMesh>(decodeMesh(o["solvedMesh"], !partitioned));
@@ -1891,9 +2216,18 @@ SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) 
             require(*a.axisymmetricSampling == s.axisymmetricSampling);
     }
     require(!a.current || a.request->infiniteBaffle == s.infiniteBaffle);
-    require(!a.current || !partitioned || a.resultRegions == s.acousticRegions);
-    require(!a.current || std::none_of(s.acousticRegions.begin(), s.acousticRegions.end(),
-                                       [](const auto &r) { return r.needsAssignmentReview; }));
+    require(!a.current || a.request->exteriorBaffle == s.acousticModel.exteriorBaffle);
+    require(!a.current || !partitioned || a.resultModel == s.acousticModel);
+    if (a.current) {
+        require(a.request->symmetry.has_value() == s.symmetryXYEnabled);
+        if (a.request->symmetry)
+            require(a.request->symmetry->planeDistanceTolerance == s.symmetryPlaneTolerance);
+    }
+    require(!a.current ||
+            (std::none_of(s.acousticModel.domains.begin(), s.acousticModel.domains.end(),
+                          [](const auto &r) { return r.needsAssignmentReview; }) &&
+             std::none_of(s.acousticModel.interfaces.begin(), s.acousticModel.interfaces.end(),
+                          [](const auto &i) { return i.needsAssignmentReview; })));
     if (a.current) {
         require(a.request->coupling.has_value() == s.couplingEnabled);
         if (a.request->coupling)

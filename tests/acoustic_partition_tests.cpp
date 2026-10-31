@@ -127,7 +127,10 @@ int main() {
             exteriorLink = exteriorLink || (link.firstDomainId == 8 && link.secondDomainId != 7);
         }
         require(innerLink && exteriorLink, "Wrong domain graph for the split horn.");
-        rejects([&] { partitionAcousticSurface(physical, {}, options); });
+        rejects([&] {
+            partitionAcousticSurface(physical, std::span<const AcousticRegionDefinition>{},
+                                     options);
+        });
         rejects([&] {
             partitionAcousticSurface(
                 physical, std::vector<AcousticRegionDefinition>{{7, "bad", {999}}}, options);

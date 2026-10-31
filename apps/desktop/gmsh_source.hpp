@@ -8,9 +8,9 @@
 namespace hornsculpt {
 std::shared_ptr<const CadSnapshot> makeGmshCadSnapshot(const MeshImportSelection &selection,
                                                        const QString &filename);
-MeshingResult validateGmshMesh(const SurfaceMesh &mesh,
-                               std::span<const AcousticRegionDefinition> regions,
-                               const MeshingOptions &options, std::stop_token stop = {});
+MeshingResult validateGmshMesh(const SurfaceMesh &mesh, const AcousticModelDefinition &model,
+                               const MeshingOptions &options, std::stop_token stop = {},
+                               const OrthogonalSymmetryPlanes *symmetry = nullptr);
 QJsonObject encodeGmshMetadata(const MeshImportSelection &selection);
 MeshImportSelection decodeGmshMetadata(const QJsonObject &json, const SurfaceMesh &mesh);
 } // namespace hornsculpt

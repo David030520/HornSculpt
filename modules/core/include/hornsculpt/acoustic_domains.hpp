@@ -30,9 +30,17 @@ struct BemInterface {
     std::vector<std::uint32_t> triangleIndices;
     bool operator==(const BemInterface &) const = default;
 };
+// One physical Wall or Driven surface with independent pressure traces on its two sides.
+struct BemTwoSidedSurface {
+    std::uint32_t firstDomainId{};
+    std::uint32_t secondDomainId{};
+    std::vector<std::uint32_t> triangleIndices;
+    bool operator==(const BemTwoSidedSurface &) const = default;
+};
 struct BemSubdomainModel {
     std::vector<BemSubdomain> domains;
     std::vector<BemInterface> interfaces;
+    std::vector<BemTwoSidedSurface> twoSidedSurfaces;
     bool operator==(const BemSubdomainModel &) const = default;
 };
 

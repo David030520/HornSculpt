@@ -340,6 +340,8 @@ evaluatePressureField(const SurfaceMesh &mesh, const BemRequest &request, double
         settings.relativeQuadratureTolerance <= 0 || settings.relativeQuadratureTolerance > .01 ||
         settings.maximumQuadratureDepth > 12)
         throw std::invalid_argument("Invalid pressure field settings.");
+    if (request.symmetry)
+        throw std::invalid_argument("Finite field evaluation with symmetry is not yet supported.");
     if (request.subdomains)
         return evaluateSubdomainField(mesh, request, frequency, solution, points, settings, stop,
                                       progress);

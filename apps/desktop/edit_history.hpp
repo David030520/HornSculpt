@@ -34,7 +34,9 @@ struct EditState {
     std::optional<CadAssignmentState> cad;
     lem::Network couplingNetwork;
     bool couplingEnabled{};
-    std::vector<AcousticRegionDefinition> acousticRegions;
+    AcousticModelDefinition acousticModel;
+    bool symmetryXYEnabled{};
+    double symmetryPlaneTolerance{1e-6};
 };
 
 bool sameCadGeometry(const std::optional<CadAssignmentState> &a,
