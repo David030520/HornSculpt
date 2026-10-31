@@ -50,6 +50,7 @@ class MainWindow final : public QMainWindow {
     bool saveInProgress() const noexcept;
     ~MainWindow() override;
     void openProject(const QString &path);
+    Project projectState() const;
     void openStep(const QString &path);
     bool sourceImportInProgress() const noexcept;
     QString sourceImportError() const;
@@ -125,7 +126,6 @@ class MainWindow final : public QMainWindow {
     void markDirty();
     void updateMeshStatus();
     void updateSourcePresentation();
-    Project projectState() const;
     void applyProject(const Project &project);
     void loadProject(const QString &path);
     void setDiagnostic(const QString &message, bool error = false);

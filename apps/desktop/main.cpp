@@ -5,8 +5,10 @@
 #include <QCommandLineParser>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QSettings>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QTranslator>
 #include <cstdio>
@@ -38,6 +40,10 @@ int main(int argc, char **argv) {
         {"mesh-test", "Erzeugt beim Smoke-Test zusätzlich ein geprüftes isotropes Netz."});
     parser.addOption({"solver-test", "Prüft zwei CUDA-Sweeps mit 7 Frequenzen von 400 bis 4000 Hz "
                                      "und vollständigen Ergebnis-Save/Open."});
+    parser.addOption(
+        {"solve-project",
+         "Berechnet das geöffnete Projekt und speichert das Ergebnis unter einem neuen Namen.",
+         "output"});
     parser.addOption({"project-test",
                       "Prüft den vollständigen Import einer angegebenen Projektdatei ohne Solve."});
     parser.addOption({"screenshot", "Speichert nach dem Aufbau ein Bild des Fensters.", "path"});
@@ -59,6 +65,29 @@ int main(int argc, char **argv) {
     if (parser.isSet("project-test") &&
         (parser.isSet("smoke-test") || parser.isSet("mesh-test") || parser.isSet("solver-test")))
         parser.showHelp(1);
+    const bool solveProject = parser.isSet("solve-project");
+    if (solveProject) {
+        const auto inputs = parser.positionalArguments();
+        const auto output = parser.value("solve-project");
+        if (inputs.size() != 1 || output.isEmpty() ||
+            QFileInfo(inputs.front()).suffix().compare("hsproj", Qt::CaseInsensitive) != 0 ||
+            QFileInfo(output).suffix().compare("hsproj", Qt::CaseInsensitive) != 0 ||
+            parser.isSet("smoke-test") || parser.isSet("mesh-test") ||
+            parser.isSet("solver-test") || parser.isSet("project-test") ||
+            parser.isSet("screenshot") || parser.isSet("screenshot-view") || parser.isSet("view") ||
+            parser.isSet("evaluate-field")) {
+            std::fprintf(stderr, "--solve-project benötigt genau eine Eingabeprojektdatei und "
+                                 "einen neuen .hsproj-Ausgabepfad ohne Testoptionen.\n");
+            return 1;
+        }
+        const QFileInfo inputInfo(inputs.front()), outputInfo(output);
+        if (!inputInfo.exists() || !inputInfo.isFile() || outputInfo.exists() ||
+            inputInfo.absoluteFilePath().compare(outputInfo.absoluteFilePath(),
+                                                 Qt::CaseInsensitive) == 0) {
+            std::fprintf(stderr, "Eingabe fehlt oder Ausgabedatei existiert bereits.\n");
+            return 1;
+        }
+    }
     hornsculpt::MainWindow window;
     hornsculpt::installBranding(window);
     if (!parser.positionalArguments().isEmpty()) {
@@ -70,6 +99,126 @@ int main(int argc, char **argv) {
             window.openProject(path);
     }
     window.show();
+    if (solveProject) {
+        auto *timer = new QTimer(&window);
+        timer->setInterval(100);
+        auto elapsed = std::make_shared<QElapsedTimer>();
+        elapsed->start();
+        auto stage = std::make_shared<int>(0);
+        auto phaseStart = std::make_shared<qint64>(0);
+        const QString output = QFileInfo(parser.value("solve-project")).absoluteFilePath();
+        QObject::connect(
+            timer, &QTimer::timeout, &window,
+            [&app, &window, timer, elapsed, stage, phaseStart, output] {
+                try {
+                    if (window.sourceImportInProgress())
+                        return;
+                    if (!window.sourceImportError().isEmpty())
+                        throw std::runtime_error(window.sourceImportError().toStdString());
+                    if (!window.geometryReady())
+                        throw std::runtime_error(
+                            "Projektgeometrie ist nicht aktuell oder ungültig.");
+                    if (*stage == 0) {
+                        std::fprintf(stdout, "Projekt geladen; Revision %llu.\n",
+                                     static_cast<unsigned long long>(window.revision()));
+                        std::fflush(stdout);
+                        if (!window.meshReady()) {
+                            window.requestMesh();
+                            *phaseStart = elapsed->elapsed();
+                            *stage = 1;
+                            return;
+                        }
+                        *stage = 2;
+                    }
+                    if (*stage == 1) {
+                        if (window.meshInProgress())
+                            return;
+                        if (!window.meshReady()) {
+                            const auto error = window.lastMeshError();
+                            throw std::runtime_error(error.isEmpty()
+                                                         ? "Netzerstellung fehlgeschlagen."
+                                                         : error.toStdString());
+                        }
+                        std::fprintf(stdout, "Netz erstellt in %lld ms.\n",
+                                     static_cast<long long>(elapsed->elapsed() - *phaseStart));
+                        *stage = 2;
+                    }
+                    if (*stage == 2) {
+                        const auto snapshot = window.projectState();
+                        const auto &settings = snapshot.simulation.settings;
+                        std::fprintf(stdout,
+                                     "Solve: %zu Frequenzen, %.9g bis %.9g Hz, Beschleunigung %d, "
+                                     "Geometriemodus %d.\n",
+                                     settings.frequencyCount, settings.minimumFrequency,
+                                     settings.maximumFrequency,
+                                     static_cast<int>(settings.acceleration),
+                                     static_cast<int>(settings.geometryMode));
+                        std::fflush(stdout);
+                        window.requestSolve();
+                        if (!window.simulationInProgress()) {
+                            const auto error = window.lastSimulationError();
+                            throw std::runtime_error(
+                                error.isEmpty() ? "Simulation konnte nicht gestartet werden."
+                                                : error.toStdString());
+                        }
+                        *phaseStart = elapsed->elapsed();
+                        *stage = 3;
+                        return;
+                    }
+                    if (window.simulationInProgress())
+                        return;
+                    if (!window.lastSimulationError().isEmpty())
+                        throw std::runtime_error(window.lastSimulationError().toStdString());
+                    if (!window.simulationReady()) {
+                        const auto error = window.lastSimulationError();
+                        throw std::runtime_error(
+                            error.isEmpty() ? "Simulation lieferte kein aktuelles Ergebnis."
+                                            : error.toStdString());
+                    }
+                    const auto snapshot = window.projectState();
+                    if (!snapshot.simulation.current || !snapshot.simulation.request ||
+                        !snapshot.simulation.result)
+                        throw std::runtime_error("Simulationssnapshot ist unvollständig.");
+                    const auto &request = *snapshot.simulation.request;
+                    const auto &result = *snapshot.simulation.result;
+                    std::fprintf(stdout,
+                                 "Ergebnis: %zu/%zu Frequenzen, %zu Dreiecke, %zu "
+                                 "Druckfreiheitsgrade; Solve %lld ms.\n",
+                                 result.frequencies.size(), request.frequencies.size(),
+                                 result.triangleCount, result.pressureDofCount,
+                                 static_cast<long long>(elapsed->elapsed() - *phaseStart));
+                    for (const auto &f : result.frequencies)
+                        std::fprintf(
+                            stdout,
+                            "%.9g Hz: Aufbau %.3f ms, Lösen %.3f ms, Faktorisierung %.3f ms, "
+                            "Rückwärtssubstitution %.3f ms, Residuum %.3f ms, Feld %.3f ms.\n",
+                            f.frequency, f.assemblyMilliseconds, f.solveMilliseconds,
+                            f.factorizationMilliseconds, f.triangularSolveMilliseconds,
+                            f.residualCheckMilliseconds, f.fieldMilliseconds);
+                    if (result.frequencies.size() != request.frequencies.size())
+                        throw std::runtime_error(
+                            "Simulationsergebnis enthält nicht alle angeforderten Frequenzen.");
+                    QTemporaryDir temporary(QFileInfo(output).absolutePath() +
+                                            "/.hornsculpt-solve-XXXXXX");
+                    if (!temporary.isValid())
+                        throw std::runtime_error(temporary.errorString().toStdString());
+                    const auto temporaryPath = temporary.filePath("result.hsproj");
+                    hornsculpt::writeProject(temporaryPath, snapshot);
+                    if (!QFile::rename(temporaryPath, output))
+                        throw std::runtime_error("Ausgabe konnte nicht angelegt werden; vorhandene "
+                                                 "Dateien werden nicht überschrieben.");
+                    std::fprintf(stdout, "Projekt gespeichert: %s\n", qPrintable(output));
+                    std::fflush(stdout);
+                    timer->stop();
+                    app.exit(0);
+                } catch (const std::exception &e) {
+                    std::fprintf(stderr, "Projektberechnung fehlgeschlagen: %s\n", e.what());
+                    timer->stop();
+                    app.exit(1);
+                }
+            });
+        timer->start();
+    }
     if (parser.isSet("smoke-test") || parser.isSet("screenshot") || parser.isSet("solver-test") ||
         parser.isSet("project-test") || parser.isSet("view") || parser.isSet("evaluate-field")) {
         auto *timer = new QTimer(&window);

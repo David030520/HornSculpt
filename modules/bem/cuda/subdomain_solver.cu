@@ -1,9 +1,14 @@
+#include "../galerkin/regular_qualification.hpp"
+#include "adaptive_patch_estimator.hpp"
+#include "subdomain_integrals.cuh"
 #include "subdomain_solver.hpp"
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <math_constants.h>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace hornsculpt::cuda_detail {
 namespace {
@@ -15,62 +20,220 @@ __device__ void addValue(cuDoubleComplex *destination, DoubleComplex value, int 
     atomicAdd(&destination->x, value.real);
     atomicAdd(&destination->y, value.imag);
 }
-// Interior trace identity in baffled_solver.cu, using the same outward-air
-// orientation for every domain, including the unbounded exterior. Interface
-// q is represented in P1, independently of physical panel DP0 fluxes.
-__global__ void assembleSamples(const SubdomainPanel *panels, const SubdomainPairSample *samples,
-                                std::size_t count, std::size_t panelCount, unsigned dimension,
-                                double k, unsigned excitationCount,
-                                const cuDoubleComplex *knownFlux, const double *rowScale,
-                                cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error) {
-    const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= count)
-        return;
-    const auto sample = samples[index];
-    const auto &test = panels[sample.testPanel];
-    const auto &trial = panels[sample.trialPanel];
-    const auto &x = test.panel;
-    const auto &y = trial.panel;
-    const auto delta = pairDelta(x, y, sample.point.test, sample.point.trial);
-    const double r = length(delta);
-    if (!(r > 0) || !isfinite(r)) {
-        atomicExch(error, 1);
-        return;
+__device__ void reduceWarpMoments(SubdomainMoments &m) {
+    for (unsigned shift = 16; shift; shift /= 2) {
+        for (unsigned i = 0; i < 9; ++i) {
+            m.pressure[i].real += __shfl_down_sync(0xffffffffu, m.pressure[i].real, shift);
+            m.pressure[i].imag += __shfl_down_sync(0xffffffffu, m.pressure[i].imag, shift);
+            m.flux[i].real += __shfl_down_sync(0xffffffffu, m.flux[i].real, shift);
+            m.flux[i].imag += __shfl_down_sync(0xffffffffu, m.flux[i].imag, shift);
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+            m.rhs[i].real += __shfl_down_sync(0xffffffffu, m.rhs[i].real, shift);
+            m.rhs[i].imag += __shfl_down_sync(0xffffffffu, m.rhs[i].imag, shift);
+        }
+        m.green.real += __shfl_down_sync(0xffffffffu, m.green.real, shift);
+        m.green.imag += __shfl_down_sync(0xffffffffu, m.green.imag, shift);
     }
-    double sine, cosine;
-    sincos(k * r, &sine, &cosine);
-    const double factor = sample.point.weight * 4 * x.area * y.area / (12.56637061435917295385 * r);
-    const DoubleComplex g{cosine * factor, -sine * factor};
-    const DoubleComplex radial{g.real - g.imag * k * r, g.imag + g.real * k * r};
-    const bool coincident = sample.testPanel == sample.trialPanel;
-    const auto d = times(radial, coincident ? 0 : dot(delta, y.normal) / (r * r));
-    const auto kp = times(radial, coincident ? 0 : -dot(delta, x.normal) / (r * r));
-    const double nn = dot(x.normal, y.normal);
-    const DoubleComplex a{d.real - k * nn * g.imag, d.imag + k * nn * g.real};
-    const DoubleComplex b{g.real - kp.imag / k, g.imag + kp.real / k};
+}
+__device__ void scatterMoments(const SubdomainMoments &m, const SubdomainPanel &test,
+                               const SubdomainPanel &trial, unsigned trialIndex,
+                               std::size_t panelCount, unsigned dimension, double k,
+                               unsigned excitationCount, const cuDoubleComplex *knownFlux,
+                               const double *rowScale, cuDoubleComplex *matrix,
+                               cuDoubleComplex *rhs, int *error) {
     for (unsigned i = 0; i < 3; ++i) {
         const auto row = test.rows[i];
-        const double scale = rowScale[row];
+        const auto scale = rowScale[row];
         for (unsigned j = 0; j < 3; ++j) {
-            const double basis = sample.point.test[i] * sample.point.trial[j];
-            const double curl = dot(x.curls[i], y.curls[j]) / k;
-            const auto av = plus(times(a, basis), {g.imag * curl, -g.real * curl});
+            const auto curl = dot(test.panel.curls[i], trial.panel.curls[j]) / k;
+            const auto value =
+                plus(m.pressure[3 * i + j], {m.green.imag * curl, -m.green.real * curl});
             addValue(matrix + row + static_cast<std::size_t>(trial.pressureColumns[j]) * dimension,
-                     times(av, scale), error);
-            if (trial.fluxColumns[j] >= 0) {
-                // Unknown is q/k, so the operator column contains -k B.
+                     times(value, scale), error);
+            if (trial.fluxColumns[j] >= 0)
                 addValue(matrix + row + static_cast<std::size_t>(trial.fluxColumns[j]) * dimension,
-                         times(b, -k * trial.fluxSign * basis * scale), error);
-            }
+                         times(m.flux[3 * i + j], -k * trial.fluxSign * scale), error);
         }
-        if (trial.fluxColumns[0] < 0) {
-            for (unsigned e = 0; e < excitationCount; ++e) {
-                const auto q = promoted(knownFlux[sample.trialPanel + e * panelCount]);
+        if (trial.fluxColumns[0] < 0)
+            for (unsigned e = 0; e < excitationCount; ++e)
                 addValue(rhs + row + static_cast<std::size_t>(e) * dimension,
-                         times(product(b, q), sample.point.test[i] * scale), error);
-            }
-        }
+                         times(product(m.rhs[i], promoted(knownFlux[trialIndex + e * panelCount])),
+                               scale),
+                         error);
     }
+}
+struct RegularPairJob {
+    unsigned test, trial, degree;
+};
+// One thread owns one regular pair and accumulates its P1 moments before
+// scattering. The same qualified tensor-product rule is used as on the host.
+__device__ void assembleRegularPair(
+    const SubdomainPanel *panels, RegularPairJob job, std::size_t panelCount, unsigned dimension,
+    double k, unsigned excitationCount, const cuDoubleComplex *knownFlux, const double *rowScale,
+    cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
+    const galerkin::TriangleQuadraturePoint *rules, unsigned n4, unsigned n6, unsigned n8,
+    const galerkin::TriangleQuadraturePoint *overrideRule = nullptr, unsigned overrideCount = 0) {
+    const auto &test = panels[job.test];
+    const auto &trial = panels[job.trial];
+    const auto &x = test.panel;
+    const auto &y = trial.panel;
+    const unsigned offset = overrideRule ? 0 : job.degree == 4 ? 0 : job.degree == 6 ? n4 : n4 + n6;
+    const unsigned n = overrideRule      ? overrideCount
+                       : job.degree == 4 ? n4
+                       : job.degree == 6 ? n6
+                                         : n8;
+    if (overrideRule)
+        rules = overrideRule;
+    SubdomainMoments moments{};
+    for (unsigned u = 0; u < n; ++u)
+        for (unsigned v = 0; v < n; ++v) {
+            const auto &xp = rules[offset + u];
+            const auto &yp = rules[offset + v];
+            galerkin::PairQuadraturePoint point{};
+            for (unsigned i = 0; i < 3; ++i) {
+                point.test[i] = xp.barycentric[i];
+                point.trial[i] = yp.barycentric[i];
+            }
+            point.weight = xp.weight * yp.weight;
+            accumulateSubdomainMoment(moments, x, y, point, k, false, trial.fluxColumns[0] >= 0,
+                                      overrideRule == nullptr, error);
+        }
+    scatterMoments(moments, test, trial, job.trial, panelCount, dimension, k, excitationCount,
+                   knownFlux, rowScale, matrix, rhs, error);
+}
+__global__ void assembleRegularPairs(const SubdomainPanel *panels, const RegularPairJob *jobs,
+                                     std::size_t count, std::size_t panelCount, unsigned dimension,
+                                     double k, unsigned excitationCount,
+                                     const cuDoubleComplex *knownFlux, const double *rowScale,
+                                     cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
+                                     const galerkin::TriangleQuadraturePoint *rules, unsigned n4,
+                                     unsigned n6, unsigned n8) {
+    const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count)
+        assembleRegularPair(panels, jobs[index], panelCount, dimension, k, excitationCount,
+                            knownFlux, rowScale, matrix, rhs, error, rules, n4, n6, n8);
+}
+// Pair qualification uses only the two interacting panel sizes. The separate
+// global endpoint check still rejects electrically unresolved meshes.
+__host__ __device__ unsigned pairMinimumDegree(double k, double testEdge, double sourceEdge,
+                                               unsigned requestedDegree) {
+    const double kh = k * (testEdge > sourceEdge ? testEdge : sourceEdge);
+    const unsigned electrical = kh <= .25 ? 4 : kh <= 1 ? 6 : kh <= 2 ? 8 : 12;
+    return electrical > requestedDegree ? electrical : requestedDegree;
+}
+__global__ void assemblePairTile(
+    const SubdomainPanel *panels, const galerkin::RegularPanelBounds *bounds, unsigned testOffset,
+    unsigned trialOffset, unsigned trialCount, std::size_t first, unsigned count,
+    std::size_t panelCount, unsigned dimension, double k, double tolerance, double nearRatio,
+    unsigned requestedDegree, unsigned excitationCount, const cuDoubleComplex *knownFlux,
+    const double *rowScale, cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error,
+    const galerkin::TriangleQuadraturePoint *rules, unsigned n4, unsigned n6, unsigned n8,
+    uint2 *fallback, unsigned *fallbackCount, bool planOnly, const unsigned *nearOffsets,
+    const unsigned *nearTrials, const std::uint8_t *wholeDegrees,
+    const galerkin::TriangleQuadraturePoint *nearRules, unsigned lowCount, unsigned highCount) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count)
+        return;
+    const auto linear = first + index;
+    const unsigned testIndex = testOffset + static_cast<unsigned>(linear / trialCount);
+    const unsigned trialIndex = trialOffset + static_cast<unsigned>(linear % trialCount);
+    if (!planOnly) {
+        unsigned left = nearOffsets[testIndex], right = nearOffsets[testIndex + 1];
+        while (left < right) {
+            const unsigned middle = left + (right - left) / 2;
+            if (nearTrials[middle] < trialIndex)
+                left = middle + 1;
+            else
+                right = middle;
+        }
+        if (left < nearOffsets[testIndex + 1] && nearTrials[left] == trialIndex)
+            return;
+    }
+    const auto &test = panels[testIndex].panel, &trial = panels[trialIndex].panel;
+    const auto topology = galerkin::classifyPairIds(test.nodes, trial.nodes).topology;
+    const auto &tb = bounds[testIndex], &sb = bounds[trialIndex];
+    const unsigned degree =
+        topology == galerkin::PairTopology::disjoint
+            ? galerkin::qualifiedRegularDegreeUnchecked(
+                  tb, sb, k, tolerance,
+                  pairMinimumDegree(k, tb.maximumEdge, sb.maximumEdge, requestedDegree))
+            : 0;
+    const double bound = tb.radius + sb.radius + nearRatio * fmax(tb.maximumEdge, sb.maximumEdge);
+    const double limit = nextafter(bound * (1 + 16 * 2.22044604925031308085e-16), CUDART_INF);
+    const double dx = tb.center.x - sb.center.x, dy = tb.center.y - sb.center.y,
+                 dz = tb.center.z - sb.center.z;
+    const double distance = hypot(hypot(dx, dy), dz);
+    const bool far = nearRatio == 0 || (isfinite(limit) && distance >= limit);
+    if (degree && far) {
+        if (planOnly)
+            return;
+        assembleRegularPair(panels, {testIndex, trialIndex, degree}, panelCount, dimension, k,
+                            excitationCount, knownFlux, rowScale, matrix, rhs, error, rules, n4, n6,
+                            n8);
+    } else if (!planOnly && wholeDegrees && wholeDegrees[index]) {
+        // A current qualified non-near rule can be cheaper than the rule
+        // accepted when this reusable plan was built at its maximum frequency.
+        const unsigned acceptedDegree = wholeDegrees[index];
+        const auto *rule = nearRules + (acceptedDegree == 14 ? lowCount : 0);
+        assembleRegularPair(panels, {testIndex, trialIndex, acceptedDegree}, panelCount, dimension,
+                            k, excitationCount, knownFlux, rowScale, matrix, rhs, error, rules, n4,
+                            n6, n8, rule, acceptedDegree == 14 ? highCount : lowCount);
+    } else {
+        const unsigned out = atomicAdd(fallbackCount, 1u);
+        fallback[out] = make_uint2(testIndex, trialIndex);
+    }
+}
+struct SingularJob {
+    unsigned test, trial, first, count;
+    galerkin::PairPermutation permutation;
+};
+struct PatchJob {
+    unsigned test, trial;
+    galerkin::PairQuadraturePatch patch;
+};
+__global__ void assembleSingularJobs(const SubdomainPanel *panels, const SingularJob *jobs,
+                                     const galerkin::PairQuadraturePoint *rules,
+                                     std::size_t panelCount, unsigned dimension, double k,
+                                     unsigned nrhs, const cuDoubleComplex *q, const double *scale,
+                                     cuDoubleComplex *matrix, cuDoubleComplex *rhs, int *error) {
+    const auto job = jobs[blockIdx.x];
+    const auto &test = panels[job.test], &trial = panels[job.trial];
+    SubdomainMoments moments{};
+    for (unsigned n = threadIdx.x; n < job.count; n += blockDim.x) {
+        const auto point = galerkin::permutePairPoint(rules[job.first + n], job.permutation);
+        accumulateSubdomainMoment(moments, test.panel, trial.panel, point, k,
+                                  job.permutation.topology == galerkin::PairTopology::coincident,
+                                  trial.fluxColumns[0] >= 0, false, error);
+    }
+    reduceWarpMoments(moments);
+    if (threadIdx.x == 0)
+        scatterMoments(moments, test, trial, job.trial, panelCount, dimension, k, nrhs, q, scale,
+                       matrix, rhs, error);
+}
+__global__ void assemblePatchJobs(const SubdomainPanel *panels, const PatchJob *jobs,
+                                  const galerkin::TriangleQuadraturePoint *rules, unsigned lowCount,
+                                  unsigned highCount, std::size_t panelCount, unsigned dimension,
+                                  double k, unsigned nrhs, const cuDoubleComplex *q,
+                                  const double *scale, cuDoubleComplex *matrix,
+                                  cuDoubleComplex *rhs, int *error) {
+    const auto job = jobs[blockIdx.x];
+    const auto &test = panels[job.test], &trial = panels[job.trial];
+    const bool high = job.patch.degree == 14;
+    const auto *rule = rules + (high ? lowCount : 0);
+    const unsigned count = high ? highCount : lowCount;
+    const unsigned points = galerkin::nearPatchPointCount(job.patch, count);
+    SubdomainMoments moments{};
+    for (unsigned n = threadIdx.x; n < points; n += blockDim.x) {
+        const auto point =
+            galerkin::mapNearPatchPoint(rule, count, job.patch, n, test.panel, trial.panel);
+        accumulateSubdomainMoment(moments, test.panel, trial.panel, point, k, false,
+                                  trial.fluxColumns[0] >= 0, false, error);
+    }
+    reduceWarpMoments(moments);
+    if (threadIdx.x == 0)
+        scatterMoments(moments, test, trial, job.trial, panelCount, dimension, k, nrhs, q, scale,
+                       matrix, rhs, error);
 }
 __global__ void assembleMass(const SubdomainPanel *panels, std::size_t count,
                              std::size_t fluxStride, unsigned dimension, double k,
@@ -107,18 +270,22 @@ void checkLaunch(const char *operation) {
         throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
 }
 } // namespace
-void assembleSubdomainSamples(const SubdomainPanel *panels, const SubdomainPairSample *samples,
-                              std::size_t count, std::size_t panelCount, unsigned dimension,
-                              double k, unsigned excitationCount, const cuDoubleComplex *knownFlux,
-                              const double *scale, cuDoubleComplex *matrix, cuDoubleComplex *rhs,
-                              int *error, cudaStream_t stream) {
-    if (!count)
-        return;
-    assembleSamples<<<static_cast<unsigned>((count + 127) / 128), 128, 0, stream>>>(
-        panels, samples, count, panelCount, dimension, k, excitationCount, knownFlux, scale, matrix,
-        rhs, error);
-    checkLaunch("Subdomain pair assembly");
-}
+struct SubdomainPairBlock {
+    unsigned testOffset{}, sourceOffset{}, sourceCount{};
+    std::size_t firstTile{}, tileCount{};
+};
+struct SubdomainPlan {
+    galerkin::PairQuadratureSettings settings;
+    double maximumK{};
+    std::optional<BemSubdomainModel> model;
+    std::optional<OrthogonalSymmetryPlanes> symmetry;
+    std::optional<ExteriorBaffle> baffle;
+    std::vector<SingularJob> singular;
+    std::vector<PatchJob> patches;
+    std::vector<unsigned> offsets, trials, sourceBlocks;
+    std::vector<SubdomainPairBlock> blocks;
+    std::vector<std::vector<std::uint8_t>> wholeTiles;
+};
 void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t count, std::size_t fluxStride,
                            unsigned dimension, double k, unsigned excitationCount,
                            const cuDoubleComplex *knownFlux, const double *scale,
@@ -137,7 +304,6 @@ void assembleSubdomainMass(const SubdomainPanel *panels, std::size_t count, std:
 // equal global mesh vertices share pressure columns, while interface vertices
 // receive additional P1 flux columns. Quadrature is streamed in bounded batches.
 #include "../galerkin/near_projection.hpp"
-#include "../galerkin/regular_qualification.hpp"
 #include "../galerkin/space.hpp"
 #include "../lem_coupling.hpp"
 #include "../planning_frequencies.hpp"
@@ -207,12 +373,13 @@ struct DomainHost {
 } // namespace
 
 namespace {
-BemResult solveCoupledSubdomains(const SurfaceMesh &, Vec3, const BemRequest &, std::stop_token,
+BemResult solveCoupledSubdomains(const SurfaceMesh &, Vec3, const BemRequest &,
+                                 SubdomainPlanCache &, std::stop_token,
                                  const std::function<void(const BemProgress &)> &);
 }
 BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRequest &request,
-                          std::stop_token stop, std::function<void(const BemProgress &)> progress,
-                          bool allowZero) {
+                          SubdomainPlanCache &planCache, std::stop_token stop,
+                          std::function<void(const BemProgress &)> progress, bool allowZero) {
     if ((request.symmetry || request.exteriorBaffle) && request.coupling)
         throw std::invalid_argument(
             "LEM coupling with symmetry or an exterior baffle is not yet supported.");
@@ -220,7 +387,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         !request.observers.empty())
         throw std::invalid_argument("Finite field evaluation with symmetry is not yet supported.");
     if (request.coupling)
-        return solveCoupledSubdomains(mesh, worldOrigin, request, stop, progress);
+        return solveCoupledSubdomains(mesh, worldOrigin, request, planCache, stop, progress);
     if (stop.stop_requested())
         throw std::runtime_error("Subdomain solve cancelled.");
     if (progress)
@@ -246,8 +413,10 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         request.numerics.relativeResidualTolerance < 1e-7 ||
         request.numerics.relativeResidualTolerance > .01)
         throw std::invalid_argument("Invalid subdomain BEM request.");
-    (void)bem_detail::planningWavenumber(request.frequencies, request.interactionPlanFrequencies,
-                                         request.medium.soundSpeed);
+    const double planningK = bem_detail::planningWavenumber(
+        request.frequencies, request.interactionPlanFrequencies, request.medium.soundSpeed);
+    if (planCache.mesh_ != &mesh)
+        throw std::logic_error("Subdomain plan cache belongs to a different mesh.");
     std::set<double> frequencies;
     for (const auto frequency : request.frequencies)
         if (!std::isfinite(frequency) || frequency <= 0 || !frequencies.insert(frequency).second ||
@@ -529,6 +698,20 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         return a + b;
     };
     constexpr std::size_t batchCapacity = 32768;
+    const auto vertexRule = galerkin::referencePairRule(galerkin::PairTopology::shared_vertex,
+                                                        request.numerics.singularOrder);
+    const auto edgeRule = galerkin::referencePairRule(galerkin::PairTopology::shared_edge,
+                                                      request.numerics.singularOrder);
+    const auto coincidentRule = galerkin::referencePairRule(galerkin::PairTopology::coincident,
+                                                            request.numerics.singularOrder);
+    std::vector<galerkin::PairQuadraturePoint> singularRules;
+    singularRules.reserve(vertexRule.size() + edgeRule.size() + coincidentRule.size());
+    singularRules.insert(singularRules.end(), vertexRule.begin(), vertexRule.end());
+    singularRules.insert(singularRules.end(), edgeRule.begin(), edgeRule.end());
+    singularRules.insert(singularRules.end(), coincidentRule.begin(), coincidentRule.end());
+    const auto low = galerkin::triangleRule(8), high = galerkin::triangleRule(14);
+    auto nearRules = low;
+    nearRules.insert(nearRules.end(), high.begin(), high.end());
     auto bytes = checkedMultiply(sizeof(SubdomainPanel), totalPanelCount);
     bytes = checkedAdd(bytes, checkedMultiply(sizeof(double), scales.size()));
     bytes = checkedAdd(
@@ -537,7 +720,25 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                        checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(dimension, nrhs)));
     bytes = checkedAdd(
         bytes, checkedMultiply(sizeof(cuDoubleComplex), checkedMultiply(totalPanelCount, nrhs)));
-    bytes = checkedAdd(bytes, checkedMultiply(sizeof(SubdomainPairSample), batchCapacity));
+    bytes = checkedAdd(bytes, checkedMultiply(sizeof(RegularPairJob), batchCapacity));
+    bytes = checkedAdd(bytes, checkedMultiply(sizeof(uint2), batchCapacity));
+    bytes =
+        checkedAdd(bytes, checkedMultiply(sizeof(galerkin::RegularPanelBounds), totalPanelCount));
+    bytes = checkedAdd(bytes, sizeof(unsigned));
+    bytes = checkedAdd(bytes, batchCapacity * sizeof(std::uint8_t));
+    bytes = checkedAdd(bytes, checkedMultiply(sizeof(SingularJob), batchCapacity));
+    bytes = checkedAdd(bytes, checkedMultiply(sizeof(PatchJob), batchCapacity));
+    bytes = checkedAdd(
+        bytes, checkedMultiply(sizeof(galerkin::PairQuadraturePoint), singularRules.size()));
+    bytes = checkedAdd(
+        bytes, checkedMultiply(sizeof(galerkin::TriangleQuadraturePoint), nearRules.size()));
+    const auto regular4 = galerkin::triangleRule(4), regular6 = galerkin::triangleRule(6),
+               regular8 = galerkin::triangleRule(8);
+    auto regularRules = regular4;
+    regularRules.insert(regularRules.end(), regular6.begin(), regular6.end());
+    regularRules.insert(regularRules.end(), regular8.begin(), regular8.end());
+    bytes = checkedAdd(
+        bytes, checkedMultiply(sizeof(galerkin::TriangleQuadraturePoint), regularRules.size()));
     bytes =
         checkedAdd(bytes, checkedMultiply(sizeof(int), static_cast<std::size_t>(dimension) + 2));
     std::size_t freeBytes{}, totalBytes{};
@@ -552,7 +753,15 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
     DomainDevice<cuDoubleComplex> matrix(static_cast<std::size_t>(dimension) * dimension),
         rhs(static_cast<std::size_t>(dimension) * nrhs);
     DomainDevice<cuDoubleComplex> dq(static_cast<std::size_t>(totalPanelCount) * nrhs);
-    DomainDevice<SubdomainPairSample> db(batchCapacity);
+    DomainDevice<RegularPairJob> regularDevice(batchCapacity);
+    DomainDevice<galerkin::TriangleQuadraturePoint> ruleDevice(regularRules.size());
+    ruleDevice.upload(regularRules);
+    DomainDevice<SingularJob> singularDevice(batchCapacity);
+    DomainDevice<PatchJob> patchDevice(batchCapacity);
+    DomainDevice<galerkin::PairQuadraturePoint> singularRuleDevice(singularRules.size());
+    singularRuleDevice.upload(singularRules);
+    DomainDevice<galerkin::TriangleQuadraturePoint> nearRuleDevice(nearRules.size());
+    nearRuleDevice.upload(nearRules);
     DomainDevice<int> error(1), info(1), pivots(dimension);
     cusolverDnHandle_t solver{};
     if (cusolverDnCreate(&solver) != CUSOLVER_STATUS_SUCCESS)
@@ -574,11 +783,279 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
     qs.nearDistanceRatio = request.numerics.nearDistanceRatio;
     qs.relativeTolerance = request.numerics.nearRelativeTolerance;
     qs.maximumSubdivisionDepth = request.numerics.nearMaximumDepth;
-    const auto low = galerkin::triangleRule(8), high = galerkin::triangleRule(14);
     using Clock = std::chrono::steady_clock;
     const auto elapsed = [](Clock::time_point begin) {
         return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
     };
+    std::vector<std::vector<galerkin::RegularPanelBounds>> bounds;
+    for (const auto &h : domains) {
+        auto &domainBounds = bounds.emplace_back();
+        for (const auto &panel : h.space.panels)
+            domainBounds.push_back(galerkin::makeRegularPanelBounds(panel));
+    }
+    std::vector<std::vector<std::vector<galerkin::RegularPanelBounds>>> imageBounds;
+    for (const auto &h : domains) {
+        auto &perDomain = imageBounds.emplace_back();
+        for (const auto &image : h.imageSpaces) {
+            auto &perImage = perDomain.emplace_back();
+            for (const auto &panel : image.panels)
+                perImage.push_back(galerkin::makeRegularPanelBounds(panel));
+        }
+    }
+    std::vector<galerkin::RegularPanelBounds> allBounds(totalPanelCount);
+    for (std::size_t domain = 0; domain < domains.size(); ++domain) {
+        const auto &h = domains[domain];
+        std::copy(bounds[domain].begin(), bounds[domain].end(), allBounds.begin() + h.panelOffset);
+        for (std::size_t image = 0; image < h.imageSpaces.size(); ++image)
+            std::copy(imageBounds[domain][image].begin(), imageBounds[domain][image].end(),
+                      allBounds.begin() + h.imageOffsets[image]);
+    }
+    DomainDevice<galerkin::RegularPanelBounds> boundDevice(totalPanelCount);
+    boundDevice.upload(allBounds);
+    DomainDevice<uint2> fallbackDevice(batchCapacity);
+    DomainDevice<unsigned> fallbackCountDevice(1);
+    DomainDevice<std::uint8_t> wholeTileDevice(batchCapacity);
+    std::vector<uint2> fallback(batchCapacity);
+    galerkin::Space adaptiveSpace;
+    adaptiveSpace.panels.resize(totalPanelCount);
+    for (const auto &h : domains) {
+        std::copy(h.space.panels.begin(), h.space.panels.end(),
+                  adaptiveSpace.panels.begin() + h.panelOffset);
+        for (std::size_t image = 0; image < h.imageSpaces.size(); ++image)
+            std::copy(h.imageSpaces[image].panels.begin(), h.imageSpaces[image].panels.end(),
+                      adaptiveSpace.panels.begin() + h.imageOffsets[image]);
+    }
+    const auto sameSettings = [&](const galerkin::PairQuadratureSettings &a) {
+        return a.regularOrder == qs.regularOrder && a.singularOrder == qs.singularOrder &&
+               a.nearDistanceRatio == qs.nearDistanceRatio &&
+               a.relativeTolerance == qs.relativeTolerance &&
+               a.maximumSubdivisionDepth == qs.maximumSubdivisionDepth;
+    };
+    bool planReused = planCache.plan_ && sameSettings(planCache.plan_->settings) &&
+                      planCache.plan_->maximumK >= planningK &&
+                      planCache.plan_->model == request.subdomains &&
+                      planCache.plan_->symmetry == request.symmetry &&
+                      planCache.plan_->baffle == request.exteriorBaffle;
+    double planMilliseconds = 0;
+    if (!planReused) {
+        const auto planStart = Clock::now();
+        auto candidate = std::make_shared<SubdomainPlan>();
+        candidate->settings = qs;
+        candidate->maximumK = planningK;
+        candidate->model = request.subdomains;
+        candidate->symmetry = request.symmetry;
+        candidate->baffle = request.exteriorBaffle;
+        constexpr std::size_t hostBudget = 256u * 1024u * 1024u;
+        std::vector<std::uint64_t> nearKeys;
+        // This budget covers plan vectors and the temporary pair-key vector.
+        // Adaptive states have a separate 256 MiB budget; a previous complete
+        // cached plan remains alive until the replacement has succeeded.
+        const auto payloadBytes = [&]() {
+            std::size_t used = 0;
+            const auto add = [&](std::size_t count, std::size_t size) {
+                used = checkedAdd(used, checkedMultiply(count, size));
+            };
+            add(candidate->singular.capacity(), sizeof(SingularJob));
+            add(candidate->patches.capacity(), sizeof(PatchJob));
+            add(nearKeys.capacity(), sizeof(std::uint64_t));
+            add(candidate->offsets.capacity(), sizeof(unsigned));
+            add(candidate->trials.capacity(), sizeof(unsigned));
+            add(candidate->sourceBlocks.capacity(), sizeof(unsigned));
+            add(candidate->blocks.capacity(), sizeof(SubdomainPairBlock));
+            add(candidate->wholeTiles.capacity(), sizeof(std::vector<std::uint8_t>));
+            for (const auto &tile : candidate->wholeTiles)
+                add(tile.capacity(), sizeof(std::uint8_t));
+            return used;
+        };
+        const auto reservePlan = [&](auto &vector, std::size_t required) {
+            if (required <= vector.capacity())
+                return;
+            using Value = typename std::decay_t<decltype(vector)>::value_type;
+            const auto doubled = vector.capacity() > hostBudget / (2 * sizeof(Value))
+                                     ? required
+                                     : vector.capacity() * 2;
+            const auto wanted = std::max(required, std::max<std::size_t>(doubled, 1));
+            // reserve temporarily owns both the old and new allocations.
+            if (wanted > hostBudget / sizeof(Value) ||
+                payloadBytes() > hostBudget - wanted * sizeof(Value))
+                throw std::runtime_error("Subdomain interaction plan exceeds 256 MiB host budget.");
+            vector.reserve(wanted);
+            if (payloadBytes() > hostBudget)
+                throw std::runtime_error("Subdomain interaction plan exceeds 256 MiB host budget.");
+        };
+        reservePlan(candidate->sourceBlocks, totalPanelCount);
+        candidate->sourceBlocks.assign(totalPanelCount, std::numeric_limits<unsigned>::max());
+        for (const auto &h : domains) {
+            for (std::size_t image = 0; image <= h.imageSpaces.size(); ++image) {
+                const auto &source = image == 0 ? h.space : h.imageSpaces[image - 1];
+                const unsigned sourceOffset =
+                    image == 0 ? h.panelOffset : h.imageOffsets[image - 1];
+                const auto pairCount = checkedMultiply(h.space.panels.size(), source.panels.size());
+                const auto tileCount = (pairCount + batchCapacity - 1) / batchCapacity;
+                const auto firstTile = candidate->wholeTiles.size();
+                reservePlan(candidate->blocks, checkedAdd(candidate->blocks.size(), 1));
+                const auto blockIndex = static_cast<unsigned>(candidate->blocks.size());
+                candidate->blocks.push_back({h.panelOffset, sourceOffset,
+                                             static_cast<unsigned>(source.panels.size()), firstTile,
+                                             tileCount});
+                reservePlan(candidate->wholeTiles, checkedAdd(firstTile, tileCount));
+                candidate->wholeTiles.resize(firstTile + tileCount);
+                for (std::size_t t = 0; t < source.panels.size(); ++t) {
+                    auto &block = candidate->sourceBlocks[sourceOffset + t];
+                    if (block != std::numeric_limits<unsigned>::max())
+                        throw std::logic_error("Duplicate subdomain source block.");
+                    block = blockIndex;
+                }
+            }
+        }
+        for (const auto &h : domains)
+            for (const auto &panel : h.space.panels)
+                (void)galerkin::minimumEndpointDegree(planningK * panel.maximumEdgeLength,
+                                                      qs.regularOrder);
+        if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess)
+            throw std::runtime_error("Cannot query GPU memory for subdomain planning.");
+        constexpr std::size_t adaptiveBudget = 256u * 1024u * 1024u;
+        wideband::AdaptivePairBatch adaptive(adaptiveSpace, planningK, qs, adaptiveBudget,
+                                             freeBytes - freeBytes / 5, 512, nullptr, stop);
+        result.peakDeviceBytes =
+            std::max(result.peakDeviceBytes, checkedAdd(bytes, adaptive.deviceBytes()));
+        const auto consume = [&](const wideband::SupportNearJob &job,
+                                 const galerkin::PairQuadratureRule &rule) {
+            if (!rule.points.empty())
+                throw std::logic_error(
+                    "Adaptive subdomain rule unexpectedly contains explicit points.");
+            if (rule.maximumDepth == 0 && rule.patches.size() == 1 &&
+                !rule.patches.front().projection &&
+                (rule.patches.front().degree == 8 || rule.patches.front().degree == 14)) {
+                const auto blockIndex = candidate->sourceBlocks.at(job.sourcePanel);
+                if (blockIndex >= candidate->blocks.size())
+                    throw std::logic_error("Missing subdomain whole-panel source block.");
+                const auto &block = candidate->blocks[blockIndex];
+                if (job.testPanel < block.testOffset || job.sourcePanel < block.sourceOffset ||
+                    job.sourcePanel - block.sourceOffset >= block.sourceCount)
+                    throw std::logic_error("Invalid subdomain whole-panel pair index.");
+                const auto ordinal =
+                    checkedAdd(checkedMultiply(job.testPanel - block.testOffset, block.sourceCount),
+                               job.sourcePanel - block.sourceOffset);
+                const auto tileIndex = block.firstTile + ordinal / batchCapacity;
+                if (tileIndex >= block.firstTile + block.tileCount)
+                    throw std::logic_error("Subdomain whole-panel tile index exceeds block.");
+                auto &tile = candidate->wholeTiles[tileIndex];
+                if (tile.empty()) {
+                    reservePlan(tile, batchCapacity);
+                    tile.resize(batchCapacity, 0);
+                }
+                auto &degree = tile[ordinal % batchCapacity];
+                if (degree)
+                    throw std::logic_error("Duplicate subdomain whole-panel pair.");
+                degree = static_cast<std::uint8_t>(rule.patches.front().degree);
+                return;
+            }
+            reservePlan(nearKeys, checkedAdd(nearKeys.size(), 1));
+            nearKeys.push_back((std::uint64_t(job.testPanel) << 32) | job.sourcePanel);
+            reservePlan(candidate->patches,
+                        checkedAdd(candidate->patches.size(), rule.patches.size()));
+            for (const auto &patch : rule.patches)
+                candidate->patches.push_back({job.testPanel, job.sourcePanel, patch});
+        };
+        error.zero();
+        for (std::size_t domain = 0; domain < domains.size(); ++domain) {
+            const auto &h = domains[domain];
+            for (std::size_t image = 0; image <= h.imageSpaces.size(); ++image) {
+                const auto &source = image == 0 ? h.space : h.imageSpaces[image - 1];
+                const auto sourceOffset = image == 0 ? h.panelOffset : h.imageOffsets[image - 1];
+                const auto &sourceBounds =
+                    image == 0 ? bounds[domain] : imageBounds[domain][image - 1];
+                const auto pairs = checkedMultiply(h.space.panels.size(), source.panels.size());
+                for (std::size_t first = 0; first < pairs; first += batchCapacity) {
+                    if (stop.stop_requested())
+                        throw std::runtime_error("Subdomain planning cancelled.");
+                    const auto count =
+                        static_cast<unsigned>(std::min(batchCapacity, pairs - first));
+                    fallbackCountDevice.zero();
+                    assemblePairTile<<<(count + 127) / 128, 128>>>(
+                        dp.data(), boundDevice.data(), h.panelOffset, sourceOffset,
+                        static_cast<unsigned>(source.panels.size()), first, count, totalPanelCount,
+                        dimension, planningK, qs.relativeTolerance, qs.nearDistanceRatio,
+                        qs.regularOrder, nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(),
+                        error.data(), ruleDevice.data(), static_cast<unsigned>(regular4.size()),
+                        static_cast<unsigned>(regular6.size()),
+                        static_cast<unsigned>(regular8.size()), fallbackDevice.data(),
+                        fallbackCountDevice.data(), true, nullptr, nullptr, nullptr, nullptr, 0, 0);
+                    checkLaunch("Subdomain plan classification");
+                    const auto countFallback = fallbackCountDevice.download()[0];
+                    if (countFallback > count || error.download()[0])
+                        throw std::runtime_error("Subdomain plan classification failed.");
+                    if (countFallback && cudaMemcpy(fallback.data(), fallbackDevice.data(),
+                                                    countFallback * sizeof(uint2),
+                                                    cudaMemcpyDeviceToHost) != cudaSuccess)
+                        throw std::runtime_error("Subdomain plan download failed.");
+                    for (unsigned n = 0; n < countFallback; ++n) {
+                        const auto ti = fallback[n].x, sj = fallback[n].y;
+                        const auto i = ti - h.panelOffset, j = sj - sourceOffset;
+                        const auto &test = h.space.panels[i], &trial = source.panels[j];
+                        const auto permutation = galerkin::classifyPair(test, trial);
+                        if (permutation.topology != galerkin::PairTopology::disjoint) {
+                            const auto topology = permutation.topology;
+                            const unsigned offset =
+                                topology == galerkin::PairTopology::shared_vertex ? 0
+                                : topology == galerkin::PairTopology::shared_edge
+                                    ? unsigned(vertexRule.size())
+                                    : unsigned(vertexRule.size() + edgeRule.size());
+                            const unsigned points =
+                                topology == galerkin::PairTopology::shared_vertex
+                                    ? unsigned(vertexRule.size())
+                                : topology == galerkin::PairTopology::shared_edge
+                                    ? unsigned(edgeRule.size())
+                                    : unsigned(coincidentRule.size());
+                            reservePlan(candidate->singular,
+                                        checkedAdd(candidate->singular.size(), 1));
+                            candidate->singular.push_back({ti, sj, offset, points, permutation});
+                            reservePlan(nearKeys, checkedAdd(nearKeys.size(), 1));
+                            nearKeys.push_back((std::uint64_t(ti) << 32) | sj);
+                            continue;
+                        }
+                        const auto degree = galerkin::qualifiedRegularDegree(
+                            bounds[domain][i], sourceBounds[j], planningK, qs.relativeTolerance,
+                            pairMinimumDegree(planningK, test.maximumEdgeLength,
+                                              trial.maximumEdgeLength, qs.regularOrder));
+                        if (degree && !galerkin::isNearPair(test, trial, qs.nearDistanceRatio))
+                            continue;
+                        const wideband::SupportNearJob job{ti, sj};
+                        while (!adaptive.submit(job))
+                            adaptive.advance(consume);
+                    }
+                }
+            }
+        }
+        adaptive.drain(consume);
+        std::sort(nearKeys.begin(), nearKeys.end());
+        if (std::adjacent_find(nearKeys.begin(), nearKeys.end()) != nearKeys.end())
+            throw std::logic_error("Duplicate subdomain interaction plan pair.");
+        reservePlan(candidate->offsets, static_cast<std::size_t>(totalPanelCount) + 1);
+        candidate->offsets.assign(static_cast<std::size_t>(totalPanelCount) + 1, 0);
+        reservePlan(candidate->trials, nearKeys.size());
+        for (const auto key : nearKeys) {
+            ++candidate->offsets[static_cast<unsigned>(key >> 32) + 1];
+            candidate->trials.push_back(static_cast<unsigned>(key));
+        }
+        for (std::size_t i = 1; i < candidate->offsets.size(); ++i)
+            candidate->offsets[i] += candidate->offsets[i - 1];
+        if (stop.stop_requested())
+            throw std::runtime_error("Subdomain planning cancelled.");
+        planMilliseconds = elapsed(planStart);
+        planCache.plan_ = std::move(candidate);
+    }
+    const auto plan = planCache.plan_;
+    const auto planDeviceBytes =
+        checkedMultiply(sizeof(unsigned), checkedAdd(plan->offsets.size(), plan->trials.size()));
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess || planDeviceBytes > freeBytes)
+        throw std::runtime_error("Insufficient GPU memory for subdomain interaction plan.");
+    DomainDevice<unsigned> nearOffsetsDevice(plan->offsets.size()),
+        nearTrialsDevice(plan->trials.size());
+    nearOffsetsDevice.upload(plan->offsets);
+    nearTrialsDevice.upload(plan->trials);
+    bytes = checkedAdd(bytes, planDeviceBytes);
     std::size_t completed = 0;
     for (double frequency : request.frequencies) {
         const auto assemblyStart = Clock::now();
@@ -637,47 +1114,68 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         matrix.zero();
         rhs.zero();
         error.zero();
-        std::vector<SubdomainPairSample> batch;
-        batch.reserve(batchCapacity);
-        std::vector<std::vector<galerkin::RegularPanelBounds>> bounds;
         unsigned minimumDegree = 4;
-        for (const auto &h : domains) {
-            auto &domainBounds = bounds.emplace_back();
-            for (const auto &panel : h.space.panels) {
-                domainBounds.push_back(galerkin::makeRegularPanelBounds(panel));
+        for (const auto &h : domains)
+            for (const auto &panel : h.space.panels)
                 minimumDegree = std::max(
                     minimumDegree,
                     galerkin::minimumEndpointDegree(k * panel.maximumEdgeLength, qs.regularOrder));
-            }
-        }
-        std::vector<std::vector<std::vector<galerkin::RegularPanelBounds>>> imageBounds;
-        for (const auto &h : domains) {
-            auto &perDomain = imageBounds.emplace_back();
-            for (const auto &image : h.imageSpaces) {
-                auto &perImage = perDomain.emplace_back();
-                for (const auto &panel : image.panels)
-                    perImage.push_back(galerkin::makeRegularPanelBounds(panel));
-            }
-        }
-        const auto regular4 = galerkin::triangleRule(4), regular6 = galerkin::triangleRule(6),
-                   regular8 = galerkin::triangleRule(8);
-        const auto flush = [&]() {
-            if (batch.empty())
+        std::vector<RegularPairJob> regularBatch;
+        regularBatch.reserve(batchCapacity);
+        const auto flushRegular = [&]() {
+            if (regularBatch.empty())
                 return;
-            db.upload(batch);
-            assembleSubdomainSamples(dp.data(), db.data(), batch.size(), totalPanelCount, dimension,
-                                     k, nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(),
-                                     error.data(), nullptr);
+            regularDevice.upload(regularBatch);
+            assembleRegularPairs<<<static_cast<unsigned>((regularBatch.size() + 127) / 128), 128>>>(
+                dp.data(), regularDevice.data(), regularBatch.size(), totalPanelCount, dimension, k,
+                nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(), error.data(),
+                ruleDevice.data(), static_cast<unsigned>(regular4.size()),
+                static_cast<unsigned>(regular6.size()), static_cast<unsigned>(regular8.size()));
+            checkLaunch("Subdomain regular pair assembly");
             if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
-                throw std::runtime_error("Subdomain quadrature assembly failed.");
-            batch.clear();
+                throw std::runtime_error("Subdomain regular quadrature assembly failed.");
+            regularBatch.clear();
         };
-        const auto push = [&](unsigned test, unsigned trial,
-                              const galerkin::PairQuadraturePoint &point) {
-            batch.push_back({test, trial, point});
-            if (batch.size() == batchCapacity)
-                flush();
+        std::vector<SingularJob> singularBatch;
+        std::vector<PatchJob> patchBatch;
+        singularBatch.reserve(batchCapacity);
+        patchBatch.reserve(batchCapacity);
+        const auto flushSingular = [&]() {
+            if (singularBatch.empty())
+                return;
+            singularDevice.upload(singularBatch);
+            assembleSingularJobs<<<static_cast<unsigned>(singularBatch.size()), 32>>>(
+                dp.data(), singularDevice.data(), singularRuleDevice.data(), totalPanelCount,
+                dimension, k, nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(), error.data());
+            checkLaunch("Subdomain singular assembly");
+            if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
+                throw std::runtime_error("Subdomain singular quadrature assembly failed.");
+            singularBatch.clear();
         };
+        const auto flushPatch = [&]() {
+            if (patchBatch.empty())
+                return;
+            patchDevice.upload(patchBatch);
+            assemblePatchJobs<<<static_cast<unsigned>(patchBatch.size()), 32>>>(
+                dp.data(), patchDevice.data(), nearRuleDevice.data(),
+                static_cast<unsigned>(low.size()), static_cast<unsigned>(high.size()),
+                totalPanelCount, dimension, k, nrhs, dq.data(), ds.data(), matrix.data(),
+                rhs.data(), error.data());
+            checkLaunch("Subdomain near patch assembly");
+            if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
+                throw std::runtime_error("Subdomain near quadrature assembly failed.");
+            patchBatch.clear();
+        };
+        for (const auto &job : plan->singular) {
+            singularBatch.push_back(job);
+            if (singularBatch.size() == batchCapacity)
+                flushSingular();
+        }
+        for (const auto &job : plan->patches) {
+            patchBatch.push_back(job);
+            if (patchBatch.size() == batchCapacity)
+                flushPatch();
+        }
         for (std::size_t domainIndex = 0; domainIndex < domains.size(); ++domainIndex) {
             const auto &h = domains[domainIndex];
             for (std::size_t image = 0; image <= h.imageSpaces.size(); ++image) {
@@ -685,55 +1183,95 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
                 const auto trialOffset = image == 0 ? h.panelOffset : h.imageOffsets[image - 1];
                 const auto &trialBounds =
                     image == 0 ? bounds[domainIndex] : imageBounds[domainIndex][image - 1];
-                for (unsigned i = 0; i < h.space.panels.size(); ++i)
-                    for (unsigned j = 0; j < trialSpace.panels.size(); ++j) {
-                        if (stop.stop_requested())
-                            throw std::runtime_error("Subdomain solve cancelled.");
+                const auto testCount = h.space.panels.size();
+                const auto sourceCount = trialSpace.panels.size();
+                const auto pairCount = checkedMultiply(testCount, sourceCount);
+                for (std::size_t first = 0; first < pairCount; first += batchCapacity) {
+                    if (stop.stop_requested())
+                        throw std::runtime_error("Subdomain solve cancelled.");
+                    const auto count =
+                        static_cast<unsigned>(std::min(batchCapacity, pairCount - first));
+                    fallbackCountDevice.zero();
+                    const auto blockIndex = plan->sourceBlocks.at(trialOffset);
+                    if (blockIndex >= plan->blocks.size())
+                        throw std::logic_error("Missing subdomain assembly source block.");
+                    const auto &block = plan->blocks[blockIndex];
+                    if (block.testOffset != h.panelOffset || block.sourceOffset != trialOffset ||
+                        block.sourceCount != sourceCount ||
+                        first / batchCapacity >= block.tileCount)
+                        throw std::logic_error("Subdomain assembly source block mismatch.");
+                    const auto &wholeTile =
+                        plan->wholeTiles[block.firstTile + first / batchCapacity];
+                    if (!wholeTile.empty())
+                        wholeTileDevice.upload(wholeTile);
+                    assemblePairTile<<<(count + 127) / 128, 128>>>(
+                        dp.data(), boundDevice.data(), h.panelOffset, trialOffset,
+                        static_cast<unsigned>(sourceCount), first, count, totalPanelCount,
+                        dimension, k, qs.relativeTolerance, qs.nearDistanceRatio, qs.regularOrder,
+                        nrhs, dq.data(), ds.data(), matrix.data(), rhs.data(), error.data(),
+                        ruleDevice.data(), static_cast<unsigned>(regular4.size()),
+                        static_cast<unsigned>(regular6.size()),
+                        static_cast<unsigned>(regular8.size()), fallbackDevice.data(),
+                        fallbackCountDevice.data(), false, nearOffsetsDevice.data(),
+                        nearTrialsDevice.data(),
+                        wholeTile.empty() ? nullptr : wholeTileDevice.data(), nearRuleDevice.data(),
+                        static_cast<unsigned>(low.size()), static_cast<unsigned>(high.size()));
+                    checkLaunch("Subdomain pair tile assembly");
+                    const auto fallbackCount = fallbackCountDevice.download()[0];
+                    if (fallbackCount > count || error.download()[0])
+                        throw std::runtime_error("Subdomain pair tile assembly failed.");
+                    if (fallbackCount && cudaMemcpy(fallback.data(), fallbackDevice.data(),
+                                                    fallbackCount * sizeof(uint2),
+                                                    cudaMemcpyDeviceToHost) != cudaSuccess)
+                        throw std::runtime_error("Subdomain pair tile download failed.");
+                    for (unsigned pair = 0; pair < fallbackCount; ++pair) {
+                        const unsigned i = fallback[pair].x - h.panelOffset;
+                        const unsigned j = fallback[pair].y - trialOffset;
                         const auto &test = h.space.panels[i], &trial = trialSpace.panels[j];
-                        const auto topology = galerkin::classifyPair(test, trial).topology;
-                        const auto degree = topology == galerkin::PairTopology::disjoint
-                                                ? galerkin::qualifiedRegularDegree(
-                                                      bounds[domainIndex][i], trialBounds[j], k,
-                                                      qs.relativeTolerance, minimumDegree)
-                                                : 0;
-                        const bool near = topology == galerkin::PairTopology::disjoint &&
+                        const auto permutation = galerkin::classifyPair(test, trial);
+                        const auto topology = permutation.topology;
+                        if (topology != galerkin::PairTopology::disjoint)
+                            throw std::logic_error("Missing touching pair in subdomain plan.");
+                        const auto degree =
+                            topology == galerkin::PairTopology::disjoint
+                                ? galerkin::qualifiedRegularDegree(
+                                      bounds[domainIndex][i], trialBounds[j], k,
+                                      qs.relativeTolerance,
+                                      pairMinimumDegree(k, test.maximumEdgeLength,
+                                                        trial.maximumEdgeLength, qs.regularOrder))
+                                : 0;
+                        const auto &testBounds = bounds[domainIndex][i];
+                        const auto &sourceBounds = trialBounds[j];
+                        const double limit =
+                            testBounds.radius + sourceBounds.radius +
+                            qs.nearDistanceRatio *
+                                std::max(test.maximumEdgeLength, trial.maximumEdgeLength);
+                        const double conservativeLimit = std::nextafter(
+                            limit * (1 + 16 * std::numeric_limits<double>::epsilon()),
+                            std::numeric_limits<double>::infinity());
+                        const double distance = std::hypot(test.centroid.x - trial.centroid.x,
+                                                           test.centroid.y - trial.centroid.y,
+                                                           test.centroid.z - trial.centroid.z);
+                        // A non-finite bound cannot establish separation; retain the exact check.
+                        const bool near = degree && qs.nearDistanceRatio > 0 &&
+                                          (!(distance >= conservativeLimit) ||
+                                           !std::isfinite(conservativeLimit)) &&
                                           galerkin::isNearPair(test, trial, qs.nearDistanceRatio);
                         if (degree && !near) {
-                            const auto &rule = degree == 4   ? regular4
-                                               : degree == 6 ? regular6
-                                                             : regular8;
-                            for (const auto &x : rule)
-                                for (const auto &y : rule) {
-                                    galerkin::PairQuadraturePoint point{};
-                                    for (unsigned z = 0; z < 3; ++z) {
-                                        point.test[z] = x.barycentric[z];
-                                        point.trial[z] = y.barycentric[z];
-                                    }
-                                    point.weight = x.weight * y.weight;
-                                    push(h.panelOffset + i, trialOffset + j, point);
-                                }
+                            regularBatch.push_back({h.panelOffset + i, trialOffset + j, degree});
+                            if (regularBatch.size() == batchCapacity)
+                                flushRegular();
                             continue;
                         }
-                        const auto rule = galerkin::makePairQuadrature(
-                            test, trial, qs, k, stop,
-                            topology == galerkin::PairTopology::disjoint && !degree);
-                        for (const auto &point : rule.points)
-                            push(h.panelOffset + i, trialOffset + j, point);
-                        for (const auto &patch : rule.patches) {
-                            const auto &tr = patch.degree == 14 ? high : low;
-                            const auto count = galerkin::nearPatchPointCount(
-                                patch, static_cast<unsigned>(tr.size()));
-                            for (unsigned x = 0; x < count; ++x)
-                                push(h.panelOffset + i, trialOffset + j,
-                                     galerkin::mapNearPatchPoint(
-                                         tr.data(), static_cast<unsigned>(tr.size()), patch, x,
-                                         panels[h.panelOffset + i].panel,
-                                         panels[trialOffset + j].panel));
-                        }
+                        throw std::runtime_error(
+                            "Subdomain interaction plan does not cover this frequency.");
                     }
+                }
             }
         }
-        flush();
+        flushRegular();
+        flushSingular();
+        flushPatch();
         assembleSubdomainMass(dp.data(), panelCount, totalPanelCount, dimension, k, nrhs, dq.data(),
                               ds.data(), matrix.data(), rhs.data(), error.data(), nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess || error.download()[0])
@@ -777,7 +1315,9 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
         const auto solved = rhs.download();
         BemFrequencyResult output;
         output.frequency = frequency;
-        output.assemblyMilliseconds = assemblyMs;
+        output.interactionPlanMilliseconds = completed == 0 ? planMilliseconds : 0;
+        output.interactionPlanReused = completed == 0 && planReused;
+        output.assemblyMilliseconds = assemblyMs + output.interactionPlanMilliseconds;
         output.factorizationMilliseconds = factorMs;
         output.triangularSolveMilliseconds = solveMs;
         output.solveMilliseconds = factorMs + solveMs;
@@ -1046,7 +1586,7 @@ BemResult solveSubdomains(const SurfaceMesh &mesh, Vec3 worldOrigin, const BemRe
 
 namespace {
 BemResult solveCoupledSubdomains(const SurfaceMesh &mesh, Vec3 origin, const BemRequest &request,
-                                 std::stop_token stop,
+                                 SubdomainPlanCache &planCache, std::stop_token stop,
                                  const std::function<void(const BemProgress &)> &progress) {
     if (!request.subdomains || request.infiniteBaffle || request.axisymmetric ||
         request.numerics.acceleration != BemAcceleration::dense || !request.excitations.empty())
@@ -1140,10 +1680,12 @@ BemResult solveCoupledSubdomains(const SurfaceMesh &mesh, Vec3 origin, const Bem
         auto basisRequest = request;
         basisRequest.coupling.reset();
         basisRequest.frequencies = {frequency};
+        if (basisRequest.interactionPlanFrequencies.empty())
+            basisRequest.interactionPlanFrequencies = request.frequencies;
         basisRequest.excitations = basis.excitations;
         basisRequest.observers.clear();
         basisRequest.farField.reset();
-        auto basisResult = solveSubdomains(mesh, origin, basisRequest, stop, {}, false);
+        auto basisResult = solveSubdomains(mesh, origin, basisRequest, planCache, stop, {}, false);
         if (basisResult.frequencies.size() != 1 ||
             basisResult.frequencies[0].excitations.size() != count)
             throw std::logic_error("BEM coupling basis result count mismatch.");
@@ -1163,8 +1705,9 @@ BemResult solveCoupledSubdomains(const SurfaceMesh &mesh, Vec3 origin, const Bem
         auto finalRequest = request;
         finalRequest.coupling.reset();
         finalRequest.frequencies = {frequency};
+        finalRequest.interactionPlanFrequencies = basisRequest.interactionPlanFrequencies;
         finalRequest.excitations = {{"LEM", bem_detail::coupledVelocities(basis, solution)}};
-        auto finalResult = solveSubdomains(mesh, origin, finalRequest, stop, {}, true);
+        auto finalResult = solveSubdomains(mesh, origin, finalRequest, planCache, stop, {}, true);
         if (finalResult.frequencies.size() != 1 ||
             finalResult.frequencies[0].excitations.size() != 1)
             throw std::logic_error("Coupled subdomain final result count mismatch.");
@@ -1183,6 +1726,12 @@ BemResult solveCoupledSubdomains(const SurfaceMesh &mesh, Vec3 origin, const Bem
             {combined.peakDeviceBytes, basisResult.peakDeviceBytes, finalResult.peakDeviceBytes});
         auto &frame = finalResult.frequencies[0];
         const auto &basisFrame = basisResult.frequencies[0];
+        frame.interactionPlanMilliseconds =
+            completed == 0
+                ? frame.interactionPlanMilliseconds + basisFrame.interactionPlanMilliseconds
+                : 0;
+        frame.interactionPlanReused =
+            completed == 0 && frame.interactionPlanReused && basisFrame.interactionPlanReused;
         frame.assemblyMilliseconds += basisFrame.assemblyMilliseconds;
         frame.solveMilliseconds += basisFrame.solveMilliseconds;
         frame.factorizationMilliseconds += basisFrame.factorizationMilliseconds;

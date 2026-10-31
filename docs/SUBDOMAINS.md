@@ -118,6 +118,66 @@ nach dem unten beschriebenen Vertrag an verschiedene Gebiete gekoppelt werden.
 
 ## Numerischer Vertrag
 
+### GPU-Aufbau und Planwiederverwendung
+
+Der Matrixaufbau überträgt kompakte Paar- und Patchaufträge. Singuläre
+Quadraturen und akzeptierte adaptive Patches werden auf der GPU in FP64
+integriert. Qualifizierte reguläre Paare verwenden für den Green-Term die
+gemeinsame gemischte Kernelarithmetik des normalen Solvers. Die Phase oberhalb
+des qualifizierten Kleinphasenbereichs, Burton–Miller-Koeffizienten,
+Momentakkumulation, Matrix und Faktorisierung bleiben in FP64. Nicht sicher
+darstellbare Zwischenwerte verwenden den vollständigen FP64-Pfad. Ein
+unabhängiger CUDA-Test vergleicht die Momente mit CPU-FP64-Formeln und
+verfeinerter Duffy-Quadratur bei beiden Normalenrichtungen, hohen Phasen und
+verschiedenen Skalierungen. Auch die eingebetteten adaptiven
+Fehlerabschätzungen laufen auf der GPU; die gemeinsame Zustandsmaschine entscheidet weiterhin
+über Unterteilung und Abbruch. Die Qualifikation verwendet die elektrische
+Größe des jeweiligen Paars und das bestehende Fehlerbudget. Ein großes
+Dreieck erzwingt keine höhere feste Ordnung für sämtliche kleineren Paare.
+Die globale Grenze `k·h ≤ 3,25` und die Ordnung für Feldwerte bleiben erhalten.
+
+Der Plan verwendet die maximale Planungswellenzahl des Auftrags. Er enthält
+gerichtete Nahpaarzuordnungen, singuläre Regeln, adaptive Patches und
+bedarfsgerecht belegte Kacheln für akzeptierte Ganzpanelregeln. Derselbe
+Solver kann einen vollständig aufgebauten Plan für passende kleinere
+Wellenzahlen wiederverwenden. Änderungen an Modell, Symmetrie, Schallwand,
+Quadraturvorgaben oder einer größeren erforderlichen Planungswellenzahl
+erzwingen einen neuen Plan. Ein abgebrochener Aufbau wird nicht übernommen.
+
+Plan-Kandidat einschließlich temporärer Paarschlüssel und adaptive Zustände
+haben getrennte Payloadbudgets von je 256 MiB. Während eines Ersatzaufbaus
+bleibt der bisherige Plan erhalten; damit können diese drei Payloads
+zusammen bis zu 768 MiB belegen. Geometrie, Modellschlüssel, CPU-/GPU-Matrizen,
+Quadraturtabellen und andere Auftragspuffer gehören zu eigenen Lebensdauern
+und sind keine Behauptung eines Gesamtlimits von 256 MiB.
+
+`subdomain_bem_tests --benchmark` misst kalte und warme Aufrufe einer
+physikalisch gleichen geteilten und ungeteilten Geometrie bei 350/500 Hz.
+Der Test berichtet Phasenzeiten, Freiheitsgrade, Speicher, Residuen und
+physikalische Unterschiede; er erzwingt keine instabile Wandzeitgrenze.
+Die dort grobe Diskretisierung besitzt oberhalb dieses Bands keinen
+Konvergenznachweis. Cacheprüfungen vergleichen warme Aufrufe, unabhängige
+Frequenzpläne, verschärfte Toleranzen und elektrische Größen bis `k·h = 2,25`.
+
+Ein Vergleich auf einer RTX 5070 Laptop GPU mit 352 physischen beziehungsweise
+382 partitionierten Dreiecken und zwei Frequenzen ergab warme Laufzeiten von
+51,23 ms ungeteilt und 135,31 ms geteilt. Die kalten Aufrufe lagen bei
+457,50/318,40 ms; der erste Aufruf kann gemeinsame GPU-Initialisierung enthalten.
+Diese Einzelmessung belegt keinen Gleichstand mit dem normalen Solver.
+Das zusätzliche gekoppelte System bleibt im warmen Vergleich etwa 2,64-mal
+langsamer. Die Druckabweichung geteilt/ungeteilt lag auf diesem groben Netz
+bei höchstens 1,18 %, die Impedanzabweichung bei 0,88 %; diese Differenzen sind
+kein Fehlermaß der gemischten Kernelarithmetik.
+
+### Projektauftrag über die Kommandozeile
+
+`HornSculpt.exe --solve-project "Horn-Ergebnis.hsproj" "Horn.hsproj"`
+öffnet das Eingabeprojekt, prüft beziehungsweise erzeugt sein Netz und
+berechnet die gespeicherten Simulationseinstellungen. Der vollständige
+Ergebnisstand wird atomar unter einem neuen Namen geschrieben. Vorhandene
+Ausgaben und das Eingabeprojekt werden nicht überschrieben. Der Auftrag
+hat keine Smoke-Test-Zeitgrenze und bleibt über die Anwendung abbrechbar.
+
 Die Darstellungen werden durch den OpenGL-Test `acoustic_guides_render`
 geprüft: Schallwand und beide Symmetrieebenen, Normalenumkehr, Sichtbarkeit,
 Entfernen der Hilfen sowie unveränderte Kamera, Flächenauswahl und Quellnetze.

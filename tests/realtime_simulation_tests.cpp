@@ -65,6 +65,8 @@
 #include <QtEndian>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <complex>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -2028,6 +2030,11 @@ void testSymmetricBaffleGuiArchive() {
     require(directory.isValid(), "Temporary directory unavailable.");
     const auto path = directory.filePath("quarter-baffle.hsproj");
     writeProject(path, project);
+    if (const auto fixtureOutput = qEnvironmentVariable("HS_SUBDOMAIN_PROJECT_OUTPUT");
+        !fixtureOutput.isEmpty()) {
+        require(!QFile::exists(fixtureOutput), "CLI fixture output already exists.");
+        writeProject(fixtureOutput, project);
+    }
     if (const auto screenshot = qEnvironmentVariable("HS_SUBDOMAIN_SCREENSHOT");
         !screenshot.isEmpty()) {
         std::map<std::uint32_t, QString> labels;
@@ -2740,6 +2747,144 @@ void testJobLifecycle() {
     std::cout << "CPU GUI: obsolete Draft/CAD cancellations preserve current revisions, "
                  "assignments and simulation readiness.\n";
 }
+void compareSavedResults(const QString &referencePath, const QString &candidatePath) {
+    const auto reference = readProject(referencePath), candidate = readProject(candidatePath);
+    const auto &a = reference.simulation, &b = candidate.simulation;
+    require(a.current && b.current && a.resultComplete == true && b.resultComplete == true &&
+                a.request && b.request && a.result && b.result && a.mesh && b.mesh,
+            "Both projects need current, complete results and meshes.");
+    const auto &x = *a.request, &y = *b.request;
+    require(*a.mesh == *b.mesh && a.resultModel == b.resultModel &&
+                x.frequencies == y.frequencies &&
+                x.interactionPlanFrequencies == y.interactionPlanFrequencies &&
+                x.subdomains == y.subdomains && x.symmetry == y.symmetry &&
+                x.exteriorBaffle == y.exteriorBaffle && x.infiniteBaffle == y.infiniteBaffle &&
+                x.axisymmetric == y.axisymmetric && x.observers == y.observers &&
+                x.observerValidity == y.observerValidity && x.farField == y.farField &&
+                x.coupling == y.coupling && x.medium.density == y.medium.density &&
+                x.medium.soundSpeed == y.medium.soundSpeed,
+            "Geometry, model, frequency grid or request differs.");
+    const auto &nx = x.numerics, &ny = y.numerics;
+    require(nx.quadratureOrder == ny.quadratureOrder && nx.singularOrder == ny.singularOrder &&
+                nx.nearDistanceRatio == ny.nearDistanceRatio &&
+                nx.nearRelativeTolerance == ny.nearRelativeTolerance &&
+                nx.nearMaximumDepth == ny.nearMaximumDepth &&
+                nx.relativeResidualTolerance == ny.relativeResidualTolerance &&
+                nx.maximumRefinementSteps == ny.maximumRefinementSteps &&
+                nx.acceleration == ny.acceleration && nx.fastMultipole == ny.fastMultipole,
+            "Numerical settings differ.");
+    require(x.excitations.size() == y.excitations.size(), "Excitation counts differ.");
+    for (std::size_t i = 0; i < x.excitations.size(); ++i) {
+        const auto &u = x.excitations[i], &v = y.excitations[i];
+        require(u.name == v.name && u.faces.size() == v.faces.size(), "Excitations differ.");
+        for (std::size_t j = 0; j < u.faces.size(); ++j)
+            require(u.faces[j].faceId == v.faces[j].faceId &&
+                        u.faces[j].normalVelocity == v.faces[j].normalVelocity,
+                    "Excitation face or velocity differs.");
+    }
+    double worstPressure = 0, worstImpedance = 0, worstFlow = 0, worstTrace = 0;
+    const auto compare = [](const auto &u, const auto &v, const std::vector<std::uint8_t> &mask) {
+        require(u.size() == v.size() && (mask.empty() || mask.size() == u.size()),
+                "Result vector or validity mask size differs.");
+        double difference = 0, norm = 0;
+        for (std::size_t i = 0; i < u.size(); ++i) {
+            if (!mask.empty() && !mask[i])
+                continue;
+            require(std::isfinite(u[i].real()) && std::isfinite(u[i].imag()) &&
+                        std::isfinite(v[i].real()) && std::isfinite(v[i].imag()),
+                    "Result contains a non-finite value.");
+            difference = std::hypot(difference, std::abs(v[i] - u[i]));
+            norm = std::hypot(norm, std::abs(u[i]));
+        }
+        return norm > 0 ? difference / norm
+                        : (difference == 0 ? 0.0 : std::numeric_limits<double>::infinity());
+    };
+    const std::vector<std::uint8_t> all;
+    const auto &ar = *a.result, &br = *b.result;
+    require(ar.frequencies.size() == x.frequencies.size() &&
+                br.frequencies.size() == x.frequencies.size() && !ar.frequencies.empty() &&
+                ar.triangleCount == br.triangleCount &&
+                ar.pressureDofCount == br.pressureDofCount && ar.acceleration == br.acceleration &&
+                ar.geometryMode == br.geometryMode,
+            "Result frequency count or solver geometry differs.");
+    double assemblyA = 0, assemblyB = 0, solveA = 0, solveB = 0, fieldA = 0, fieldB = 0;
+    for (std::size_t f = 0; f < ar.frequencies.size(); ++f) {
+        const auto &u = ar.frequencies[f], &v = br.frequencies[f];
+        require(u.frequency == x.frequencies[f] && v.frequency == x.frequencies[f] &&
+                    u.excitations.size() == v.excitations.size() && !u.excitations.empty(),
+                "Frequency or result excitation count differs.");
+        assemblyA += u.assemblyMilliseconds;
+        assemblyB += v.assemblyMilliseconds;
+        solveA += u.solveMilliseconds;
+        solveB += v.solveMilliseconds;
+        fieldA += u.fieldMilliseconds;
+        fieldB += v.fieldMilliseconds;
+        for (std::size_t e = 0; e < u.excitations.size(); ++e) {
+            const auto &p = u.excitations[e], &q = v.excitations[e];
+            require(p.name == q.name && p.observerValidity == q.observerValidity &&
+                        p.observerPressure.size() == x.observers.size(),
+                    "Observer result identity or validity differs.");
+            worstPressure = std::max(
+                worstPressure, compare(p.observerPressure, q.observerPressure, p.observerValidity));
+            require(p.impedances.size() == q.impedances.size(), "Impedance counts differ.");
+            std::vector<std::complex<double>> pa, pb, za, zb, va, vb;
+            for (std::size_t j = 0; j < p.impedances.size(); ++j) {
+                const auto &i = p.impedances[j], &k = q.impedances[j];
+                require(i.faceId == k.faceId && i.area == k.area,
+                        "Impedance face or area differs.");
+                pa.push_back(i.meanPressure);
+                pb.push_back(k.meanPressure);
+                za.push_back(i.volumeImpedance);
+                zb.push_back(k.volumeImpedance);
+                va.push_back(i.volumeVelocity);
+                vb.push_back(k.volumeVelocity);
+            }
+            worstPressure = std::max(worstPressure, compare(pa, pb, all));
+            worstImpedance = std::max(worstImpedance, compare(za, zb, all));
+            worstFlow = std::max(worstFlow, compare(va, vb, all));
+            const auto &pt = p.subdomainTraces(), &qt = q.subdomainTraces();
+            require(pt.size() == qt.size() &&
+                        (!x.subdomains || pt.size() == x.subdomains->domains.size()),
+                    "Subdomain trace counts differ or are incomplete.");
+            std::set<std::uint32_t> traceDomains;
+            for (std::size_t j = 0; j < pt.size(); ++j) {
+                const auto &i = pt[j], &k = qt[j];
+                require(traceDomains.insert(i.domainId).second && !i.vertexIndices.empty() &&
+                            !i.triangleIndices.empty() &&
+                            (!x.subdomains ||
+                             std::any_of(
+                                 x.subdomains->domains.begin(), x.subdomains->domains.end(),
+                                 [&](const auto &domain) { return domain.id == i.domainId; })) &&
+                            i.domainId == k.domainId && i.vertexIndices == k.vertexIndices &&
+                            i.triangleIndices == k.triangleIndices &&
+                            i.pressureTrace.size() == i.vertexIndices.size() &&
+                            i.normalDerivative.size() == i.triangleIndices.size() &&
+                            i.interfaceFluxes.size() == k.interfaceFluxes.size(),
+                        "Subdomain trace identity or completeness differs.");
+                worstTrace = std::max({worstTrace, compare(i.pressureTrace, k.pressureTrace, all),
+                                       compare(i.normalDerivative, k.normalDerivative, all)});
+                for (std::size_t z = 0; z < i.interfaceFluxes.size(); ++z) {
+                    const auto &m = i.interfaceFluxes[z], &n = k.interfaceFluxes[z];
+                    require(m.interfaceId == n.interfaceId && m.vertexIndices == n.vertexIndices &&
+                                m.normalDerivative.size() == m.vertexIndices.size(),
+                            "Interface flux identity or completeness differs.");
+                    worstTrace =
+                        std::max(worstTrace, compare(m.normalDerivative, n.normalDerivative, all));
+                }
+            }
+        }
+    }
+    std::cout << "Compared " << ar.frequencies.size()
+              << " frequencies; worst relative L2 pressure=" << worstPressure
+              << ", impedance=" << worstImpedance << ", flow=" << worstFlow
+              << ", boundary trace=" << worstTrace << '\n'
+              << "Summed recorded ms (reference/candidate): assembly=" << assemblyA << '/'
+              << assemblyB << ", solve=" << solveA << '/' << solveB << ", field=" << fieldA << '/'
+              << fieldB << '\n';
+    require(std::max({worstPressure, worstImpedance, worstFlow, worstTrace}) <= 1e-4,
+            "Saved results exceed the 1e-4 comparison target.");
+}
+
 } // namespace
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
@@ -2749,6 +2894,10 @@ int main(int argc, char **argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings.path());
     try {
+        if (argc == 4 && QString::fromLocal8Bit(argv[1]) == "--compare-results") {
+            compareSavedResults(QString::fromLocal8Bit(argv[2]), QString::fromLocal8Bit(argv[3]));
+            return 0;
+        }
         if (argc == 3 && QString::fromLocal8Bit(argv[1]) == "--project-test") {
             MainWindow main;
             main.openProject(QString::fromLocal8Bit(argv[2]));

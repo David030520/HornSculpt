@@ -1013,7 +1013,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     const bool automated =
         arguments.contains("--smoke-test") || arguments.contains("--mesh-test") ||
         arguments.contains("--solver-test") || arguments.contains("--project-test") ||
-        arguments.contains("--screenshot");
+        arguments.contains("--screenshot") || arguments.contains("--solve-project");
     if (!recoveryRoot_.isEmpty() ||
         (QCoreApplication::applicationName() == QStringLiteral("HornSculpt") && !automated))
         QTimer::singleShot(0, this, &MainWindow::startRecovery);

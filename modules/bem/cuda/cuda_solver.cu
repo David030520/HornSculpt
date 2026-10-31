@@ -749,9 +749,9 @@ class CudaBemSolver::Implementation {
           symmetryModel(std::move(symmetry)), baffleModel(std::move(baffle)), origin{},
           mesh(centered(std::move(value), origin)),
           space(domainModel ? galerkin::buildSpace(mesh) : validatedSpace(mesh)),
-          baffledPlanCache(mesh), panels(pack(space)), stream(), blas(stream), solver(stream),
-          devicePanels(panels.size()), deviceMass(space.lumpedMass.size()),
-          deviceRowScale(space.lumpedMass.size()) {
+          baffledPlanCache(mesh), subdomainPlanCache(mesh), panels(pack(space)), stream(),
+          blas(stream), solver(stream), devicePanels(panels.size()),
+          deviceMass(space.lumpedMass.size()), deviceRowScale(space.lumpedMass.size()) {
         if (storage.quadraturePatches != CudaCacheResidency::automatic &&
             storage.quadraturePatches != CudaCacheResidency::device &&
             storage.quadraturePatches != CudaCacheResidency::mappedHost)
@@ -956,6 +956,7 @@ class CudaBemSolver::Implementation {
     SurfaceMesh mesh;
     galerkin::Space space;
     cuda_detail::BaffledPlanCache baffledPlanCache;
+    cuda_detail::SubdomainPlanCache subdomainPlanCache;
     std::vector<Panel> panels;
     Stream stream;
     Blas blas;
@@ -1034,8 +1035,8 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     if (request.subdomains != state.domainModel)
         throw std::invalid_argument("BEM request and solver subdomain snapshots differ.");
     if (request.subdomains) {
-        auto result = cuda_detail::solveSubdomains(state.mesh, state.origin, request, stop,
-                                                   std::move(progress));
+        auto result = cuda_detail::solveSubdomains(
+            state.mesh, state.origin, request, state.subdomainPlanCache, stop, std::move(progress));
         result.peakDeviceBytes +=
             state.cacheBytes() + (state.workspace ? state.workspace->bytes() : 0);
         return result;
