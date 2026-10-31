@@ -1968,13 +1968,25 @@ void testSymmetricBaffleGuiArchive() {
     settings.minimumFrequency = settings.maximumFrequency = 500;
     settings.frequencyCount = 1;
     settings.symmetryXYEnabled = true;
-    settings.symmetryPlaneTolerance = 1e-6;
+    settings.symmetryPlaneTolerance = 1e-9;
     settings.acousticModel.domains = {{7, "Innen", BemDomainKind::interior, {1, 3}},
                                       {8, "Freifeld", BemDomainKind::exterior}};
     settings.acousticModel.domains[0].groups = {{1, "Driver", {1}}, {2, "Horn", {3}}};
     settings.acousticModel.interfaces = {{9, "Räumliches Interface", 7, 8, {2}}};
     settings.acousticModel.interfaces[0].groups = {{1, "Öffnung", {2}}};
     settings.acousticModel.exteriorBaffle = ExteriorBaffle{{0, 0, 0}, {0, 0, 1}, 1e-6};
+    QMainWindow validatorOwner;
+    SimulationDock archiveValidator(&validatorOwner);
+    archiveValidator.validateArchive(project.simulation);
+    auto rounded = project.simulation;
+    rounded.settings.symmetryPlaneTolerance = 3.1e-9;
+    bool rejectedRounded = false;
+    try {
+        archiveValidator.validateArchive(rounded);
+    } catch (const std::invalid_argument &) {
+        rejectedRounded = true;
+    }
+    require(rejectedRounded, "Archive accepted a symmetry tolerance rounded by the control.");
     QTemporaryDir directory;
     require(directory.isValid(), "Temporary directory unavailable.");
     const auto path = directory.filePath("quarter-baffle.hsproj");
@@ -2684,6 +2696,18 @@ int main(int argc, char **argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings.path());
     try {
+        if (argc == 3 && QString::fromLocal8Bit(argv[1]) == "--project-test") {
+            MainWindow main;
+            main.openProject(QString::fromLocal8Bit(argv[2]));
+            main.show();
+            waitUntil([&] { return !main.sourceImportInProgress(); });
+            if (!main.sourceImportError().isEmpty())
+                throw std::runtime_error(main.sourceImportError().toStdString());
+            require(main.geometryReady(), "Opened project has no current geometry.");
+            main.exerciseLoadedProjectRoundTrip();
+            std::cout << "Desktop project import and temporary round-trip PASS.\n";
+            return 0;
+        }
         if (argc == 2 && QString::fromLocal8Bit(argv[1]) == "--gmsh-source-only") {
             testGmshImportPreservesLiveLink();
             testGmshSubdomainEndToEnd();

@@ -1820,13 +1820,18 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
         multipole.restartLength > 300)
         throw std::invalid_argument("Ungültige Fast-Multipole-Einstellungen.");
     const auto valid = [](double value, QDoubleSpinBox *control) {
-        if (!std::isfinite(value) || value < control->minimum() || value > control->maximum())
+        if (!std::isfinite(value))
             return false;
         QDoubleSpinBox checked;
         checked.setDecimals(control->decimals());
         checked.setRange(control->minimum(), control->maximum());
         checked.setValue(value);
-        return checked.value() == value;
+        // SI-to-display-unit multiplication can move an exactly representable
+        // displayed value by a few floating-point ULPs. This bound is far below
+        // a displayed decimal step and does not permit a rounded user value.
+        const double restored = checked.value();
+        const double scale = std::max(std::abs(value), std::abs(restored));
+        return std::abs(restored - value) <= 15 * std::numeric_limits<double>::epsilon() * scale;
     };
     if (!valid(s.minimumFrequency, minimumFrequency_) ||
         !valid(s.maximumFrequency, maximumFrequency_) || s.maximumFrequency < s.minimumFrequency ||

@@ -3400,10 +3400,10 @@ void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
                                                               : QString{})});
                 item->setToolTip(0, tr("Flächennormale zeigt in Subdomain 1; die zweite Seite "
                                        "verwendet die Gegenrichtung."));
-                QStringList faces;
+                QStringList faceLabels;
                 for (auto id : interface.faceIds)
-                    faces << QString::number(id);
-                new QTreeWidgetItem(item, {tr("Flächen: %1").arg(faces.join(", "))});
+                    faceLabels << QString::number(id);
+                new QTreeWidgetItem(item, {tr("Flächen: %1").arg(faceLabels.join(", "))});
                 for (const auto &group : interface.groups) {
                     QStringList members;
                     for (auto id : group.faceIds)
@@ -3827,8 +3827,18 @@ void MainWindow::exerciseLoadedProjectRoundTrip() {
     if (simulationInProgress() || meshBusy_ || dirty_)
         throw std::runtime_error(
             "Offline-Projektimport startet Berechnungen oder markiert das Projekt geändert.");
-    if (cadMode() && cadSnapshot_->faces.size() >= 2) {
-        std::vector<std::uint32_t> selected{cadSnapshot_->faces[0].id, cadSnapshot_->faces[1].id};
+    std::set<std::uint32_t> interfaceFaces;
+    for (const auto &interface : original.simulation.settings.acousticModel.interfaces)
+        interfaceFaces.insert(interface.faceIds.begin(), interface.faceIds.end());
+    std::vector<std::uint32_t> selected;
+    if (cadMode())
+        for (const auto &face : cadSnapshot_->faces)
+            if (!interfaceFaces.contains(face.id) && selected.size() < 2)
+                selected.push_back(face.id);
+    // The group-assignment exercise requires two independently assignable
+    // material faces. The import and temporary round-trip above still run for
+    // models with fewer such faces.
+    if (selected.size() == 2) {
         std::sort(selected.begin(), selected.end());
         cadDock_->selectFace(selected[0]);
         cadDock_->selectFace(selected[1], Qt::ControlModifier);
