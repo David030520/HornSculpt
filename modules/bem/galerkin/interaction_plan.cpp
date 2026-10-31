@@ -221,7 +221,7 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
     // With qualified shapes, k*h<=2 and a sufficient arithmetic budget, every
     // unqualified pair has centroid-ball gap<h. Its vertex-zero distance is
     // <(1+8/3)*h<4*h, so ratio2 is a conservative spatial candidate search.
-    const auto pairs = allPairs ? std::vector<PanelPair>{}
+    auto pairs = allPairs ? std::vector<PanelPair>{}
                                 : candidates(space, std::max(2., settings.nearDistanceRatio), stop,
                                              fixedBudget, active);
     result.candidatePairs = pairs.size();
@@ -354,23 +354,50 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
     if (allPairs)
         result.candidatePairs = streamedCandidates.load();
     cancelled(stop);
+    // Classification and worker scratch are no longer live. Return their
+    // payload to the common host limit before flattening retained rules.
+    const auto classificationBytes = bounds.capacity() * sizeof(RegularPanelBounds) +
+                                     pairs.capacity() * sizeof(PanelPair);
+    std::vector<RegularPanelBounds>().swap(bounds);
+    std::vector<PanelPair>().swap(pairs);
+    fixedBudget.release(classificationBytes);
+    AdaptiveQuadratureWorkspace flattenBudget(maximumHostBytes - fixedBudget.liveBytes());
+    flattenBudget.acquire(outputBudget.liveBytes());
     std::sort(planned.begin(), planned.end(),
               [](const auto &a, const auto &b) { return a.pair < b.pair; });
+    std::size_t patchCount = 0, nearCount = 0;
+    for (const auto &entry : planned) {
+        if (entry.rule.patches.size() > std::numeric_limits<std::size_t>::max() - patchCount)
+            throw std::runtime_error("Dense quadrature plan capacity overflow.");
+        patchCount += entry.rule.patches.size();
+        nearCount += active[entry.pair.first] + active[entry.pair.second];
+    }
+    index32(patchCount);
+    index32(nearCount);
+    // Exact final sizes avoid repeated geometric growth and its old+new peak.
+    try {
+        reserveTracked(result.patches, patchCount, flattenBudget);
+        reserveTracked(result.near, nearCount, flattenBudget);
+    } catch (const std::runtime_error &error) {
+        std::ostringstream context;
+        context << "Dense plan flattening (pairs=" << planned.size() << ", patches="
+                << patchCount << ", directed jobs=" << nearCount << ", live="
+                << flattenBudget.liveBytes() << " bytes, available="
+                << maximumHostBytes - fixedBudget.liveBytes() << " bytes): " << error.what();
+        throw std::runtime_error(context.str());
+    }
     for (auto &entry : planned) {
         cancelled(stop);
         const auto first = index32(result.patches.size()),
                    size = index32(entry.rule.patches.size());
         index32(result.patches.size() + entry.rule.patches.size());
-        reserveTracked(result.patches, result.patches.size() + entry.rule.patches.size(),
-                       outputBudget);
         result.patches.insert(result.patches.end(), entry.rule.patches.begin(),
                               entry.rule.patches.end());
         // Both buffers were charged during the copy. Release consumed rules
         // immediately so later flattening does not retain a complete duplicate.
         const auto retainedBytes = entry.rule.patches.capacity() * sizeof(PairQuadraturePatch);
         std::vector<PairQuadraturePatch>().swap(entry.rule.patches);
-        outputBudget.release(retainedBytes);
-        reserveTracked(result.near, result.near.size() + 2, outputBudget);
+        flattenBudget.release(retainedBytes);
         if (active[entry.pair.first])
             result.near.push_back({entry.pair.first, entry.pair.second, first, size, 0});
         if (active[entry.pair.second])
@@ -380,7 +407,18 @@ InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSett
             std::max(result.maximumEstimatedRelativeError, entry.rule.estimatedRelativeError);
     }
     index32(result.near.size());
-    reserveTracked(result.nearTrials, result.near.size(), outputBudget);
+    const auto plannedBytes = planned.capacity() * sizeof(PlannedPair);
+    std::vector<PlannedPair>().swap(planned);
+    flattenBudget.release(plannedBytes);
+    try {
+        reserveTracked(result.nearTrials, result.near.size(), flattenBudget);
+    } catch (const std::runtime_error &error) {
+        std::ostringstream context;
+        context << "Dense plan near-trial indexing (directed jobs=" << nearCount << ", live="
+                << flattenBudget.liveBytes() << " bytes, available="
+                << maximumHostBytes - fixedBudget.liveBytes() << " bytes): " << error.what();
+        throw std::runtime_error(context.str());
+    }
     std::sort(result.near.begin(), result.near.end(), [](const auto &a, const auto &b) {
         return std::pair{a.test, a.trial} < std::pair{b.test, b.trial};
     });

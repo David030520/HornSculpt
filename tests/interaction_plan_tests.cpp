@@ -334,7 +334,9 @@ void retainedRulesBudgetTest() {
     settings.maximumSubdivisionDepth = 6;
     settings.nearDistanceRatio = 1000;
     constexpr double k = 366.366;
-    constexpr std::size_t budget = 1024 * 1024;
+    // Tight enough that geometric growth during the final flattening cannot
+    // coexist with all retained rule metadata in the old half-budget pool.
+    constexpr std::size_t budget = 768 * 1024;
     const auto serial = makeInteractionPlan(space, settings, k, {}, 1, budget);
     const auto parallel = makeInteractionPlan(space, settings, k, {}, 8, budget);
     comparePlans(serial, parallel);

@@ -61,7 +61,9 @@ struct InteractionPlan {
 // numerical regular qualification still applies. The payload budget includes
 // candidates, retained patches and bounded concurrent adaptive workspaces.
 // Completed rules use a shared output pool; worker scratch holds only the
-// currently integrated pair. Flattening releases each consumed rule promptly.
+// currently integrated pair. After workers finish, flattening reuses the
+// classification and scratch allowances under the same total payload limit,
+// reserves exact final sizes, and releases consumed rules and metadata promptly.
 InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSettings &settings,
                                     double maximumWavenumber, std::stop_token stop = {},
                                     unsigned maximumThreads = 0,
