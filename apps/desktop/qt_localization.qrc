@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/hornsculpt/i18n">
+    <file alias="qtbase_de.qm">resources/qtbase_de.qm</file>
+  </qresource>
+</RCC>

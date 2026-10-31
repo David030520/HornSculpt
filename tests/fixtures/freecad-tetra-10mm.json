@@ -1,0 +1,145 @@
+{
+  "type": "snapshot",
+  "protocol": 2,
+  "units": "m",
+  "sessionId": "fixture-session",
+  "documentId": "fixture-document",
+  "documentName": "Fixture",
+  "revision": "1",
+  "acousticOrigin": [
+    0,
+    0,
+    0
+  ],
+  "acousticAxis": [
+    0,
+    0,
+    1
+  ],
+  "objects": [
+    {
+      "id": "object-a",
+      "name": "Fixture",
+      "label": "Fixture",
+      "placement": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "topologyFingerprint": "02d87c70109802b99af384239799656ca8494a1f2296a02a64d2d5022237e39f"
+    }
+  ],
+  "faces": [
+    {
+      "objectId": "object-a",
+      "mappedName": "",
+      "label": "Fixture / Face1",
+      "surfaceType": "Plane",
+      "geometryKey": "125dfb59585050b6d6b953c60602c7fb444305450f9a946a252db975bf13614d",
+      "topologyKey": "883879552c8bdcc83f071e53437a23367c1d6971ead540db1a2549198a425b90",
+      "area": 4.999999999999999e-05,
+      "center": [
+        0.003333333333333333,
+        0.0033333333333333335,
+        0.0
+      ],
+      "normal": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "edgeCount": 3,
+      "wireCount": 1
+    },
+    {
+      "objectId": "object-a",
+      "mappedName": "",
+      "label": "Fixture / Face2",
+      "surfaceType": "Plane",
+      "geometryKey": "cccf3ef92171c8f6b54fc63f41f6e389b7f910a24153f07fdbfd17d826f138a2",
+      "topologyKey": "12d0324cc85c223f99b743dc23363ab2b63f6da9eabf6a51013b92a3a93d2085",
+      "area": 4.999999999999999e-05,
+      "center": [
+        0.003333333333333332,
+        0.0,
+        0.003333333333333333
+      ],
+      "normal": [
+        0.0,
+        -1.0,
+        0.0
+      ],
+      "edgeCount": 3,
+      "wireCount": 1
+    },
+    {
+      "objectId": "object-a",
+      "mappedName": "",
+      "label": "Fixture / Face3",
+      "surfaceType": "Plane",
+      "geometryKey": "182ed3242a445651ffeaedc9c32bfba06539045876a9ae61ca7fae1b84a0b03c",
+      "topologyKey": "ad94e70eb95a921683ca4c3dda96e69bde1b4f2fa018da5f5086145282bab134",
+      "area": 4.999999999999997e-05,
+      "center": [
+        0.0,
+        0.0033333333333333314,
+        0.003333333333333332
+      ],
+      "normal": [
+        -1.0,
+        -0.0,
+        -0.0
+      ],
+      "edgeCount": 3,
+      "wireCount": 1
+    },
+    {
+      "objectId": "object-a",
+      "mappedName": "",
+      "label": "Fixture / Face4",
+      "surfaceType": "Plane",
+      "geometryKey": "bdbbf93019ac8863a9286b1790a6018b8b2f429d88115e456fa884e8f20ea10a",
+      "topologyKey": "dbd3a2d028c73c27bbf0b126d41d19505cecd5d59e425712e4bc0f35d1d949c6",
+      "area": 8.660254037844385e-05,
+      "center": [
+        0.0033333333333333344,
+        0.0033333333333333344,
+        0.003333333333333333
+      ],
+      "normal": [
+        0.5773502691896258,
+        0.5773502691896257,
+        0.5773502691896258
+      ],
+      "edgeCount": 3,
+      "wireCount": 1
+    }
+  ],
+  "brepMetresPerUnit": 0.001,
+  "brepParts": [
+    {
+      "objectId": "object-a",
+      "data": "CkNBU0NBREUgVG9wb2xvZ3kgVjEsIChjKSBNYXRyYS1EYXRhdmlzaW9uCkxvY2F0aW9ucyAzCjEKICAgICAgICAgICAgICAxICAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDAgICAgICAgICAgICAgICAwIAogICAgICAgICAgICAgIDAgICAgICAgICAgICAgICAxICAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDAgCiAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDAgICAgICAgICAgICAgICAxICAgICAgICAgICAgICAgMCAKMQogICAgICAgICAgICAgIDEgICAgICAgICAgICAgICAwICAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDAgCiAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDEgICAgICAgICAgICAgICAwICAgICAgICAgICAgICAgMCAKICAgICAgICAgICAgICAwICAgICAgICAgICAgICAgMCAgICAgICAgICAgICAgIDEgICAgICAgICAgICAgICAwIAoyICAyIC0xIDAKQ3VydmUyZHMgMTIKMSAzLjUzNTUzMzkwNTkzMjczNzggLTMuNTM1NTMzOTA1OTMyNzM3OCAwIDEgCjggMCAxMAoxIDMuNTM1NTMzOTA1OTMyNzM3OCAzLjUzNTUzMzkwNTkzMjczNzggLTAgLTEgCjEgMy41MzU1MzM5MDU5MzI3Mzc4IDYuNDY0NDY2MDk0MDY3MjYyMiAtMC43MDcxMDY3ODExODY1NDc1NyAtMC43MDcxMDY3ODExODY1NDc1NyAKOCAwIDE0LjE0MjEzNTYyMzczMDk1MQoxIDAgOC4xNjQ5NjU4MDkyNzcyNjA4IDAuNSAtMC44NjYwMjU0MDM3ODQ0Mzg2IAoxIC02LjQ2NDQ2NjA5NDA2NzI2MjIgLTMuNTM1NTMzOTA1OTMyNzM3OCAxIDAgCjggMCAxMAoxIDMuNTM1NTMzOTA1OTMyNzM3OCA2LjQ2NDQ2NjA5NDA2NzI2MjIgLTAgLTEgCjEgMy41MzU1MzM5MDU5MzI3Mzc4IDYuNDY0NDY2MDk0MDY3MjYyMiAtMC43MDcxMDY3ODExODY1NDc1NyAtMC43MDcxMDY3ODExODY1NDc1NyAKOCAwIDE0LjE0MjEzNTYyMzczMDk1MQoxIDcuMDcxMDY3ODExODY1NDc1NSAtNC4wODI0ODI5MDQ2Mzg2MzEzIC0xIC0wIAoxIC02LjQ2NDQ2NjA5NDA2NzI2MjIgLTMuNTM1NTMzOTA1OTMyNzM3OCAxIDAgCjggMCAxMAoxIC02LjQ2NDQ2NjA5NDA2NzI2MjIgMy41MzU1MzM5MDU5MzI3Mzc4IDEgLTAgCjEgLTYuNDY0NDY2MDk0MDY3MjYyMiAzLjUzNTUzMzkwNTkzMjczNzggMC43MDcxMDY3ODExODY1NDc1NyAtMC43MDcxMDY3ODExODY1NDc1NyAKOCAwIDE0LjE0MjEzNTYyMzczMDk1MQoxIC03LjA3MTA2NzgxMTg2NTQ3MzcgLTQuMDgyNDgyOTA0NjM4NjI5NSAwLjQ5OTk5OTk5OTk5OTk5OTg5IDAuODY2MDI1NDAzNzg0NDM4NiAKQ3VydmVzIDYKMSAwIDAgMCAwIDEgMCAKMSAwIDEwIDAgMC43MDcxMDY3ODExODY1NDc0NiAtMC43MDcxMDY3ODExODY1NDc0NiAwIAoxIDEwIDAgMCAtMSAwIDAgCjEgMTAgMCAwIC0wLjcwNzEwNjc4MTE4NjU0NzQ2IDAgMC43MDcxMDY3ODExODY1NDc0NiAKMSAwIDAgMTAgMCAwIC0xIAoxIDAgMCAxMCAwIDAuNzA3MTA2NzgxMTg2NTQ3NDYgLTAuNzA3MTA2NzgxMTg2NTQ3NDYgClBvbHlnb24zRCAwClBvbHlnb25PblRyaWFuZ3VsYXRpb25zIDAKU3VyZmFjZXMgNAoxIDMuNTM1NTMzOTA1OTMyNzM3OCAzLjUzNTUzMzkwNTkzMjczNzggMCAtMCAtMCAtMSAtMSAwIDAgMCAxIC0wIAoxIDAgMy41MzU1MzM5MDU5MzI3Mzc4IDMuNTM1NTMzOTA1OTMyNzM3OCAtMSAtMCAtMCAwIDAgLTEgMCAtMSAwIAoxIDMuMzMzMzMzMzMzMzMzMzMzNSAzLjMzMzMzMzMzMzMzMzMzMzUgMy4zMzMzMzMzMzMzMzMzMzM1IDAuNTc3MzUwMjY5MTg5NjI1NzMgMC41NzczNTAyNjkxODk2MjU3MyAwLjU3NzM1MDI2OTE4OTYyNTg0IDAuNzA3MTA2NzgxMTg2NTQ3NTcgMCAtMC43MDcxMDY3ODExODY1NDc0NiAtMC40MDgyNDgyOTA0NjM4NjMwMiAwLjgxNjQ5NjU4MDkyNzcyNjE1IC0wLjQwODI0ODI5MDQ2Mzg2MzA3IAoxIDMuNTM1NTMzOTA1OTMyNzM3OCAwIDMuNTM1NTMzOTA1OTMyNzM3OCAtMCAtMSAtMCAwIDAgLTEgMSAtMCAwIApUcmlhbmd1bGF0aW9ucyAwCgpUU2hhcGVzIDIwClZlCjFlLTA3CjAgMCAwCjAgMAoKMDEwMTEwMQoqClZlCjFlLTA3CjAgMTAgMAowIDAKCjAxMDExMDEKKgpFZAogMWUtMDcgMSAxIDAKMSAgMSAwIDAgMTAKMiAgMSAxIDAgMCAxMAoyICAyIDIgMCAwIDEwCjAKCjAxMDEwMDAKKzIwIDMgLTE5IDMgKgpWZQoxZS0wNwoxMCAwIDAKMCAwCgowMTAxMTAxCioKRWQKIDFlLTA3IDEgMSAwCjEgIDIgMCAwIDE0LjE0MjEzNTYyMzczMQoyICAzIDEgMCAwIDE0LjE0MjEzNTYyMzczMQoyICA0IDMgMCAwIDE0LjE0MjEzNTYyMzczMQowCgowMTAxMDAwCisxOSAzIC0xNyAzICoKRWQKIDFlLTA3IDEgMSAwCjEgIDMgMCAwIDEwCjIgIDUgMSAwIDAgMTAKMiAgNiA0IDAgMCAxMAowCgowMTAxMDAwCisxNyAzIC0yMCAzICoKV2kKCjAxMDExMDAKKzE4IDAgKzE2IDAgKzE1IDAgKgpGYQowICAxZS0wNyAxIDAKCjAxMDEwMDAKKzE0IDAgKgpWZQoxZS0wNwowIDAgMTAKMCAwCgowMTAxMTAxCioKRWQKIDFlLTA3IDEgMSAwCjEgIDQgMCAwIDE0LjE0MjEzNTYyMzczMQoyICA3IDQgMCAwIDE0LjE0MjEzNTYyMzczMQoyICA4IDMgMCAwIDE0LjE0MjEzNTYyMzczMQowCgowMTAxMDAwCisxNyAzIC0xMiAzICoKRWQKIDFlLTA3IDEgMSAwCjEgIDUgMCAwIDEwCjIgIDkgNCAwIDAgMTAKMiAgMTAgMiAwIDAgMTAKMAoKMDEwMTAwMAorMTIgMyAtMjAgMyAqCldpCgowMTAxMTAwCi0xNSAwICsxMSAwICsxMCAwICoKRmEKMCAgMWUtMDcgNCAwCgowMTAxMDAwCis5IDAgKgpFZAogMWUtMDcgMSAxIDAKMSAgNiAwIDAgMTQuMTQyMTM1NjIzNzMxCjIgIDExIDIgMCAwIDE0LjE0MjEzNTYyMzczMQoyICAxMiAzIDAgMCAxNC4xNDIxMzU2MjM3MzEKMAoKMDEwMTAwMAorMTIgMyAtMTkgMyAqCldpCgowMTAxMTAwCi0xMCAwICs3IDAgLTE4IDAgKgpGYQowICAxZS0wNyAyIDAKCjAxMDEwMDAKKzYgMCAqCldpCgowMTAxMTAwCi0xNiAwIC03IDAgLTExIDAgKgpGYQowICAxZS0wNyAzIDAKCjAxMDEwMDAKKzQgMCAqClNoCgowMTAxMTAwCisxMyAwICs4IDAgKzUgMCArMyAwICoKU28KCjExMDAwMDAKKzIgMCAqCgorMSAxIA==",
+      "sha256": "e7e29d47b379df472d3b8fb59560dec1ae2c1af23677629b06995038475c89f4",
+      "faceIndices": [
+        0,
+        1,
+        2,
+        3
+      ]
+    }
+  ]
+}

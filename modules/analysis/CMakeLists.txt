@@ -1,0 +1,4 @@
+add_library(hs_analysis STATIC geometry_analysis.cpp acoustic_analysis.cpp acoustic_frame.cpp)
+target_include_directories(hs_analysis PUBLIC include)
+target_link_libraries(hs_analysis PUBLIC hs_geometry)
+target_compile_features(hs_analysis PUBLIC cxx_std_20)

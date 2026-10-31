@@ -1,0 +1,23 @@
+Enthaltene Komponenten
+
+Qt 6.8.3: https://www.qt.io/
+Qt Translations 6.8.3 (qtbase_de.qm), Copyright (C) The Qt Company Ltd.
+und Mitwirkende, BSD-3-Clause: siehe Qt-Translations-BSD-3-Clause.txt.
+Originalpaket: https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_683/qt6_683/qt.qt6.683.win64_msvc2022_64/6.8.3-0-202503201308qttranslations-Windows-Windows_11_23H2-MSVC2022-Windows-Windows_11_23H2-X86_64.7z
+Paket SHA-256: c78fef2eff30b880e1aa9b049eff8a283431bc2d7e03132143279b5480d95418
+qtbase_de.qm SHA-256: b30044cc265c7216c1a2b3db8c065fdb980cc01f169906859e7966b3feab2753
+Qt-Paket-SHA-1 wurde gegen die veröffentlichte .sha1-Datei geprüft; die
+Katalog-SHA-1 163923e304398decacda90c1edf3c430ef0e9079 stimmt mit dem
+vom Originalpaket mitgelieferten Qt-Translations-SBOM überein. Der Katalog ist unverändert
+als Ressource eingebunden; der Build lädt keine Dateien herunter.
+CGAL 6.2.1: https://www.cgal.org/
+Boost 1.88.0: https://www.boost.org/
+Open CASCADE Technology 7.9.3: https://github.com/Open-Cascade-SAS/OCCT/tree/V7_9_3
+NVIDIA CUDA Toolkit 13.3 / cuBLAS / cuSOLVER / cuSPARSE:
+https://developer.nvidia.com/cuda-toolkit
+Microsoft Visual C++ Laufzeit und D3Dcompiler_47.
+
+Lizenztexte und der bereitgestellte Qt-SBOM liegen in diesem Verzeichnis.
+Weitere CAD-Laufzeiten, Quellen und Lizenzhinweise stehen unter OpenCASCADE.
+Die Drittanbieter behalten ihre jeweiligen Rechte.
+HornSculpt-Quellcode und Builddefinitionen liegen im zugehoerigen Git-Projekt.

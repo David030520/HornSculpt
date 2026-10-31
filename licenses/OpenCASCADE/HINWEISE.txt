@@ -1,0 +1,23 @@
+CAD-Laufzeiten
+
+Open CASCADE Technology 7.9.3: Copyright Open Cascade SAS und Beitragende.
+LGPL 2.1 mit OCCT-Ausnahme. Lizenztexte in diesem Verzeichnis.
+Quellcode: https://github.com/Open-Cascade-SAS/OCCT/tree/V7_9_3
+SDK/Abhängigkeiten und Prüfsummen: QUELLEN.md.
+
+oneTBB 2021.13.0: Apache 2.0. Quellcode:
+https://github.com/oneapi-src/oneTBB/tree/v2021.13.0
+jemalloc: BSD-Lizenz, gemäß mitgeliefertem OCCT-Drittanbieterpaket.
+https://github.com/jemalloc/jemalloc
+FreeType 2.13.3: FreeType License (FTL). Quellcode:
+https://gitlab.freedesktop.org/freetype/freetype/-/tree/VER-2-13-3
+FreeImage 3.18.0: FreeImage Public License. Quellcode:
+https://sourceforge.net/projects/freeimage/files/Source%20Distribution/3.18.0/
+OpenVR 1.14.15: BSD-Lizenz. Quellcode:
+https://github.com/ValveSoftware/openvr/tree/v1.14.15
+FFmpeg 3.3.4: Die tatsächlich mitgelieferten avutil/avcodec/avformat-Laufzeiten
+melden über *_license() "LGPL version 2.1 or later".
+Quellcode: https://github.com/FFmpeg/FFmpeg/tree/n3.3.4
+Lizenztext: FFmpeg-LGPL-2.1.txt.
+
+Alle Komponenten liegen als separat ersetzbare dynamische Bibliotheken vor.
