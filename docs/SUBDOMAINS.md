@@ -58,6 +58,21 @@ vorselektiert; übernommen wird sie erst durch die ausdrückliche Zuordnung.
 Gruppennamen ändern keine Randbedingung. Gruppen bleiben disjunkte Teilmengen
 der tatsächlichen Flächenzuordnung.
 
+Beim Öffnen eines Projekts mit expliziten Interfaces sind deren Drahtnetz
+und Normalen sichtbar. **Interface-Normalen** zeigt cyanfarbene Pfeile `+n`
+in Subdomain 1 und orangefarbene Pfeile `−n` in Subdomain 2. Die Legende nennt
+die zugehörigen Gebietsnamen. Die Richtungen folgen der tatsächlichen
+Dreiecksorientierung, auch nach einer bewussten Flächenumkehr; bei großen
+Netzen werden die Pfeile je Flächengruppe ausgedünnt.
+
+**Modellebenen** zeigt die konfigurierte unendliche Außenraum-Schallwand
+und die beiden Symmetrieebenen als farbige Gitter. Ihre endliche gezeichnete
+Ausdehnung ist symbolisch. Ein Schallwandpfeil zeigt in den abstrahlenden
+Außenraum, die Symmetriepfeile in die behaltenen Halbseiten. Diese Angaben
+werden bereits aus der aktuellen Modellkonfiguration angezeigt, ohne einen
+Solve zu starten. Das Ein-/Ausblenden verändert weder Netz und Kamera noch
+Revision oder Ergebnisgültigkeit.
+
 Abbrechen übernimmt keine Eingaben. Vorhandene IDs bleiben beim Bearbeiten
 erhalten. Numerisch gleiche Face-IDs eines anderen CAD-Dokuments sind
 keine Identität: Nach einem unklaren Flächenwechsel bleibt die Zuordnung
@@ -92,6 +107,12 @@ Druck; die Fläche ist keine Materialwand. Physische LEM-Anschlüsse können
 nach dem unten beschriebenen Vertrag an verschiedene Gebiete gekoppelt werden.
 
 ## Numerischer Vertrag
+
+Die Darstellungen werden durch den OpenGL-Test `acoustic_guides_render`
+geprüft: Schallwand und beide Symmetrieebenen, Normalenumkehr, Sichtbarkeit,
+Entfernen der Hilfen sowie unveränderte Kamera, Flächenauswahl und Quellnetze.
+Der native GUI-Test prüft die Anzeigen vor und nach einer CUDA-Rechnung,
+das Wiederöffnen und den Wechsel zu einem Projekt ohne diese Hilfen.
 
 ### Viertelsymmetrie und Außenraum-Schallwand
 

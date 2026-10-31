@@ -1936,6 +1936,36 @@ void testGmshSubdomainEndToEnd() {
             "Saved Gmsh project did not reopen current.");
     std::cerr << "Gmsh GUI stage done\n" << std::flush;
 }
+void checkAcousticGuideControls(MainWindow &main, const SimulationSettings &settings) {
+    auto *viewport = dynamic_cast<MeshViewport *>(main.findChild<QOpenGLWidget *>("meshViewport"));
+    auto *guides = main.findChild<QCheckBox *>("showAcousticGuides");
+    auto *normals = main.findChild<QCheckBox *>("showInterfaceNormals");
+    auto *interfaces = main.findChild<QCheckBox *>("showBemLemInterfaces");
+    require(viewport && guides && normals && interfaces, "Acoustic display controls missing.");
+    require(guides->isChecked() && normals->isChecked() && interfaces->isChecked() &&
+                viewport->acousticGuidesVisible() && viewport->interfaceNormalsVisible(),
+            "Acoustic guides are hidden when an explicit interface project opens.");
+    require(viewport->exteriorBaffle() == settings.acousticModel.exteriorBaffle &&
+                viewport->symmetryPlanes().has_value(),
+            "Viewport does not show the configured acoustic planes.");
+    const auto &groups = viewport->interfaceOrientationLabels();
+    require(groups.size() == 1 && !groups.front().triangleIndices.empty() &&
+                groups.front().name ==
+                    QString::fromStdString(settings.acousticModel.interfaces[0].name) &&
+                groups.front().firstDomain == "Innen" && groups.front().secondDomain == "Freifeld",
+            "Interface arrows do not identify their two domain sides.");
+    const auto revision = main.revision();
+    const bool current = main.simulationReady();
+    guides->setChecked(false);
+    normals->setChecked(false);
+    require(!viewport->acousticGuidesVisible() && !viewport->interfaceNormalsVisible(),
+            "Acoustic visibility controls do not reach the viewport.");
+    guides->setChecked(true);
+    normals->setChecked(true);
+    require(main.revision() == revision && main.simulationReady() == current &&
+                !main.simulationInProgress() && !main.meshInProgress(),
+            "Acoustic visibility changes revisions or starts computation.");
+}
 void testSymmetricBaffleGuiArchive() {
     auto mesh = testing::openRimSourceMesh(true);
     for (auto &triangle : mesh.triangles)
@@ -2009,6 +2039,7 @@ void testSymmetricBaffleGuiArchive() {
     waitUntil([&] { return !main.sourceImportInProgress(); });
     require(main.sourceImportError().isEmpty() && main.geometryReady(),
             "Symmetric source failed to open.");
+    checkAcousticGuideControls(main, settings);
     main.requestMesh();
     waitUntil([&] { return !main.meshInProgress(); });
     if (!main.lastMeshError().isEmpty())
@@ -2019,6 +2050,7 @@ void testSymmetricBaffleGuiArchive() {
     if (!main.lastSimulationError().isEmpty())
         throw std::runtime_error(main.lastSimulationError().toStdString());
     require(main.simulationReady(), "Symmetric baffle solve did not finish.");
+    checkAcousticGuideControls(main, settings);
     if (const auto screenshot = qEnvironmentVariable("HS_SUBDOMAIN_SCREENSHOT");
         !screenshot.isEmpty()) {
         auto *workflow = main.findChild<QLabel *>("workflowStatus");
@@ -2056,6 +2088,20 @@ void testSymmetricBaffleGuiArchive() {
             (QStringLiteral("Symmetric source reopen failed: ") + reopened.sourceImportError())
                 .toStdString());
     require(reopened.simulationReady(), "Symmetric project reopened without a current result.");
+    checkAcousticGuideControls(reopened, settings);
+    auto plain = project;
+    plain.simulation.settings.symmetryXYEnabled = false;
+    plain.simulation.settings.acousticModel = {};
+    const auto plainPath = directory.filePath("without-guides.hsproj");
+    writeProject(plainPath, plain);
+    reopened.openProject(plainPath);
+    waitUntil([&] { return !reopened.sourceImportInProgress(); });
+    require(reopened.sourceImportError().isEmpty(), "Plain project failed to reopen.");
+    auto *viewport =
+        dynamic_cast<MeshViewport *>(reopened.findChild<QOpenGLWidget *>("meshViewport"));
+    require(viewport && !viewport->symmetryPlanes() && !viewport->exteriorBaffle() &&
+                viewport->interfaceOrientationLabels().empty(),
+            "Opening a different project leaves stale acoustic guides.");
 }
 void testGmshImportPreservesLiveLink() {
     MainWindow main;
@@ -2704,6 +2750,12 @@ int main(int argc, char **argv) {
             if (!main.sourceImportError().isEmpty())
                 throw std::runtime_error(main.sourceImportError().toStdString());
             require(main.geometryReady(), "Opened project has no current geometry.");
+            if (const auto screenshot = qEnvironmentVariable("HS_SUBDOMAIN_SCREENSHOT");
+                !screenshot.isEmpty()) {
+                QApplication::processEvents();
+                require(main.grab().save(screenshot + "-import.png"),
+                        "Imported project screenshot failed.");
+            }
             main.exerciseLoadedProjectRoundTrip();
             std::cout << "Desktop project import and temporary round-trip PASS.\n";
             return 0;

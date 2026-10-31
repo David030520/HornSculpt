@@ -496,6 +496,20 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     showInterfaces_->setWhatsThis(showInterfaces_->toolTip());
     showInterfaces_->setEnabled(false);
     viewLayout->addWidget(showInterfaces_, 1, 2);
+    auto *showGuides = new QCheckBox(tr("Modellebenen"));
+    showGuides->setObjectName("showAcousticGuides");
+    showGuides->setChecked(true);
+    showGuides->setToolTip(tr("Symmetrie- und Schallwandebenen anzeigen. Ihre dargestellte "
+                              "Ausdehnung ist symbolisch; die Ebenen sind unendlich."));
+    showGuides->setWhatsThis(showGuides->toolTip());
+    viewLayout->addWidget(showGuides, 2, 0, 1, 2);
+    auto *showInterfaceNormals = new QCheckBox(tr("Interface-Normalen"));
+    showInterfaceNormals->setObjectName("showInterfaceNormals");
+    showInterfaceNormals->setChecked(true);
+    showInterfaceNormals->setToolTip(tr("+n zeigt in Subdomain 1, −n in Subdomain 2. "
+                                        "Die Pfeile ändern weder Netz noch Rechnung."));
+    showInterfaceNormals->setWhatsThis(showInterfaceNormals->toolTip());
+    viewLayout->addWidget(showInterfaceNormals, 2, 2, 1, 2);
     // Keep the native controls reachable on narrow displays without forcing
     // the entire center column to their combined minimum width.
     auto *viewScroll = new QScrollArea;
@@ -547,6 +561,9 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     centerLayout->addWidget(viewport_, 1);
     setCentralWidget(center);
     connect(wireframe, &QCheckBox::toggled, viewport_, &MeshViewport::setWireframe);
+    connect(showGuides, &QCheckBox::toggled, viewport_, &MeshViewport::setAcousticGuidesVisible);
+    connect(showInterfaceNormals, &QCheckBox::toggled, viewport_,
+            &MeshViewport::setInterfaceNormalsVisible);
     connect(wireframe, &QCheckBox::toggled, this,
             [](bool enabled) { QSettings().setValue("view/wireframe", enabled); });
     auto *backgroundGrid = view->addAction(tr("Hintergrundraster"));
@@ -627,6 +644,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     meshItem_ = new QTreeWidgetItem(projectItem_, {tr("Netz · nicht erzeugt")});
     domainsItem_ = new QTreeWidgetItem(projectItem_, {tr("Akustische Gebiete")});
     domainsItem_->setHidden(true);
+    symmetryItem_ = new QTreeWidgetItem(projectItem_, {tr("Symmetrie · x = 0, y = 0")});
+    symmetryItem_->setHidden(true);
     tree->expandAll();
     auto *treeDock = dock(this, tr("Projekt"), "projectDock", tree, Qt::LeftDockWidgetArea);
     view->addAction(treeDock->toggleViewAction());
@@ -816,6 +835,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         rememberEdit(true);
         if (gmsh_)
             meshingChanged();
+        updateDisplay();
     };
     simulationDock_->onObservationFrameChanged = [this] {
         viewport_->setObservationFrame(simulationDock_->observationFrame());
@@ -1936,7 +1956,7 @@ void MainWindow::applyProject(const PreparedProject &prepared) {
     meshPanel_->setFaceNotice({});
     {
         const QSignalBlocker visibility(showInterfaces_);
-        showInterfaces_->setChecked(false);
+        showInterfaces_->setChecked(!project.simulation.settings.acousticModel.interfaces.empty());
     }
     updateSourcePresentation();
     updatePlots(prepared.analysis);
@@ -3415,7 +3435,64 @@ void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
         }
         domainsItem_->setExpanded(true);
     }
-    viewport_->setInterfaceMesh(interfaceOverlay_);
+    const auto domainName = [&](std::uint32_t id) {
+        const auto found = std::find_if(regions.domains.begin(), regions.domains.end(),
+                                        [id](const auto &d) { return d.id == id; });
+        return found == regions.domains.end() ? QString::number(id)
+                                              : QString::fromStdString(found->name);
+    };
+    std::vector<InterfaceOrientationLabels> labels;
+    if (interfaceOverlay_) {
+        if (computed) {
+            std::size_t offset = 0;
+            for (const auto &interface : archive.request->subdomains->interfaces) {
+                InterfaceOrientationLabels group{{},
+                                                 QString::fromStdString(interface.name),
+                                                 domainName(interface.firstDomainId),
+                                                 domainName(interface.secondDomainId)};
+                for (std::size_t i = 0; i < interface.triangleIndices.size(); ++i)
+                    group.triangleIndices.push_back(offset++);
+                labels.push_back(std::move(group));
+            }
+        } else {
+            for (const auto &interface : regions.interfaces) {
+                InterfaceOrientationLabels group{{},
+                                                 QString::fromStdString(interface.name),
+                                                 domainName(interface.firstDomainId),
+                                                 domainName(interface.secondDomainId)};
+                for (std::size_t i = 0; i < interfaceOverlay_->triangles.size(); ++i)
+                    if (std::find(interface.faceIds.begin(), interface.faceIds.end(),
+                                  interfaceOverlay_->triangles[i].faceId) !=
+                        interface.faceIds.end())
+                        group.triangleIndices.push_back(i);
+                labels.push_back(std::move(group));
+            }
+        }
+    }
+    viewport_->setInterfaceMesh(interfaceOverlay_, std::move(labels));
+    symmetryItem_->setHidden(!archive.settings.symmetryXYEnabled);
+    symmetryItem_->setToolTip(0, tr("Symmetrieebenen x = 0 und y = 0; Toleranz %1 mm")
+                                     .arg(archive.settings.symmetryPlaneTolerance * 1000));
+    std::optional<OrthogonalSymmetryPlanes> planes;
+    if (archive.settings.symmetryXYEnabled) {
+        const auto sector = mesh_ && meshRevision_ == revision_
+                                ? std::shared_ptr<const SurfaceMesh>(mesh_, &mesh_->mesh)
+                                : (geometryRevision_ == revision_ ? preview_ : nullptr);
+        if (sector) {
+            try {
+                planes = inferXYSymmetry(*sector, archive.settings.symmetryPlaneTolerance);
+            } catch (const std::invalid_argument &) {
+                // Invalid sectors cannot supply a retained-side orientation.
+            }
+        }
+    }
+    viewport_->setSymmetryPlanes(planes);
+    auto baffle = regions.exteriorBaffle;
+    if (!baffle && archive.settings.infiniteBaffle) {
+        const auto &b = *archive.settings.infiniteBaffle;
+        baffle = ExteriorBaffle{b.origin, b.normal, 0};
+    }
+    viewport_->setExteriorBaffle(baffle);
     viewport_->setInterfaceVisible(showInterfaces_->isChecked());
 }
 void MainWindow::configureSimulation() {

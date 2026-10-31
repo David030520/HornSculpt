@@ -5,6 +5,7 @@
 #include <QOpenGLPaintDevice>
 #include <QOpenGLShaderProgram>
 #include <QPainter>
+#include <QStringList>
 #include <QSurfaceFormat>
 #include <QToolTip>
 #include <QVector2D>
@@ -19,6 +20,7 @@
 #include <hornsculpt/triangle_metrics.hpp>
 #include <limits>
 #include <numbers>
+#include <numeric>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -313,8 +315,9 @@ void MeshViewport::setMesh(std::shared_ptr<const SurfaceMesh> mesh) {
     fieldUploadPending_ = true;
     update();
 }
-void MeshViewport::setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh) {
-    if (interfaceMesh_ == mesh)
+void MeshViewport::setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh,
+                                    std::vector<InterfaceOrientationLabels> groups) {
+    if (interfaceMesh_ == mesh && interfaceGroups_ == groups)
         return;
     if (mesh) {
         for (const auto &p : mesh->vertices)
@@ -328,8 +331,69 @@ void MeshViewport::setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh) {
             static_cast<std::size_t>(std::numeric_limits<int>::max()) / (6 * sizeof(RenderVertex)))
             throw std::invalid_argument("Viewer: Interface-Puffer zu groß.");
     }
+    for (const auto &group : groups)
+        for (const auto index : group.triangleIndices)
+            if (!mesh || index >= mesh->triangles.size())
+                throw std::invalid_argument("Viewer: ungueltige Interface-Gruppenzuordnung.");
+    // Account for the worst case: every sampled triangle has its own face.
+    const auto maxVertices =
+        static_cast<std::size_t>(std::numeric_limits<int>::max()) / sizeof(RenderVertex);
+    std::size_t vertexBudget = mesh ? mesh->triangles.size() * 6 : 0;
+    const auto addBudget = [&](std::size_t triangles) {
+        if (vertexBudget > maxVertices - 78 || triangles > (maxVertices - 78 - vertexBudget) / 12)
+            throw std::invalid_argument("Viewer: Interface-Puffer zu groß.");
+        vertexBudget += triangles * 12;
+    };
+    if (groups.empty() && mesh)
+        addBudget(mesh->triangles.size());
+    else
+        for (const auto &group : groups)
+            addBudget(group.triangleIndices.size());
     interfaceMesh_ = std::move(mesh);
+    interfaceGroups_ = std::move(groups);
     interfaceUploadPending_ = true;
+    update();
+}
+void MeshViewport::setSymmetryPlanes(std::optional<OrthogonalSymmetryPlanes> planes) {
+    if (symmetryPlanes_ == planes)
+        return;
+    const auto finite = [](Vec3 v) {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    };
+    const auto nonzero = [](Vec3 v) { return v.x != 0 || v.y != 0 || v.z != 0; };
+    if (planes &&
+        (!finite(planes->origin) || !finite(planes->firstNormal) || !finite(planes->secondNormal) ||
+         !nonzero(planes->firstNormal) || !nonzero(planes->secondNormal) ||
+         !std::isfinite(planes->planeDistanceTolerance)))
+        throw std::invalid_argument("Viewer: ungültige Symmetrieebene.");
+    symmetryPlanes_ = std::move(planes);
+    interfaceUploadPending_ = true;
+    update();
+}
+void MeshViewport::setExteriorBaffle(std::optional<ExteriorBaffle> baffle) {
+    if (exteriorBaffle_ == baffle)
+        return;
+    const auto finite = [](Vec3 v) {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    };
+    if (baffle && (!finite(baffle->origin) || !finite(baffle->normal) ||
+                   (baffle->normal.x == 0 && baffle->normal.y == 0 && baffle->normal.z == 0) ||
+                   !std::isfinite(baffle->planeDistanceTolerance)))
+        throw std::invalid_argument("Viewer: ungültige Schallwandebene.");
+    exteriorBaffle_ = std::move(baffle);
+    interfaceUploadPending_ = true;
+    update();
+}
+void MeshViewport::setAcousticGuidesVisible(bool visible) {
+    if (acousticGuidesVisible_ == visible)
+        return;
+    acousticGuidesVisible_ = visible;
+    update();
+}
+void MeshViewport::setInterfaceNormalsVisible(bool visible) {
+    if (interfaceNormalsVisible_ == visible)
+        return;
+    interfaceNormalsVisible_ = visible;
     update();
 }
 void MeshViewport::setInterfaceVisible(bool visible) {
@@ -607,6 +671,88 @@ void MeshViewport::uploadInterfaces() {
             }
         }
     }
+    interfaceVertexCount_ = static_cast<int>(vertices.size());
+    const auto add = [&](Vec3 p, std::array<float, 3> color) {
+        vertices.push_back({{float((p.x - center_.x) / extent_), float((p.y - center_.y) / extent_),
+                             float((p.z - center_.z) / extent_)},
+                            {0, 0, 1},
+                            {color[0], color[1], color[2]}});
+    };
+    const auto sum = [](Vec3 a, Vec3 b) { return Vec3{a.x + b.x, a.y + b.y, a.z + b.z}; };
+    const auto scale = [](Vec3 a, double k) { return Vec3{a.x * k, a.y * k, a.z * k}; };
+    const auto unit = [&](Vec3 a) {
+        const double length = std::sqrt(dot(a, a));
+        return length > 0 && std::isfinite(length) ? scale(a, 1 / length) : Vec3{};
+    };
+    const auto arrow = [&](Vec3 origin, Vec3 direction, double length, std::array<float, 3> color) {
+        const Vec3 n = unit(direction);
+        if (dot(n, n) == 0)
+            return;
+        const Vec3 side = unit(cross(n, std::abs(n.z) < .9 ? Vec3{0, 0, 1} : Vec3{0, 1, 0}));
+        const Vec3 tip = sum(origin, scale(n, length));
+        add(origin, color);
+        add(tip, color);
+        add(tip, color);
+        add(sum(sum(tip, scale(n, -length * .25)), scale(side, length * .12)), color);
+        add(tip, color);
+        add(sum(sum(tip, scale(n, -length * .25)), scale(side, -length * .12)), color);
+    };
+    if (interfaceMesh_) {
+        auto groups = interfaceGroups_;
+        if (groups.empty()) {
+            InterfaceOrientationLabels fallback;
+            fallback.triangleIndices.resize(interfaceMesh_->triangles.size());
+            std::iota(fallback.triangleIndices.begin(), fallback.triangleIndices.end(), 0);
+            groups.push_back(std::move(fallback));
+        }
+        for (const auto &group : groups) {
+            std::unordered_map<std::uint32_t, std::vector<std::size_t>> faces;
+            for (const auto index : group.triangleIndices)
+                faces[interfaceMesh_->triangles[index].faceId].push_back(index);
+            for (const auto &[face, indices] : faces) {
+                (void)face;
+                const std::size_t step = std::max<std::size_t>(1, (indices.size() + 15) / 16);
+                for (std::size_t i = 0; i < indices.size(); i += step) {
+                    const auto &t = interfaceMesh_->triangles[indices[i]];
+                    const auto a = interfaceMesh_->vertices[t.vertices[0]];
+                    const auto b = interfaceMesh_->vertices[t.vertices[1]];
+                    const auto c = interfaceMesh_->vertices[t.vertices[2]];
+                    const Vec3 center = scale(sum(sum(a, b), c), 1. / 3);
+                    const Vec3 n = unit(cross(subtract(b, a), subtract(c, a)));
+                    arrow(center, n, extent_ * .10, {0.f, .55f, .7f});
+                    arrow(center, scale(n, -1), extent_ * .10, {.88f, .39f, .08f});
+                }
+            }
+        }
+    }
+    normalVertexCount_ = static_cast<int>(vertices.size()) - interfaceVertexCount_;
+    const auto plane = [&](Vec3 origin, Vec3 normal, std::array<float, 3> color) {
+        const Vec3 n = unit(normal);
+        if (dot(n, n) == 0)
+            return;
+        const Vec3 u = unit(cross(n, std::abs(n.z) < .9 ? Vec3{0, 0, 1} : Vec3{0, 1, 0}));
+        const Vec3 v = unit(cross(n, u));
+        // A finite view patch represents the plane at its actual world position.
+        const Vec3 base = subtract(center_, scale(n, dot(subtract(center_, origin), n)));
+        const double radius = extent_ * .8;
+        for (int i = -2; i <= 2; ++i) {
+            const double offset = radius * i / 2.;
+            const Vec3 a = sum(base, scale(u, offset)), b = sum(base, scale(v, offset));
+            add(sum(a, scale(v, -radius)), color);
+            add(sum(a, scale(v, radius)), color);
+            add(sum(b, scale(u, -radius)), color);
+            add(sum(b, scale(u, radius)), color);
+        }
+        arrow(base, n, extent_ * .22, color);
+    };
+    if (symmetryPlanes_) {
+        plane(symmetryPlanes_->origin, symmetryPlanes_->firstNormal, {.42f, .34f, .74f});
+        plane(symmetryPlanes_->origin, symmetryPlanes_->secondNormal, {.32f, .58f, .30f});
+    }
+    if (exteriorBaffle_)
+        plane(exteriorBaffle_->origin, exteriorBaffle_->normal, {.75f, .36f, .13f});
+    guideVertexCount_ =
+        static_cast<int>(vertices.size()) - interfaceVertexCount_ - normalVertexCount_;
     interfaceVao_.bind();
     interfaceBuffer_.bind();
     interfaceBuffer_.setUsagePattern(QOpenGLBuffer::StaticDraw);
@@ -614,7 +760,6 @@ void MeshViewport::uploadInterfaces() {
                               static_cast<int>(vertices.size() * sizeof(RenderVertex)));
     interfaceVao_.release();
     interfaceBuffer_.release();
-    interfaceVertexCount_ = static_cast<int>(vertices.size());
     interfaceUploadPending_ = false;
 }
 
@@ -711,13 +856,20 @@ void MeshViewport::paintGL() {
         }
         vao_.release();
     }
-    if (interfaceVisible_ && interfaceVertexCount_ > 0) {
+    if ((interfaceVisible_ && (interfaceVertexCount_ > 0 || normalVertexCount_ > 0)) ||
+        (acousticGuidesVisible_ && guideVertexCount_ > 0)) {
         program_->setUniformValue("wirePass", 0);
         program_->setUniformValue("orientationPass", 0);
         program_->setUniformValue("unlit", 1);
         glDepthMask(GL_FALSE);
         interfaceVao_.bind();
-        glDrawArrays(GL_LINES, 0, interfaceVertexCount_);
+        if (interfaceVisible_) {
+            glDrawArrays(GL_LINES, 0, interfaceVertexCount_);
+            if (interfaceNormalsVisible_)
+                glDrawArrays(GL_LINES, interfaceVertexCount_, normalVertexCount_);
+        }
+        if (acousticGuidesVisible_)
+            glDrawArrays(GL_LINES, interfaceVertexCount_ + normalVertexCount_, guideVertexCount_);
         interfaceVao_.release();
         glDepthMask(GL_TRUE);
     }
@@ -784,10 +936,45 @@ void MeshViewport::paintOverlay() {
         const auto textSize = painter.fontMetrics().size(Qt::TextSingleLine, label_);
         occupied.emplace_back(12, 8, std::max(0, std::min(width() - 24, textSize.width())), 23);
     }
+    QStringList guideLines;
+    if (acousticGuidesVisible_ && symmetryPlanes_) {
+        const auto planeLabel = [&](Vec3 n) {
+            if (std::abs(n.x) > .999 && std::abs(symmetryPlanes_->origin.x) < 1e-12)
+                return n.x > 0 ? tr("x=0, x≥0") : tr("x=0, x≤0");
+            if (std::abs(n.y) > .999 && std::abs(symmetryPlanes_->origin.y) < 1e-12)
+                return n.y > 0 ? tr("y=0, y≥0") : tr("y=0, y≤0");
+            return tr("beliebige Ebene");
+        };
+        guideLines << tr("Symmetrie violett: %1 / grün: %2; Pfeile zum Halbraum")
+                          .arg(planeLabel(symmetryPlanes_->firstNormal),
+                               planeLabel(symmetryPlanes_->secondNormal));
+    }
+    if (acousticGuidesVisible_ && exteriorBaffle_)
+        guideLines << tr("Schallwand orange (unendlich, symbolisch): Pfeil zum Außenraum");
+    if (interfaceVisible_ && interfaceNormalsVisible_)
+        for (const auto &group : interfaceGroups_)
+            guideLines << tr("%1: cyan +n → %2 / orange −n → %3")
+                              .arg(group.name, group.firstDomain, group.secondDomain);
+    if (interfaceVisible_ && interfaceNormalsVisible_ && interfaceMesh_ &&
+        !interfaceMesh_->triangles.empty() && interfaceGroups_.empty())
+        guideLines << tr("Interface: cyan +n / orange −n");
     const auto gizmo = overlay::gizmo(size(), painter.fontMetrics(), fieldVisible_ && bool(field_),
                                       !label_.isEmpty());
     if (gizmo)
         occupied.push_back(gizmo->reserved);
+    int guideY = height() - 8 - int(guideLines.size()) * painter.fontMetrics().height();
+    const int guideLeft = gizmo ? int(gizmo->reserved.right()) + 4 : 8;
+    for (const auto &line : guideLines) {
+        const QRectF lineRect(guideLeft, guideY, std::max(0, width() - guideLeft - 8),
+                              painter.fontMetrics().height());
+        painter.fillRect(lineRect, QColor(248, 250, 251, 220));
+        painter.setPen(QColor(55, 61, 66));
+        painter.drawText(
+            lineRect, Qt::AlignLeft | Qt::AlignVCenter,
+            painter.fontMetrics().elidedText(line, Qt::ElideRight, int(lineRect.width())));
+        occupied.push_back(lineRect);
+        guideY += painter.fontMetrics().height();
+    }
     if (fieldVisible_ && field_) {
         const auto limits = pressureFieldRange(fieldAppearance_);
         const auto unit = fieldAppearance_.quantity == 0   ? tr("dB SPL · 3 dB")

@@ -41,6 +41,9 @@ if(BUILD_TESTING)
   add_test(NAME interface_render COMMAND render_benchmark --interface-only)
   set_tests_properties(interface_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
     ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
+  add_test(NAME acoustic_guides_render COMMAND render_benchmark --acoustic-guides-only)
+  set_tests_properties(acoustic_guides_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
+    ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
   add_test(NAME orientation_render COMMAND render_benchmark --frames 2)
   set_tests_properties(orientation_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
     ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")

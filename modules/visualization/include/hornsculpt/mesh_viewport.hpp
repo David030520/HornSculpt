@@ -9,9 +9,11 @@
 #include <cstddef>
 #include <functional>
 #include <hornsculpt/acoustic_frame.hpp>
+#include <hornsculpt/exterior_baffle.hpp>
 #include <hornsculpt/face_color.hpp>
 #include <hornsculpt/mesh.hpp>
 #include <hornsculpt/pressure_field_plane.hpp>
+#include <hornsculpt/symmetry_planes.hpp>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -39,13 +41,41 @@ enum class MeshColorMode {
     faceColors
 };
 
+struct InterfaceOrientationLabels {
+    std::vector<std::size_t> triangleIndices;
+    QString name;
+    QString firstDomain;
+    QString secondDomain;
+    bool operator==(const InterfaceOrientationLabels &) const = default;
+};
+
 class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core {
   public:
     explicit MeshViewport(QWidget *parent = nullptr);
     ~MeshViewport() override;
     void setMesh(std::shared_ptr<const SurfaceMesh> mesh);
     // Presentation-only interface edges; face picking continues to use setMesh.
-    void setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh);
+    void setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh,
+                          std::vector<InterfaceOrientationLabels> groups = {});
+    void setSymmetryPlanes(std::optional<OrthogonalSymmetryPlanes> planes);
+    void setExteriorBaffle(std::optional<ExteriorBaffle> baffle);
+    void setAcousticGuidesVisible(bool visible);
+    void setInterfaceNormalsVisible(bool visible);
+    std::optional<OrthogonalSymmetryPlanes> symmetryPlanes() const noexcept {
+        return symmetryPlanes_;
+    }
+    std::optional<ExteriorBaffle> exteriorBaffle() const noexcept {
+        return exteriorBaffle_;
+    }
+    bool acousticGuidesVisible() const noexcept {
+        return acousticGuidesVisible_;
+    }
+    bool interfaceNormalsVisible() const noexcept {
+        return interfaceNormalsVisible_;
+    }
+    const std::vector<InterfaceOrientationLabels> &interfaceOrientationLabels() const noexcept {
+        return interfaceGroups_;
+    }
     void setInterfaceVisible(bool visible);
     void setWireframe(bool enabled);
     void setBackgroundGrid(bool enabled);
@@ -106,6 +136,13 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     QOpenGLVertexArrayObject interfaceVao_;
     QOpenGLBuffer interfaceBuffer_{QOpenGLBuffer::VertexBuffer};
     int interfaceVertexCount_{};
+    int normalVertexCount_{};
+    int guideVertexCount_{};
+    std::vector<InterfaceOrientationLabels> interfaceGroups_;
+    std::optional<OrthogonalSymmetryPlanes> symmetryPlanes_;
+    std::optional<ExteriorBaffle> exteriorBaffle_;
+    bool acousticGuidesVisible_{true};
+    bool interfaceNormalsVisible_{true};
     bool interfaceVisible_{true};
     bool interfaceUploadPending_{};
     std::optional<AcousticFrame> observationFrame_;

@@ -203,6 +203,7 @@ class MainWindow final : public QMainWindow {
     QTreeWidgetItem *facesItem_{};
     QTreeWidgetItem *projectItem_{};
     QTreeWidgetItem *domainsItem_{};
+    QTreeWidgetItem *symmetryItem_{};
     std::shared_ptr<const SurfaceMesh> interfaceOverlaySource_;
     std::shared_ptr<const SurfaceMesh> interfaceOverlay_;
     std::set<std::uint32_t> interfaceOverlayFaceIds_;

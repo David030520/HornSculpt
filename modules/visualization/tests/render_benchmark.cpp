@@ -295,6 +295,108 @@ void checkInterfaceOverlay(hornsculpt::MeshViewport &viewport, const QString &sc
     viewport.setInterfaceMesh({});
     viewport.setInterfaceVisible(true);
 }
+// Compare rendered contributions rather than a particular driver-dependent blend color.
+std::size_t changedPixels(const QImage &a, const QImage &b) {
+    if (a.size() != b.size())
+        throw std::runtime_error("Framebuffergröße änderte sich während des Tests.");
+    std::size_t changed = 0;
+    for (int y = 0; y < a.height(); ++y)
+        for (int x = 0; x < a.width(); ++x) {
+            const auto left = a.pixelColor(x, y), right = b.pixelColor(x, y);
+            if (std::max({std::abs(left.red() - right.red()),
+                          std::abs(left.green() - right.green()),
+                          std::abs(left.blue() - right.blue())}) > 8)
+                ++changed;
+        }
+    return changed;
+}
+void checkAcousticGuides(hornsculpt::MeshViewport &viewport, const QString &screenshot) {
+    using namespace hornsculpt;
+    auto source = box({2, 2, 2});
+    const auto original = *source;
+    viewport.setMesh(source);
+    viewport.setHiddenFaces({});
+    viewport.setSelectedFaces({});
+    viewport.setWireframe(false);
+    viewport.setColorMode(MeshColorMode::boundary);
+    viewport.viewFront({1, 1, 2});
+    viewport.fitView();
+    const QPointF center(viewport.width() * .5, viewport.height() * .5);
+    const auto picked = viewport.pickFace(center);
+    if (!picked)
+        throw std::runtime_error("Hilfsebenen-Test: Modell nicht auswählbar.");
+    const auto image = [&] {
+        viewport.repaint();
+        return viewport.grabFramebuffer();
+    };
+    const auto baseline = image();
+    const OrthogonalSymmetryPlanes planes{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, 1e-6};
+    const ExteriorBaffle baffle{{0, 0, 0}, {0, 0, 1}, 1e-6};
+    viewport.setExteriorBaffle(baffle);
+    const auto baffleImage = image();
+    if (changedPixels(baseline, baffleImage) < 100)
+        throw std::runtime_error("Schallwandebene fehlt im OpenGL-Bild.");
+    viewport.setExteriorBaffle({});
+    viewport.setSymmetryPlanes(planes);
+    const auto symmetryImage = image();
+    if (changedPixels(baseline, symmetryImage) < 100)
+        throw std::runtime_error("Symmetrieebenen fehlen im OpenGL-Bild.");
+    // Moving one plane while keeping the other fixed must affect the projection.
+    auto moved = planes;
+    moved.secondNormal = {0, 0, 1};
+    viewport.setSymmetryPlanes(moved);
+    if (changedPixels(symmetryImage, image()) < 100)
+        throw std::runtime_error("Die zweite Symmetrieebene ist nicht sichtbar.");
+    moved = planes;
+    moved.firstNormal = {0, 0, 1};
+    viewport.setSymmetryPlanes(moved);
+    if (changedPixels(symmetryImage, image()) < 100)
+        throw std::runtime_error("Die erste Symmetrieebene ist nicht sichtbar.");
+    viewport.setSymmetryPlanes(planes);
+    viewport.setExteriorBaffle(baffle);
+    const auto combined = image();
+    if (!screenshot.isEmpty() && !combined.save(screenshot))
+        throw std::runtime_error("Hilfsebenen-Screenshot konnte nicht gespeichert werden.");
+    viewport.setAcousticGuidesVisible(false);
+    if (changedPixels(baseline, image()) != 0)
+        throw std::runtime_error(
+            "Ausgeblendete Hilfsebenen bleiben sichtbar oder verändern die Kamera.");
+    viewport.setAcousticGuidesVisible(true);
+    viewport.setSymmetryPlanes({});
+    viewport.setExteriorBaffle({});
+    if (changedPixels(baseline, image()) != 0)
+        throw std::runtime_error("Gelöschte Hilfsebenen hinterlassen Bildartefakte.");
+
+    auto interfaceMesh = std::make_shared<SurfaceMesh>();
+    interfaceMesh->vertices = {{-.6, -.6, 1.01}, {.6, -.6, 1.01}, {0, .6, 1.01}};
+    interfaceMesh->triangles = {{{0, 1, 2}, 999, BoundaryCondition::wall}};
+    const auto interfaceOriginal = *interfaceMesh;
+    const std::vector<InterfaceOrientationLabels> labels{{{0}, "Interface", "Innen", "Außen"}};
+    viewport.setInterfaceMesh(interfaceMesh, labels);
+    viewport.setInterfaceVisible(true);
+    viewport.setInterfaceNormalsVisible(false);
+    const auto withoutNormals = image();
+    viewport.setInterfaceNormalsVisible(true);
+    const auto forward = image();
+    if (changedPixels(withoutNormals, forward) < 5)
+        throw std::runtime_error("Interface-Normale und Gebietsbezeichnungen fehlen.");
+    auto reversed = std::make_shared<SurfaceMesh>(*interfaceMesh);
+    std::swap(reversed->triangles[0].vertices[1], reversed->triangles[0].vertices[2]);
+    viewport.setInterfaceMesh(reversed, labels);
+    const auto backward = image();
+    if (changedPixels(forward, backward) < 5)
+        throw std::runtime_error("Interface-Normale folgt nicht der Dreiecksorientierung.");
+    viewport.setInterfaceNormalsVisible(false);
+    if (changedPixels(withoutNormals, image()) != 0)
+        throw std::runtime_error("Ausgeblendete Interface-Normalen hinterlassen Artefakte.");
+    viewport.setInterfaceMesh({});
+    viewport.setInterfaceNormalsVisible(true);
+    if (changedPixels(baseline, image()) != 0 || viewport.pickFace(center) != picked)
+        throw std::runtime_error(
+            "Gelöschtes Interface verändert Kamera, Bild oder Flächenauswahl.");
+    if (*source != original || *interfaceMesh != interfaceOriginal)
+        throw std::runtime_error("Akustische Hilfen verändern die Quellgeometrie.");
+}
 void checkPressureField(hornsculpt::MeshViewport &viewport) {
     using namespace hornsculpt;
     auto mesh = std::make_shared<SurfaceMesh>();
@@ -372,8 +474,9 @@ void checkPressureField(hornsculpt::MeshViewport &viewport) {
         throw std::runtime_error("Der gültige Nullpegel erhält nicht die minimale Skalenfarbe.");
     for (const double rotation : {0., 180.}) {
         viewport.setPressureField(zero, {2, 40, 94, rotation});
-        if (colorDistance(pixel(), QColor(Qt::white)) > 3)
-            throw std::runtime_error("Der gültige Null-Realteil wird nicht weiß dargestellt.");
+        if (colorDistance(pixel(), pressureFieldColor(0, {2, 40, 94, rotation})) > 3)
+            throw std::runtime_error(
+                "Der gültige Null-Realteil erhält nicht die korrekte Skalenfarbe.");
     }
     viewport.setPressureField(front, {2, 40, 94, 0});
     const auto positive = pixel();
@@ -405,6 +508,8 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QCommandLineParser parser;
     parser.addHelpOption();
+    parser.addOption(
+        {"acoustic-guides-only", "Nur akustische Hilfselemente mit kleinem Modell prüfen."});
     parser.addOption({"interface-only", "Nur Interface-Overlay mit kleinem Modell prüfen."});
     parser.addOption({"output", "JSON-Ausgabe.", "path"});
     parser.addOption({"screenshot", "Viewport-Bild.", "path"});
@@ -414,7 +519,7 @@ int main(int argc, char **argv) {
     viewport.resize(1000, 700);
     viewport.setWindowTitle("HornSculpt · Renderbenchmark");
     std::optional<hornsculpt::DraftGeometry> geometry;
-    if (parser.isSet("interface-only"))
+    if (parser.isSet("interface-only") || parser.isSet("acoustic-guides-only"))
         viewport.setMesh(box({2, 2, 2}));
     else {
         geometry.emplace();
@@ -423,6 +528,22 @@ int main(int argc, char **argv) {
     viewport.show();
     QTimer::singleShot(500, &viewport, [&] {
         try {
+            if (parser.isSet("acoustic-guides-only")) {
+                checkAcousticGuides(viewport, parser.value("screenshot"));
+                const QJsonObject report{{"acousticGuidesPassed", true},
+                                         {"sourceTriangles", 12},
+                                         {"interfaceTriangles", 1}};
+                const auto bytes = QJsonDocument(report).toJson(QJsonDocument::Indented);
+                if (!parser.value("output").isEmpty()) {
+                    QFile file(parser.value("output"));
+                    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size())
+                        throw std::runtime_error(
+                            "Hilfsebenen-Testbericht konnte nicht gespeichert werden.");
+                }
+                std::fwrite(bytes.constData(), 1, static_cast<std::size_t>(bytes.size()), stdout);
+                app.exit(0);
+                return;
+            }
             if (parser.isSet("interface-only")) {
                 checkInterfaceOverlay(viewport, parser.value("screenshot"));
                 {
