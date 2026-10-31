@@ -192,6 +192,7 @@ class MainWindow final : public QMainWindow {
     QCheckBox *sectionMesh_{};
     QCheckBox *showAperture_{};
     QCheckBox *showInterfaces_{};
+    QCheckBox *showFullSymmetry_{};
     QComboBox *representation_{};
     QComboBox *meshColor_{};
     QComboBox *sourceMode_{};

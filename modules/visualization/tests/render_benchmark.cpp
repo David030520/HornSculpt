@@ -397,6 +397,129 @@ void checkAcousticGuides(hornsculpt::MeshViewport &viewport, const QString &scre
     if (*source != original || *interfaceMesh != interfaceOriginal)
         throw std::runtime_error("Akustische Hilfen verändern die Quellgeometrie.");
 }
+void checkFullSymmetry(hornsculpt::MeshViewport &viewport, const QString &screenshot) {
+    using namespace hornsculpt;
+    auto mesh = std::make_shared<SurfaceMesh>();
+    // The reflection planes intersect at (2, -3); both faces are asymmetric and
+    // have opposite winding, making odd-reflection front-facing errors observable.
+    mesh->vertices = {{2.2, -3.2, 0}, {3.4, -3.2, 0}, {3.4, -4.4, 0}, {2.2, -4.4, 0}};
+    mesh->triangles = {{{0, 2, 1}, 11, BoundaryCondition::wall},
+                       {{0, 2, 3}, 12, BoundaryCondition::wall}};
+    const auto original = *mesh;
+    viewport.setMesh(mesh);
+    viewport.setBackgroundGrid(false);
+    viewport.setAcousticGuidesVisible(false);
+    viewport.setWireframe(false);
+    viewport.setColorMode(MeshColorMode::orientation);
+    viewport.setSymmetryPlanes(OrthogonalSymmetryPlanes{{2, -3, 0}, {1, 0, 0}, {0, 1, 0}, 1e-6});
+    if (viewport.fullSymmetryVisible())
+        throw std::runtime_error("Gesamtansicht ist unerwartet standardmäßig aktiviert.");
+    viewport.setFullSymmetryVisible(true);
+    viewport.viewFront({0, 0, 1});
+    viewport.fitView();
+    viewport.repaint();
+    if (!viewport.fullSymmetryVisible())
+        throw std::runtime_error("Gesamtansicht lässt sich nicht aktivieren.");
+
+    const auto frame = viewport.grabFramebuffer();
+    if (!screenshot.isEmpty() && !frame.save(screenshot))
+        throw std::runtime_error("Symmetrie-Screenshot konnte nicht gespeichert werden.");
+    struct Hit {
+        QPoint point;
+        std::uint32_t face;
+    };
+    std::vector<Hit> hits;
+    QRect bounds;
+    for (int y = 12; y < viewport.height() - 12; y += 24)
+        for (int x = 12; x < viewport.width() - 12; x += 24)
+            if (const auto face = viewport.pickFace(QPointF(x, y)); face) {
+                hits.push_back({{x, y}, *face});
+                bounds |= QRect(x, y, 1, 1);
+            }
+    if (hits.empty())
+        throw std::runtime_error("Gesamtansicht enthält keine auswählbare Geometrie.");
+    std::array<std::array<int, 2>, 4> counts{};
+    const auto pixel = [&](const QImage &image, QPoint p) {
+        return image.pixelColor(static_cast<int>(p.x() * viewport.devicePixelRatioF()),
+                                static_cast<int>(p.y() * viewport.devicePixelRatioF()));
+    };
+    for (const auto &hit : hits) {
+        if (hit.face != 11 && hit.face != 12)
+            throw std::runtime_error("Spiegelinstanz liefert eine fremde Flächen-ID.");
+        const int quadrant = (hit.point.x() > bounds.center().x() ? 1 : 0) +
+                             (hit.point.y() > bounds.center().y() ? 2 : 0);
+        ++counts[quadrant][hit.face == 11 ? 0 : 1];
+        const auto c = pixel(frame, hit.point);
+        if ((hit.face == 11 && c.green() < c.red() * 1.5) ||
+            (hit.face == 12 && c.red() < c.green() * 1.5))
+            throw std::runtime_error("Orientierungsfarbe einer Spiegelinstanz ist falsch.");
+    }
+    for (const auto &quadrant : counts)
+        if (quadrant[0] < 5 || quadrant[1] < 5)
+            throw std::runtime_error("Flächen oder Picking fehlen in einem Symmetriequadranten.");
+    viewport.setSelectedFaces({11});
+    viewport.repaint();
+    const auto selected = viewport.grabFramebuffer();
+    std::array<int, 4> highlights{};
+    for (const auto &hit : hits)
+        if (hit.face == 11 && pixel(frame, hit.point) != pixel(selected, hit.point))
+            ++highlights[(hit.point.x() > bounds.center().x() ? 1 : 0) +
+                         (hit.point.y() > bounds.center().y() ? 2 : 0)];
+    for (const auto count : highlights)
+        if (count < 5)
+            throw std::runtime_error("Flächenauswahl hebt nicht alle Spiegelinstanzen hervor.");
+    viewport.setSelectedFaces({});
+    auto interfaceMesh = std::make_shared<SurfaceMesh>();
+    interfaceMesh->vertices = {{2.4, -3.4, .1}, {3.2, -3.4, .3}, {2.4, -4.2, .1}};
+    interfaceMesh->triangles = {{{0, 1, 2}, 99, BoundaryCondition::wall}};
+    const auto interfaceOriginal = *interfaceMesh;
+    viewport.setInterfaceMesh(interfaceMesh, {{{0}, "Interface", "Innen", "Außen"}});
+    viewport.setInterfaceVisible(true);
+    viewport.setInterfaceNormalsVisible(false);
+    viewport.repaint();
+    const auto withoutNormals = viewport.grabFramebuffer();
+    viewport.setInterfaceNormalsVisible(true);
+    viewport.repaint();
+    const auto withNormals = viewport.grabFramebuffer();
+    std::array<int, 4> normalPixels{};
+    const auto scale = viewport.devicePixelRatioF();
+    const int left = static_cast<int>(bounds.left() * scale);
+    const int right = std::min(withNormals.width(), static_cast<int>((bounds.right() + 1) * scale));
+    const int top = static_cast<int>(bounds.top() * scale);
+    const int bottom =
+        std::min(withNormals.height(), static_cast<int>((bounds.bottom() + 1) * scale));
+    const int middleX = static_cast<int>(bounds.center().x() * scale);
+    const int middleY = static_cast<int>(bounds.center().y() * scale);
+    for (int y = top; y < bottom; ++y)
+        for (int x = left; x < right; ++x) {
+            const auto a = withoutNormals.pixelColor(x, y);
+            const auto b = withNormals.pixelColor(x, y);
+            if (std::max({std::abs(a.red() - b.red()), std::abs(a.green() - b.green()),
+                          std::abs(a.blue() - b.blue())}) > 8)
+                ++normalPixels[(x > middleX ? 1 : 0) + (y > middleY ? 2 : 0)];
+        }
+    for (const auto count : normalPixels)
+        if (count < 5)
+            throw std::runtime_error("Interface-Normalen fehlen in einem Symmetriequadranten.");
+    viewport.setInterfaceMesh({});
+    viewport.setHiddenFaces({11});
+    viewport.repaint();
+    for (const auto &hit : hits)
+        if (hit.face == 11 && viewport.pickFace(hit.point) == 11)
+            throw std::runtime_error(
+                "Verborgene Fläche bleibt in einer Spiegelinstanz auswählbar.");
+    viewport.setHiddenFaces({});
+    viewport.setFullSymmetryVisible(false);
+    viewport.repaint();
+    const auto single = viewport.grabFramebuffer();
+    viewport.setFullSymmetryVisible(true);
+    viewport.setSymmetryPlanes({});
+    viewport.repaint();
+    if (changedPixels(single, viewport.grabFramebuffer()) != 0)
+        throw std::runtime_error("Gelöschte Symmetrieebenen hinterlassen Spiegelinstanzen.");
+    if (*mesh != original || *interfaceMesh != interfaceOriginal)
+        throw std::runtime_error("Gesamtansicht verändert das physische Quellnetz.");
+}
 void checkPressureField(hornsculpt::MeshViewport &viewport) {
     using namespace hornsculpt;
     auto mesh = std::make_shared<SurfaceMesh>();
@@ -511,6 +634,7 @@ int main(int argc, char **argv) {
     parser.addOption(
         {"acoustic-guides-only", "Nur akustische Hilfselemente mit kleinem Modell prüfen."});
     parser.addOption({"interface-only", "Nur Interface-Overlay mit kleinem Modell prüfen."});
+    parser.addOption({"full-symmetry-only", "Nur Gesamtansicht mit kleinem Modell prüfen."});
     parser.addOption({"output", "JSON-Ausgabe.", "path"});
     parser.addOption({"screenshot", "Viewport-Bild.", "path"});
     parser.addOption({"frames", "Gemessene Frames nach 30 Aufwärmframes.", "count", "240"});
@@ -519,7 +643,8 @@ int main(int argc, char **argv) {
     viewport.resize(1000, 700);
     viewport.setWindowTitle("HornSculpt · Renderbenchmark");
     std::optional<hornsculpt::DraftGeometry> geometry;
-    if (parser.isSet("interface-only") || parser.isSet("acoustic-guides-only"))
+    if (parser.isSet("interface-only") || parser.isSet("acoustic-guides-only") ||
+        parser.isSet("full-symmetry-only"))
         viewport.setMesh(box({2, 2, 2}));
     else {
         geometry.emplace();
@@ -528,6 +653,21 @@ int main(int argc, char **argv) {
     viewport.show();
     QTimer::singleShot(500, &viewport, [&] {
         try {
+            if (parser.isSet("full-symmetry-only")) {
+                checkFullSymmetry(viewport, parser.value("screenshot"));
+                const auto bytes =
+                    QJsonDocument(QJsonObject{{"fullSymmetryPassed", true}, {"sourceTriangles", 2}})
+                        .toJson(QJsonDocument::Indented);
+                if (!parser.value("output").isEmpty()) {
+                    QFile file(parser.value("output"));
+                    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size())
+                        throw std::runtime_error(
+                            "Symmetrie-Testbericht konnte nicht gespeichert werden.");
+                }
+                std::fwrite(bytes.constData(), 1, static_cast<std::size_t>(bytes.size()), stdout);
+                app.exit(0);
+                return;
+            }
             if (parser.isSet("acoustic-guides-only")) {
                 checkAcousticGuides(viewport, parser.value("screenshot"));
                 const QJsonObject report{{"acousticGuidesPassed", true},

@@ -73,6 +73,16 @@ werden bereits aus der aktuellen Modellkonfiguration angezeigt, ohne einen
 Solve zu starten. Das Ein-/Ausblenden verändert weder Netz und Kamera noch
 Revision oder Ergebnisgültigkeit.
 
+**Ganzes Modell** spiegelt das Viertelmodell an beiden Symmetrieebenen und
+zeigt das vollständige Horn. Bei aktiver XY-Symmetrie ist diese Ansicht
+standardmäßig eingeschaltet; zum ursprünglichen Viertelnetz den Haken
+entfernen. **Einpassen** passt die Kamera an die jeweils sichtbare Ausdehnung
+an. Interfaces, Normalen, Farben und Flächenauswahl erscheinen auch in den
+Spiegelbildern. Eine dort gewählte Fläche bleibt dieselbe Ursprungsfläche.
+Die Symmetrieansicht erweitert weder das gespeicherte Netz noch den
+Solverauftrag. Berechnete Schallfeldebenen bleiben an ihren tatsächlichen
+Weltpositionen und werden nicht als unbelegte Feldwerte gespiegelt.
+
 Abbrechen übernimmt keine Eingaben. Vorhandene IDs bleiben beim Bearbeiten
 erhalten. Numerisch gleiche Face-IDs eines anderen CAD-Dokuments sind
 keine Identität: Nach einem unklaren Flächenwechsel bleibt die Zuordnung

@@ -42,6 +42,9 @@ if(BUILD_TESTING)
   set_tests_properties(interface_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
     ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
   add_test(NAME acoustic_guides_render COMMAND render_benchmark --acoustic-guides-only)
+  add_test(NAME full_symmetry_render COMMAND render_benchmark --full-symmetry-only)
+  set_tests_properties(full_symmetry_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
+    ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
   set_tests_properties(acoustic_guides_render PROPERTIES LABELS "desktop;opengl" TIMEOUT 60
     ENVIRONMENT "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
   add_test(NAME orientation_render COMMAND render_benchmark --frames 2)

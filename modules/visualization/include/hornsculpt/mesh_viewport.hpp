@@ -58,6 +58,10 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     void setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh,
                           std::vector<InterfaceOrientationLabels> groups = {});
     void setSymmetryPlanes(std::optional<OrthogonalSymmetryPlanes> planes);
+    void setFullSymmetryVisible(bool visible);
+    bool fullSymmetryVisible() const noexcept {
+        return fullSymmetryVisible_;
+    }
     void setExteriorBaffle(std::optional<ExteriorBaffle> baffle);
     void setAcousticGuidesVisible(bool visible);
     void setInterfaceNormalsVisible(bool visible);
@@ -128,6 +132,7 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     void updateFit();
     void updateSceneBounds();
     void uploadField();
+    std::vector<QMatrix4x4> symmetryTransforms() const;
     QMatrix4x4 viewMatrix() const;
     QMatrix4x4 projectionMatrix() const;
     void paintOverlay();
@@ -141,6 +146,7 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     std::vector<InterfaceOrientationLabels> interfaceGroups_;
     std::optional<OrthogonalSymmetryPlanes> symmetryPlanes_;
     std::optional<ExteriorBaffle> exteriorBaffle_;
+    bool fullSymmetryVisible_{};
     bool acousticGuidesVisible_{true};
     bool interfaceNormalsVisible_{true};
     bool interfaceVisible_{true};

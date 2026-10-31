@@ -510,6 +510,15 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
                                         "Die Pfeile ändern weder Netz noch Rechnung."));
     showInterfaceNormals->setWhatsThis(showInterfaceNormals->toolTip());
     viewLayout->addWidget(showInterfaceNormals, 2, 2, 1, 2);
+    showFullSymmetry_ = new QCheckBox(tr("Ganzes Modell"));
+    showFullSymmetry_->setObjectName("showFullSymmetry");
+    showFullSymmetry_->setChecked(QSettings().value("view/fullSymmetry", true).toBool());
+    showFullSymmetry_->setEnabled(false);
+    showFullSymmetry_->setToolTip(tr("Das Viertelmodell an beiden Symmetrieebenen vollständig "
+                                     "spiegeln. Auswahl und Flächenfarben gelten auch für die "
+                                     "Spiegelbilder; das Rechennetz bleibt unverändert."));
+    showFullSymmetry_->setWhatsThis(showFullSymmetry_->toolTip());
+    viewLayout->addWidget(showFullSymmetry_, 3, 0, 1, 2);
     // Keep the native controls reachable on narrow displays without forcing
     // the entire center column to their combined minimum width.
     auto *viewScroll = new QScrollArea;
@@ -564,6 +573,11 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     connect(showGuides, &QCheckBox::toggled, viewport_, &MeshViewport::setAcousticGuidesVisible);
     connect(showInterfaceNormals, &QCheckBox::toggled, viewport_,
             &MeshViewport::setInterfaceNormalsVisible);
+    viewport_->setFullSymmetryVisible(showFullSymmetry_->isChecked());
+    connect(showFullSymmetry_, &QCheckBox::toggled, viewport_,
+            &MeshViewport::setFullSymmetryVisible);
+    connect(showFullSymmetry_, &QCheckBox::toggled, this,
+            [](bool enabled) { QSettings().setValue("view/fullSymmetry", enabled); });
     connect(wireframe, &QCheckBox::toggled, this,
             [](bool enabled) { QSettings().setValue("view/wireframe", enabled); });
     auto *backgroundGrid = view->addAction(tr("Hintergrundraster"));
@@ -3487,6 +3501,7 @@ void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
         }
     }
     viewport_->setSymmetryPlanes(planes);
+    showFullSymmetry_->setEnabled(planes.has_value());
     auto baffle = regions.exteriorBaffle;
     if (!baffle && archive.settings.infiniteBaffle) {
         const auto &b = *archive.settings.infiniteBaffle;

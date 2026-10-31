@@ -1941,13 +1941,17 @@ void checkAcousticGuideControls(MainWindow &main, const SimulationSettings &sett
     auto *guides = main.findChild<QCheckBox *>("showAcousticGuides");
     auto *normals = main.findChild<QCheckBox *>("showInterfaceNormals");
     auto *interfaces = main.findChild<QCheckBox *>("showBemLemInterfaces");
-    require(viewport && guides && normals && interfaces, "Acoustic display controls missing.");
+    auto *whole = main.findChild<QCheckBox *>("showFullSymmetry");
+    require(viewport && guides && normals && interfaces && whole,
+            "Acoustic display controls missing.");
     require(guides->isChecked() && normals->isChecked() && interfaces->isChecked() &&
                 viewport->acousticGuidesVisible() && viewport->interfaceNormalsVisible(),
             "Acoustic guides are hidden when an explicit interface project opens.");
     require(viewport->exteriorBaffle() == settings.acousticModel.exteriorBaffle &&
                 viewport->symmetryPlanes().has_value(),
             "Viewport does not show the configured acoustic planes.");
+    require(whole->isEnabled() && whole->isChecked() && viewport->fullSymmetryVisible(),
+            "Quarter project does not open with a full symmetry preview.");
     const auto &groups = viewport->interfaceOrientationLabels();
     require(groups.size() == 1 && !groups.front().triangleIndices.empty() &&
                 groups.front().name ==
@@ -1958,10 +1962,13 @@ void checkAcousticGuideControls(MainWindow &main, const SimulationSettings &sett
     const bool current = main.simulationReady();
     guides->setChecked(false);
     normals->setChecked(false);
+    whole->setChecked(false);
     require(!viewport->acousticGuidesVisible() && !viewport->interfaceNormalsVisible(),
             "Acoustic visibility controls do not reach the viewport.");
+    require(!viewport->fullSymmetryVisible(), "Quarter-view control does not reach the viewport.");
     guides->setChecked(true);
     normals->setChecked(true);
+    whole->setChecked(true);
     require(main.revision() == revision && main.simulationReady() == current &&
                 !main.simulationInProgress() && !main.meshInProgress(),
             "Acoustic visibility changes revisions or starts computation.");

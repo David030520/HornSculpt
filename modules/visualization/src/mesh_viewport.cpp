@@ -367,8 +367,19 @@ void MeshViewport::setSymmetryPlanes(std::optional<OrthogonalSymmetryPlanes> pla
          !std::isfinite(planes->planeDistanceTolerance)))
         throw std::invalid_argument("Viewer: ungültige Symmetrieebene.");
     symmetryPlanes_ = std::move(planes);
+    if (fullSymmetryVisible_) {
+        updateSceneBounds();
+        if (automaticFit_)
+            updateFit();
+    }
     interfaceUploadPending_ = true;
     update();
+}
+void MeshViewport::setFullSymmetryVisible(bool visible) {
+    if (fullSymmetryVisible_ == visible)
+        return;
+    fullSymmetryVisible_ = visible;
+    fitView();
 }
 void MeshViewport::setExteriorBaffle(std::optional<ExteriorBaffle> baffle) {
     if (exteriorBaffle_ == baffle)
@@ -418,8 +429,23 @@ void MeshViewport::updateSceneBounds() {
         high.z = std::max(high.z, p.z);
     };
     if (mesh_)
-        for (const auto p : mesh_->vertices)
+        for (const auto p : mesh_->vertices) {
             include(p);
+            if (fullSymmetryVisible_ && symmetryPlanes_) {
+                const auto reflect = [&](Vec3 point, Vec3 normal) {
+                    const double length = std::hypot(normal.x, normal.y, normal.z);
+                    normal = {normal.x / length, normal.y / length, normal.z / length};
+                    const double distance = dot(subtract(point, symmetryPlanes_->origin), normal);
+                    return Vec3{point.x - 2 * distance * normal.x,
+                                point.y - 2 * distance * normal.y,
+                                point.z - 2 * distance * normal.z};
+                };
+                const auto first = reflect(p, symmetryPlanes_->firstNormal);
+                include(first);
+                include(reflect(p, symmetryPlanes_->secondNormal));
+                include(reflect(first, symmetryPlanes_->secondNormal));
+            }
+        }
     if (field_)
         for (const auto p : field_->positions)
             include(p);
@@ -776,6 +802,32 @@ void MeshViewport::uploadSelection() {
     selectionUploadPending_ = false;
 }
 
+std::vector<QMatrix4x4> MeshViewport::symmetryTransforms() const {
+    std::vector<QMatrix4x4> transforms(1);
+    if (!fullSymmetryVisible_ || !symmetryPlanes_)
+        return transforms;
+    const auto reflection = [&](Vec3 normal) {
+        const double length = std::hypot(normal.x, normal.y, normal.z);
+        const double n[] = {normal.x / length, normal.y / length, normal.z / length};
+        const Vec3 origin = subtract(symmetryPlanes_->origin, center_);
+        const double distance = (origin.x * n[0] + origin.y * n[1] + origin.z * n[2]) / extent_;
+        QMatrix4x4 matrix;
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column)
+                matrix(row, column) =
+                    static_cast<float>((row == column ? 1.0 : 0.0) - 2 * n[row] * n[column]);
+            matrix(row, 3) = static_cast<float>(2 * distance * n[row]);
+        }
+        return matrix;
+    };
+    const auto first = reflection(symmetryPlanes_->firstNormal);
+    const auto second = reflection(symmetryPlanes_->secondNormal);
+    transforms.push_back(first);
+    transforms.push_back(second);
+    transforms.push_back(second * first);
+    return transforms;
+}
+
 QMatrix4x4 MeshViewport::viewMatrix() const {
     const double unitsPerPixel =
         2 * cameraDistance * std::tan(halfFieldOfView) / zoom_ / std::max(1, height());
@@ -841,7 +893,12 @@ void MeshViewport::paintGL() {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(1.f, 1.f);
         }
-        glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+        const auto transforms = symmetryTransforms();
+        for (std::size_t i = 0; i < transforms.size(); ++i) {
+            program_->setUniformValue("view", viewMatrix() * transforms[i]);
+            glFrontFace(i == 1 || i == 2 ? GL_CW : GL_CCW);
+            glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+        }
         glDisable(GL_POLYGON_OFFSET_FILL);
         if (wireframe_) {
             program_->setUniformValue("wirePass", 1);
@@ -849,12 +906,18 @@ void MeshViewport::paintGL() {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+            for (std::size_t i = 0; i < transforms.size(); ++i) {
+                program_->setUniformValue("view", viewMatrix() * transforms[i]);
+                glFrontFace(i == 1 || i == 2 ? GL_CW : GL_CCW);
+                glDrawElements(GL_TRIANGLES, indexCount_, GL_UNSIGNED_INT, nullptr);
+            }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
         }
         vao_.release();
+        glFrontFace(GL_CCW);
+        program_->setUniformValue("view", viewMatrix());
     }
     if ((interfaceVisible_ && (interfaceVertexCount_ > 0 || normalVertexCount_ > 0)) ||
         (acousticGuidesVisible_ && guideVertexCount_ > 0)) {
@@ -864,9 +927,13 @@ void MeshViewport::paintGL() {
         glDepthMask(GL_FALSE);
         interfaceVao_.bind();
         if (interfaceVisible_) {
-            glDrawArrays(GL_LINES, 0, interfaceVertexCount_);
-            if (interfaceNormalsVisible_)
-                glDrawArrays(GL_LINES, interfaceVertexCount_, normalVertexCount_);
+            for (const auto &transform : symmetryTransforms()) {
+                program_->setUniformValue("view", viewMatrix() * transform);
+                glDrawArrays(GL_LINES, 0, interfaceVertexCount_);
+                if (interfaceNormalsVisible_)
+                    glDrawArrays(GL_LINES, interfaceVertexCount_, normalVertexCount_);
+            }
+            program_->setUniformValue("view", viewMatrix());
         }
         if (acousticGuidesVisible_)
             glDrawArrays(GL_LINES, interfaceVertexCount_ + normalVertexCount_, guideVertexCount_);
@@ -1278,29 +1345,36 @@ std::optional<std::uint32_t> MeshViewport::pickFace(QPointF position) const {
     double nearest = std::numeric_limits<double>::infinity();
     std::optional<std::uint32_t> selected;
     // Double-sided Moller–Trumbore intersection, in the same normalized coordinates as the VBO.
-    for (const auto &triangle : mesh_->triangles) {
-        if (std::binary_search(hiddenFaces_.begin(), hiddenFaces_.end(), triangle.faceId))
-            continue;
-        const auto a = normalize(mesh_->vertices[triangle.vertices[0]]);
-        const auto e1 = subtract(normalize(mesh_->vertices[triangle.vertices[1]]), a);
-        const auto e2 = subtract(normalize(mesh_->vertices[triangle.vertices[2]]), a);
-        const auto p = cross(ray, e2);
-        const double determinant = dot(e1, p);
-        const double scale = std::sqrt(dot(e1, e1) * dot(e2, e2));
-        if (std::abs(determinant) <= scale * 1e-12)
-            continue;
-        const auto t = subtract(origin, a);
-        const double u = dot(t, p) / determinant;
-        if (u < 0 || u > 1)
-            continue;
-        const auto q = cross(t, e1);
-        const double v = dot(ray, q) / determinant;
-        if (v < 0 || u + v > 1)
-            continue;
-        const double distance = dot(e2, q) / determinant;
-        if (distance >= 0 && distance < nearest) {
-            nearest = distance;
-            selected = triangle.faceId;
+    for (const auto &transform : symmetryTransforms()) {
+        const auto instancePoint = [&](Vec3 point) {
+            const auto p = normalize(point);
+            const auto mapped = transform * QVector4D(float(p.x), float(p.y), float(p.z), 1);
+            return Vec3{mapped.x(), mapped.y(), mapped.z()};
+        };
+        for (const auto &triangle : mesh_->triangles) {
+            if (std::binary_search(hiddenFaces_.begin(), hiddenFaces_.end(), triangle.faceId))
+                continue;
+            const auto a = instancePoint(mesh_->vertices[triangle.vertices[0]]);
+            const auto e1 = subtract(instancePoint(mesh_->vertices[triangle.vertices[1]]), a);
+            const auto e2 = subtract(instancePoint(mesh_->vertices[triangle.vertices[2]]), a);
+            const auto p = cross(ray, e2);
+            const double determinant = dot(e1, p);
+            const double scale = std::sqrt(dot(e1, e1) * dot(e2, e2));
+            if (std::abs(determinant) <= scale * 1e-12)
+                continue;
+            const auto t = subtract(origin, a);
+            const double u = dot(t, p) / determinant;
+            if (u < 0 || u > 1)
+                continue;
+            const auto q = cross(t, e1);
+            const double v = dot(ray, q) / determinant;
+            if (v < 0 || u + v > 1)
+                continue;
+            const double distance = dot(e2, q) / determinant;
+            if (distance >= 0 && distance < nearest) {
+                nearest = distance;
+                selected = triangle.faceId;
+            }
         }
     }
     return selected;
@@ -1367,26 +1441,33 @@ std::optional<std::size_t> MeshViewport::pickFieldSample(QPointF position) const
         return Vec3{(p.x - center_.x) / extent_, (p.y - center_.y) / extent_,
                     (p.z - center_.z) / extent_};
     };
-    for (const auto &triangle : mesh_->triangles) {
-        if (std::binary_search(hiddenFaces_.begin(), hiddenFaces_.end(), triangle.faceId))
-            continue;
-        const auto a = normalize(mesh_->vertices[triangle.vertices[0]]);
-        const auto e1 = subtract(normalize(mesh_->vertices[triangle.vertices[1]]), a);
-        const auto e2 = subtract(normalize(mesh_->vertices[triangle.vertices[2]]), a);
-        const auto crossRay = cross(ray, e2);
-        const double determinant = dot(e1, crossRay);
-        const double scale = std::sqrt(dot(e1, e1) * dot(e2, e2));
-        if (std::abs(determinant) <= scale * 1e-12)
-            continue;
-        const auto t = subtract(origin, a);
-        const double u = dot(t, crossRay) / determinant;
-        if (u < 0 || u > 1)
-            continue;
-        const auto q = cross(t, e1);
-        const double v = dot(ray, q) / determinant;
-        const double distance = dot(e2, q) / determinant;
-        if (v >= 0 && u + v <= 1 && distance >= 0 && distance < targetDistance - 1e-6)
-            return {};
+    for (const auto &transform : symmetryTransforms()) {
+        const auto instancePoint = [&](Vec3 point) {
+            const auto p = normalize(point);
+            const auto mapped = transform * QVector4D(float(p.x), float(p.y), float(p.z), 1);
+            return Vec3{mapped.x(), mapped.y(), mapped.z()};
+        };
+        for (const auto &triangle : mesh_->triangles) {
+            if (std::binary_search(hiddenFaces_.begin(), hiddenFaces_.end(), triangle.faceId))
+                continue;
+            const auto a = instancePoint(mesh_->vertices[triangle.vertices[0]]);
+            const auto e1 = subtract(instancePoint(mesh_->vertices[triangle.vertices[1]]), a);
+            const auto e2 = subtract(instancePoint(mesh_->vertices[triangle.vertices[2]]), a);
+            const auto crossRay = cross(ray, e2);
+            const double determinant = dot(e1, crossRay);
+            const double scale = std::sqrt(dot(e1, e1) * dot(e2, e2));
+            if (std::abs(determinant) <= scale * 1e-12)
+                continue;
+            const auto t = subtract(origin, a);
+            const double u = dot(t, crossRay) / determinant;
+            if (u < 0 || u > 1)
+                continue;
+            const auto q = cross(t, e1);
+            const double v = dot(ray, q) / determinant;
+            const double distance = dot(e2, q) / determinant;
+            if (v >= 0 && u + v <= 1 && distance >= 0 && distance < targetDistance - 1e-6)
+                return {};
+        }
     }
     return selected;
 }
