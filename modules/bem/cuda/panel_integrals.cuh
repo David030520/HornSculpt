@@ -12,16 +12,6 @@ struct Panel {
     unsigned nodes[3];
     double area, edge;
 };
-struct RegularPanel {
-    float3 points[6];
-    Vec3 origin;
-    float3 normal, curls[3];
-    unsigned nodes[3];
-    float weights[6];
-};
-struct RegularQuadraturePoint {
-    float barycentric[3];
-};
 struct PairJob {
     unsigned test{}, trial{};
     galerkin::PairPermutation permutation;
@@ -92,26 +82,46 @@ template <class T> __device__ inline float floatDot(T a, T b) {
            static_cast<float>(a.y) * static_cast<float>(b.y) +
            static_cast<float>(a.z) * static_cast<float>(b.z);
 }
-template <class PanelType, class Basis, class Delta>
-__device__ inline void mixedSample(MixedMoments &result, Delta delta, const PanelType &test,
-                                   const PanelType &trial, const Basis *testBasis,
-                                   const Basis *trialBasis, float physicalWeight, float k,
-                                   float inverseK, bool coincident, int *error) {
-    // Keep subtraction in FP64 so a common large translation does not erase a gap.
+struct MixedKernelSample {
+    cuFloatComplex green{}, pressure{}, flux{};
+};
+
+// Evaluate scalar kernels before contracting bases. Dense assembly and the
+// tensor-contracted near path thereby share one distance and phase contract.
+template <class PanelType>
+__device__ inline MixedKernelSample
+mixedKernelSample(Vec3 delta, const PanelType &test, const PanelType &trial, float physicalWeight,
+                  double waveNumber, float inverseK, bool coincident, int *error) {
+    // Preserve the original FP64 displacement and wavenumber for the phase.
+    // Above the measured small-phase domain, rounding k or r to FP32 causes
+    // an O(epsilon_float*k*r) error that no quadrature refinement can remove.
+    const float k = static_cast<float>(waveNumber);
     const float dx = static_cast<float>(delta.x), dy = static_cast<float>(delta.y),
                 dz = static_cast<float>(delta.z), radiusSquared = dx * dx + dy * dy + dz * dz;
     if (!(radiusSquared > 0) || !isfinite(radiusSquared)) {
         atomicExch(error, 1);
-        return;
+        return {};
     }
     const float inverseRadius = rsqrtf(radiusSquared), radius = radiusSquared * inverseRadius,
-                inverseRadiusSquared = inverseRadius * inverseRadius, phase = k * radius;
-    float sine, cosine;
-    sincosf(phase, &sine, &cosine);
+                inverseRadiusSquared = inverseRadius * inverseRadius;
+    float phase = k * radius, sine, cosine;
+    if (phase <= 1.f) {
+        sincosf(phase, &sine, &cosine);
+    } else {
+        const double radius64 = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z),
+                     phase64 = waveNumber * radius64;
+        if (!(radius64 > 0) || !isfinite(phase64)) {
+            atomicExch(error, 1);
+            return {};
+        }
+        double sine64, cosine64;
+        sincos(phase64, &sine64, &cosine64);
+        sine = static_cast<float>(sine64);
+        cosine = static_cast<float>(cosine64);
+        phase = static_cast<float>(phase64);
+    }
     const float scale = physicalWeight * (0.07957747154594766788f * inverseRadius);
     const float gr = cosine * scale, gi = -sine * scale;
-    result.green.x += gr;
-    result.green.y += gi;
     const float radialReal = gr - gi * phase, radialImag = gi + gr * phase;
     const float sourceFactor = coincident ? 0.f
                                           : (dx * static_cast<float>(trial.normal.x) +
@@ -128,16 +138,28 @@ __device__ inline void mixedSample(MixedMoments &result, Delta delta, const Pane
                 ai = -radialImag * sourceFactor + k * normalProduct * gr,
                 br = -gr - radialImag * targetFactor * inverseK,
                 bi = -gi + radialReal * targetFactor * inverseK;
+    return {{gr, gi}, {ar, ai}, {br, bi}};
+}
+
+template <class PanelType, class Basis>
+__device__ inline void mixedSample(MixedMoments &result, Vec3 delta, const PanelType &test,
+                                   const PanelType &trial, const Basis *testBasis,
+                                   const Basis *trialBasis, float physicalWeight, double waveNumber,
+                                   float inverseK, bool coincident, int *error) {
+    const auto sample = mixedKernelSample(delta, test, trial, physicalWeight, waveNumber, inverseK,
+                                          coincident, error);
+    result.green.x += sample.green.x;
+    result.green.y += sample.green.y;
 #pragma unroll
     for (unsigned i = 0; i < 3; ++i) {
         const float basis = static_cast<float>(testBasis[i]);
-        result.rhs[i].x += br * basis;
-        result.rhs[i].y += bi * basis;
+        result.rhs[i].x += sample.flux.x * basis;
+        result.rhs[i].y += sample.flux.y * basis;
 #pragma unroll
         for (unsigned j = 0; j < 3; ++j) {
             const float product = basis * static_cast<float>(trialBasis[j]);
-            result.matrix[3 * i + j].x += ar * product;
-            result.matrix[3 * i + j].y += ai * product;
+            result.matrix[3 * i + j].x += sample.pressure.x * product;
+            result.matrix[3 * i + j].y += sample.pressure.y * product;
         }
     }
 }
@@ -342,44 +364,16 @@ __device__ inline FieldIntegral fieldPatch(Vec3 observer, const Panel &panel,
     }
     return result;
 }
-__device__ inline DoubleComplex regularField(Vec3 observer, const RegularPanel &panel,
-                                             const RegularQuadraturePoint *rule, unsigned count,
-                                             const cuDoubleComplex *pressure, cuFloatComplex flux,
-                                             double k, int *error) {
-    const auto originDelta = sub(observer, panel.origin);
-    DoubleComplex result{};
-    for (unsigned sample = 0; sample < count; ++sample) {
-        const auto offset = panel.points[sample];
-        const double dx = originDelta.x - offset.x, dy = originDelta.y - offset.y,
-                     dz = originDelta.z - offset.z, distanceSquared = dx * dx + dy * dy + dz * dz;
-        if (!(distanceSquared > 0) || !isfinite(distanceSquared)) {
-            atomicExch(error, 1);
-            return {};
-        }
-        const double distance = sqrt(distanceSquared), inverseDistance = 1.0 / distance,
-                     phase = k * distance;
-        double sine, cosine;
-        sincos(phase, &sine, &cosine);
-        const double scale = panel.weights[sample] * (0.07957747154594766788 * inverseDistance),
-                     normalFactor =
-                         (dx * panel.normal.x + dy * panel.normal.y + dz * panel.normal.z) *
-                         inverseDistance * inverseDistance,
-                     derivativeReal = (cosine + sine * phase) * scale * normalFactor,
-                     derivativeImag = (-sine + cosine * phase) * scale * normalFactor;
-        const float gr = static_cast<float>(cosine * scale), gi = static_cast<float>(-sine * scale),
-                    dr = static_cast<float>(derivativeReal),
-                    di = static_cast<float>(derivativeImag);
-        double pr = 0, pi = 0;
-#pragma unroll
-        for (unsigned i = 0; i < 3; ++i) {
-            const auto value = pressure[panel.nodes[i]];
-            pr += rule[sample].barycentric[i] * value.x;
-            pi += rule[sample].barycentric[i] * value.y;
-        }
-        result.real += (dr * pr - di * pi) - (gr * flux.x - gi * flux.y);
-        result.imag += (dr * pi + di * pr) - (gr * flux.y + gi * flux.x);
-    }
-    return result;
+__device__ inline DoubleComplex regularField(Vec3 observer, const Panel &panel,
+                                             const galerkin::TriangleQuadraturePoint *rule,
+                                             unsigned count, const cuDoubleComplex *pressure,
+                                             cuFloatComplex flux, double k, int *error) {
+    const FieldPatch whole{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, 1.0, 0};
+    // The same canonical FP64 geometry/integrand is used by both fixed-rule
+    // evaluation and adaptive refinement. No rounded point cache survives.
+    return fieldPatch(observer, panel, whole, rule, static_cast<int>(count), pressure, flux, k,
+                      error)
+        .value;
 }
 
 __device__ inline DoubleComplex asymptoticField(Vec3 direction, Vec3 observationOrigin,

@@ -44,8 +44,7 @@ class LemEditor;
 class MainWindow final : public QMainWindow {
   public:
     // The starter must return a joinable worker, or throw without starting the job.
-    using SourceImportStarter =
-        std::function<std::jthread(std::function<void(std::stop_token)>)>;
+    using SourceImportStarter = std::function<std::jthread(std::function<void(std::stop_token)>)>;
     explicit MainWindow(QWidget *parent = nullptr, ProjectSaveWorker::Writer writer = {},
                         SourceImportStarter sourceImportStarter = {}, QString recoveryRoot = {});
     bool saveInProgress() const noexcept;
@@ -159,6 +158,7 @@ class MainWindow final : public QMainWindow {
     void configureSimulation();
     void configureLemFaces();
     void updateInterfacePresentation();
+    void updateAcousticDomainDisplay(const SimulationArchive &archive);
     void couplingChanged();
     bool cadMode() const;
     EditState editState() const;
@@ -202,6 +202,12 @@ class MainWindow final : public QMainWindow {
     QTreeWidgetItem *sourceItem_{};
     QTreeWidgetItem *facesItem_{};
     QTreeWidgetItem *projectItem_{};
+    QTreeWidgetItem *domainsItem_{};
+    std::shared_ptr<const SurfaceMesh> interfaceOverlaySource_;
+    std::shared_ptr<const SurfaceMesh> interfaceOverlay_;
+    std::set<std::uint32_t> interfaceOverlayFaceIds_;
+    std::vector<AcousticRegionDefinition> displayedAcousticRegions_;
+    bool interfaceOverlayFromResult_{};
     QDockWidget *analysisDock_{};
     QDockWidget *parameterDock_{};
     QDockWidget *meshSettingsDock_{};
@@ -237,6 +243,7 @@ class MainWindow final : public QMainWindow {
     std::shared_ptr<const SurfaceMesh> rawPreview_;
     std::shared_ptr<const MeshingResult> mesh_;
     std::shared_ptr<const CadSnapshot> cadSnapshot_;
+    std::optional<MeshImportSelection> gmsh_;
     std::uint64_t revision_{1};
     std::uint64_t geometryRevision_{};
     std::uint64_t analysisRevision_{};

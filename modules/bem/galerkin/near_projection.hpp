@@ -226,8 +226,8 @@ mapProjectionPatch(const TriangleQuadraturePoint &outer, unsigned edge, GaussPoi
 }
 
 HS_NEAR_HD inline unsigned nearPatchPointCount(const PairQuadraturePatch &patch,
-                                               unsigned outerCount) {
-    const unsigned order = 20 * patch.projectionIntervals;
+                                               unsigned outerCount, unsigned innerOrder = 20) {
+    const unsigned order = innerOrder * patch.projectionIntervals;
     return patch.projection ? outerCount * 3 * order * order : outerCount * outerCount;
 }
 
@@ -235,19 +235,19 @@ template <class PanelType>
 HS_NEAR_HD inline PairQuadraturePoint
 mapNearPatchPoint(const TriangleQuadraturePoint *rule, unsigned count,
                   const PairQuadraturePatch &patch, unsigned index, const PanelType &test,
-                  const PanelType &trial) {
+                  const PanelType &trial, unsigned innerOrder = 20) {
     if (!patch.projection)
         return mapPairPatch(rule[index / count], rule[index % count], patch);
-    const unsigned order = 20 * patch.projectionIntervals;
+    const unsigned order = innerOrder * patch.projectionIntervals;
     const unsigned radial = index % order;
     index /= order;
     const unsigned angular = index % order;
     index /= order;
     const unsigned edge = index % 3, outer = index / 3;
-    auto u = projection_detail::gauss(20, angular % 20);
-    auto v = projection_detail::gauss(20, radial % 20);
-    u.position = (angular / 20 + u.position) / patch.projectionIntervals;
-    v.position = (radial / 20 + v.position) / patch.projectionIntervals;
+    auto u = projection_detail::gauss(innerOrder, angular % innerOrder);
+    auto v = projection_detail::gauss(innerOrder, radial % innerOrder);
+    u.position = (angular / innerOrder + u.position) / patch.projectionIntervals;
+    v.position = (radial / innerOrder + v.position) / patch.projectionIntervals;
     u.weight /= patch.projectionIntervals;
     v.weight /= patch.projectionIntervals;
     return mapProjectionPatch(rule[outer], edge, u, v, patch, test, trial);

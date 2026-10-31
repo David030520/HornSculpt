@@ -143,12 +143,27 @@ BemRequest request() {
     value.observers = {{0, 0, .3}, {1, 0, 0}, {0, 0, 3}};
     return value;
 }
-double checkSphere(const BemResult &result, double maximumError) {
+double checkSphere(const BemResult &result, double maximumError,
+                   double residualTolerance = BemNumerics{}.relativeResidualTolerance) {
     require(result.pressureDofCount == result.triangleCount / 2 + 2,
             "Closed spherical P1 pressure space has an incorrect number of DOFs");
     double worst = 0;
     for (const auto &frequency : result.frequencies) {
         const auto &unit = frequency.excitations[0];
+        for (const auto &excitation : frequency.excitations) {
+            require(excitation.fieldQuadratureComparisonDegree > 0 &&
+                        excitation.fieldQuadratureVerificationDegree >
+                            excitation.fieldQuadratureComparisonDegree &&
+                        excitation.fieldQuadratureVerificationDegree <= 14 &&
+                        std::isfinite(excitation.fieldQuadratureDiscrepancy) &&
+                        excitation.fieldQuadratureDiscrepancy <= .025 * residualTolerance,
+                    "Dense observer field lacks a genuine independent rule comparison.");
+            require(excitation.fastMultipoleAccuracySeed == 0 &&
+                        excitation.fastMultipoleComparisonLevels.empty() &&
+                        excitation.fastMultipoleVerificationLevels.empty() &&
+                        excitation.farQuadratureComparisonDegree == 0,
+                    "Dense field quadrature must not invent FMM expansion evidence.");
+        }
         for (std::size_t j = 0; j < 3; ++j) {
             const auto expected = analytic(frequency.frequency, std::array{.3, 1.0, 3.0}[j]);
             const double error = std::abs(unit.observerPressure[j] / expected - 1.0);
@@ -234,7 +249,7 @@ void checkTightResidual() {
                   << std::setprecision(12) << excitation.boundaryResidual << ", refinement "
                   << excitation.refinementSteps << '\n';
     }
-    checkSphere(result, .015);
+    checkSphere(result, .015, input.numerics.relativeResidualTolerance);
     std::cout << "Tight CUDA residual, analytic pressure, impedance and complex phase PASS.\n";
 }
 void checkThinBody() {

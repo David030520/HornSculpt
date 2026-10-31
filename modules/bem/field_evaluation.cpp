@@ -6,9 +6,9 @@
 #include <cmath>
 #include <hornsculpt/field_evaluation.hpp>
 #include <limits>
+#include <map>
 #include <numbers>
 #include <set>
-#include <map>
 #include <stdexcept>
 
 namespace hornsculpt {
@@ -83,8 +83,8 @@ struct Integral {
     double magnitude{};
 };
 Integral integrate(const galerkin::Panel &panel, const Patch &patch, Vec3 observer, double k,
-                   const std::array<Complex, 3> &pressure, Complex derivative, bool rayleigh,
-                   const std::vector<galerkin::TriangleQuadraturePoint> &rule) {
+                   const std::array<Complex, 3> &pressure, const std::array<Complex, 3> &derivative,
+                   bool rayleigh, const std::vector<galerkin::TriangleQuadraturePoint> &rule) {
     Integral result;
     for (const auto &point : rule) {
         Vec3 b{};
@@ -97,7 +97,8 @@ Integral integrate(const galerkin::Panel &panel, const Patch &patch, Vec3 observ
         if (!(r > 0))
             throw std::runtime_error("Field observation lies on a quadrature point.");
         const Complex g = std::polar(1 / (4 * std::numbers::pi * r), -k * r);
-        const Complex single = g * derivative;
+        const Complex single =
+            g * (b.x * derivative[0] + b.y * derivative[1] + b.z * derivative[2]);
         const Complex doubleLayer = g * Complex{1 / r, k} * (dot(displacement, panel.normal) / r) *
                                     (b.x * pressure[0] + b.y * pressure[1] + b.z * pressure[2]);
         // triangleRule weights integrate the reference triangle (area 1/2).
@@ -115,7 +116,7 @@ std::array<Patch, 4> children(const Patch &p) {
     return {{{{a, ab, ca}, area}, {{ab, b, bc}, area}, {{ca, bc, c}, area}, {{ab, bc, ca}, area}}};
 }
 bool adaptive(const galerkin::Panel &panel, const Patch &patch, Vec3 observer, double k,
-              const std::array<Complex, 3> &p, Complex q, bool rayleigh,
+              const std::array<Complex, 3> &p, const std::array<Complex, 3> &q, bool rayleigh,
               const std::vector<galerkin::TriangleQuadraturePoint> &coarseRule,
               const std::vector<galerkin::TriangleQuadraturePoint> &fineRule,
               const PressureFieldSettings &settings, unsigned depth, Complex &value,
@@ -139,6 +140,192 @@ bool adaptive(const galerkin::Panel &panel, const Patch &patch, Vec3 observer, d
             return false;
     return true;
 }
+bool adaptive(const galerkin::Panel &panel, const Patch &patch, Vec3 observer, double k,
+              const std::array<Complex, 3> &p, Complex q, bool rayleigh,
+              const std::vector<galerkin::TriangleQuadraturePoint> &coarseRule,
+              const std::vector<galerkin::TriangleQuadraturePoint> &fineRule,
+              const PressureFieldSettings &settings, unsigned depth, Complex &value,
+              std::stop_token stop) {
+    return adaptive(panel, patch, observer, k, p, std::array<Complex, 3>{q, q, q}, rayleigh,
+                    coarseRule, fineRule, settings, depth, value, stop);
+}
+struct FieldDomain {
+    BemDomainKind kind;
+    galerkin::Space space;
+    std::vector<std::array<Complex, 3>> pressure;
+    std::vector<std::array<Complex, 3>> flux;
+    std::vector<bool> interfacePanels;
+};
+std::vector<PressureFieldSample>
+evaluateSubdomainField(const SurfaceMesh &mesh, const BemRequest &request, double frequency,
+                       const BemExcitationResult &solution, const std::vector<Vec3> &points,
+                       const PressureFieldSettings &settings, std::stop_token stop,
+                       const std::function<void(std::size_t, std::size_t)> &progress) {
+    std::vector<FieldDomain> domains;
+    for (const auto &definition : request.subdomains->domains) {
+        const auto found =
+            std::find_if(solution.subdomainTraces().begin(), solution.subdomainTraces().end(),
+                         [&](const auto &x) { return x.domainId == definition.id; });
+        if (found == solution.subdomainTraces().end() ||
+            found->vertexIndices.size() != found->pressureTrace.size() ||
+            found->triangleIndices.size() != found->normalDerivative.size())
+            throw std::invalid_argument("Incomplete subdomain field traces.");
+        std::map<std::uint32_t, Complex> pressures, means;
+        for (std::size_t i = 0; i < found->vertexIndices.size(); ++i)
+            if (!finite(found->pressureTrace[i]) ||
+                !pressures.emplace(found->vertexIndices[i], found->pressureTrace[i]).second)
+                throw std::invalid_argument("Invalid subdomain pressure trace.");
+        for (std::size_t i = 0; i < found->triangleIndices.size(); ++i)
+            if (!finite(found->normalDerivative[i]) ||
+                !means.emplace(found->triangleIndices[i], found->normalDerivative[i]).second)
+                throw std::invalid_argument("Invalid subdomain flux trace.");
+        std::map<std::uint32_t, std::map<std::uint32_t, Complex>> interfaceFlux;
+        for (const auto &trace : found->interfaceFluxes) {
+            if (trace.vertexIndices.size() != trace.normalDerivative.size() ||
+                interfaceFlux.contains(trace.interfaceId))
+                throw std::invalid_argument("Invalid P1 interface trace.");
+            auto &entries = interfaceFlux[trace.interfaceId];
+            for (std::size_t i = 0; i < trace.vertexIndices.size(); ++i)
+                if (!finite(trace.normalDerivative[i]) ||
+                    !entries.emplace(trace.vertexIndices[i], trace.normalDerivative[i]).second)
+                    throw std::invalid_argument("Invalid P1 interface flux.");
+        }
+        std::map<std::uint32_t, std::uint32_t> interfaceOf;
+        for (const auto &interface : request.subdomains->interfaces)
+            if (interface.firstDomainId == definition.id ||
+                interface.secondDomainId == definition.id)
+                for (auto t : interface.triangleIndices)
+                    if (!interfaceOf.emplace(t, interface.id).second)
+                        throw std::invalid_argument("Overlapping field interfaces.");
+        SurfaceMesh local;
+        std::map<std::uint32_t, std::uint32_t> ids;
+        FieldDomain output;
+        output.kind = definition.kind;
+        for (const auto &entry : definition.panels) {
+            if (entry.triangleIndex >= mesh.triangles.size() ||
+                (entry.normalSign != 1 && entry.normalSign != -1) ||
+                !means.contains(entry.triangleIndex))
+                throw std::invalid_argument("Invalid subdomain field panel.");
+            auto triangle = mesh.triangles[entry.triangleIndex];
+            if (entry.normalSign < 0)
+                std::swap(triangle.vertices[1], triangle.vertices[2]);
+            std::array<Complex, 3> p{}, q{};
+            for (unsigned j = 0; j < 3; ++j) {
+                const auto global = triangle.vertices[j];
+                if (global >= mesh.vertices.size() || !pressures.contains(global))
+                    throw std::invalid_argument("Missing field pressure node.");
+                p[j] = pressures.at(global);
+                q[j] = means.at(entry.triangleIndex);
+                if (interfaceOf.contains(entry.triangleIndex)) {
+                    const auto face = interfaceOf.at(entry.triangleIndex);
+                    if (!interfaceFlux.contains(face) || !interfaceFlux.at(face).contains(global))
+                        throw std::invalid_argument("Missing field interface flux node.");
+                    q[j] = interfaceFlux.at(face).at(global);
+                }
+                const auto [it, added] =
+                    ids.emplace(global, static_cast<std::uint32_t>(ids.size()));
+                if (added)
+                    local.vertices.push_back(mesh.vertices[global]);
+                triangle.vertices[j] = it->second;
+            }
+            local.triangles.push_back(triangle);
+            output.pressure.push_back(p);
+            output.flux.push_back(q);
+            output.interfacePanels.push_back(interfaceOf.contains(entry.triangleIndex));
+        }
+        output.space = galerkin::buildSpace(local);
+        domains.push_back(std::move(output));
+    }
+    const auto coarse = galerkin::triangleRule(4), fine = galerkin::triangleRule(8);
+    const double k = 2 * std::numbers::pi * frequency / request.medium.soundSpeed;
+    std::vector<PressureFieldSample> output;
+    output.reserve(points.size());
+    for (const auto point : points) {
+        if (stop.stop_requested())
+            throw std::runtime_error("Field evaluation cancelled.");
+        if (!finite(point))
+            throw std::invalid_argument("Invalid pressure field point.");
+        PressureFieldSample sample{point, {}, FieldPointStatus::excluded};
+        const FieldDomain *selected = nullptr;
+        bool boundary = false;
+        std::optional<Complex> interfacePressure;
+        // Physical surfaces take priority, including interface rims. The
+        // interface itself is transparent; only roundoff-close points use
+        // its P1 trace, all other points follow adaptive volume integration.
+        for (const auto &domain : domains) {
+            for (std::size_t t = 0; t < domain.space.panels.size(); ++t) {
+                const auto &panel = domain.space.panels[t];
+                if (!domain.interfacePanels[t]) {
+                    if (distanceToPanel(point, panel) <= settings.minimumBoundaryDistance)
+                        boundary = true;
+                    continue;
+                }
+                const double scale =
+                    std::max({norm(point), norm(panel.vertices[0]), panel.maximumEdgeLength,
+                              std::numeric_limits<double>::min()});
+                const double roundoffDistance =
+                    128 * std::numeric_limits<double>::epsilon() * scale;
+                if (distanceToPanel(point, panel) > roundoffDistance)
+                    continue;
+                const auto a = panel.vertices[0], u = sub(panel.vertices[1], a),
+                           v = sub(panel.vertices[2], a), w = sub(point, a);
+                const double uu = dot(u, u), uv = dot(u, v), vv = dot(v, v), wu = dot(w, u),
+                             wv = dot(w, v);
+                const double determinant = uu * vv - uv * uv;
+                if (!(determinant > 0))
+                    throw std::invalid_argument("Degenerate interface field panel.");
+                const double b = (wu * vv - wv * uv) / determinant,
+                             c = (wv * uu - wu * uv) / determinant;
+                const auto value = (1 - b - c) * domain.pressure[t][0] + b * domain.pressure[t][1] +
+                                   c * domain.pressure[t][2];
+                if (!finite(value))
+                    throw std::invalid_argument("Non-finite interface pressure.");
+                if (!interfacePressure)
+                    interfacePressure = value;
+            }
+        }
+        if (!boundary && !interfacePressure)
+            for (const auto &domain : domains) {
+                double angle = 0;
+                for (const auto &panel : domain.space.panels)
+                    angle += solidAngle(point, panel);
+                const bool contains = domain.kind == BemDomainKind::interior
+                                          ? std::abs(angle) > 2 * std::numbers::pi
+                                          : std::abs(angle) < 2 * std::numbers::pi;
+                if (contains) {
+                    if (selected)
+                        throw std::invalid_argument("Ambiguous subdomain field point.");
+                    selected = &domain;
+                }
+            }
+        if (boundary)
+            sample.status = FieldPointStatus::boundary;
+        else if (interfacePressure) {
+            sample.status = FieldPointStatus::air;
+            sample.pressure = *interfacePressure;
+        } else if (selected) {
+            sample.status = FieldPointStatus::air;
+            for (std::size_t t = 0; t < selected->space.panels.size(); ++t)
+                if (!adaptive(selected->space.panels[t], {}, point, k, selected->pressure[t],
+                              selected->flux[t], false, coarse, fine, settings, 0, sample.pressure,
+                              stop)) {
+                    sample.status = FieldPointStatus::quadratureNotConverged;
+                    sample.pressure = {};
+                    break;
+                }
+            // All domain normals point out of air: representation is S q - D p.
+            sample.pressure = -sample.pressure;
+            if (!finite(sample.pressure)) {
+                sample.status = FieldPointStatus::quadratureNotConverged;
+                sample.pressure = {};
+            }
+        }
+        output.push_back(sample);
+        if (progress)
+            progress(output.size(), points.size());
+    }
+    return output;
+}
 } // namespace
 
 std::vector<PressureFieldSample>
@@ -153,6 +340,9 @@ evaluatePressureField(const SurfaceMesh &mesh, const BemRequest &request, double
         settings.relativeQuadratureTolerance <= 0 || settings.relativeQuadratureTolerance > .01 ||
         settings.maximumQuadratureDepth > 12)
         throw std::invalid_argument("Invalid pressure field settings.");
+    if (request.subdomains)
+        return evaluateSubdomainField(mesh, request, frequency, solution, points, settings, stop,
+                                      progress);
     if (!solution.boundary() || solution.boundary()->pressureTrace.size() != mesh.vertices.size() ||
         solution.boundary()->normalDerivative.size() != mesh.triangles.size())
         throw std::invalid_argument(
@@ -175,14 +365,15 @@ evaluatePressureField(const SurfaceMesh &mesh, const BemRequest &request, double
         auto velocities = solution.solvedVelocities;
         if (velocities.empty() && !request.coupling) {
             const auto found = std::find_if(request.excitations.begin(), request.excitations.end(),
-                [&](const auto &e) { return e.name == solution.name; });
+                                            [&](const auto &e) { return e.name == solution.name; });
             if (found != request.excitations.end())
                 velocities = found->faces;
         }
         for (const auto &v : velocities)
             exteriorVelocities.emplace(v.faceId, v.normalVelocity);
         if (exteriorVelocities.empty())
-            throw std::invalid_argument("Exterior source velocities are required for field evaluation.");
+            throw std::invalid_argument(
+                "Exterior source velocities are required for field evaluation.");
     }
     const auto coarse = galerkin::triangleRule(4), fine = galerkin::triangleRule(8);
     const double k = 2 * std::numbers::pi * frequency / request.medium.soundSpeed;
@@ -233,8 +424,8 @@ evaluatePressureField(const SurfaceMesh &mesh, const BemRequest &request, double
                 if (solution.boundary()->normalDerivative[t] == Complex{} &&
                     (rayleigh || (p[0] == Complex{} && p[1] == Complex{} && p[2] == Complex{})))
                     continue;
-                if (!adaptive(panel, {}, point, k, p, solution.boundary()->normalDerivative[t], rayleigh,
-                              coarse, fine, settings, 0, sample.pressure, stop)) {
+                if (!adaptive(panel, {}, point, k, p, solution.boundary()->normalDerivative[t],
+                              rayleigh, coarse, fine, settings, 0, sample.pressure, stop)) {
                     sample.status = FieldPointStatus::quadratureNotConverged;
                     sample.pressure = {};
                     break;
@@ -247,7 +438,9 @@ evaluatePressureField(const SurfaceMesh &mesh, const BemRequest &request, double
                     const auto found = exteriorVelocities.find(panel.faceId);
                     if (found == exteriorVelocities.end() || found->second == Complex{})
                         continue;
-                    const auto q = Complex{0, -2 * std::numbers::pi * frequency * request.medium.density} * found->second;
+                    const auto q =
+                        Complex{0, -2 * std::numbers::pi * frequency * request.medium.density} *
+                        found->second;
                     if (!adaptive(panel, {}, point, k, {}, q, true, coarse, fine, settings, 0,
                                   sample.pressure, stop)) {
                         sample.status = FieldPointStatus::quadratureNotConverged;

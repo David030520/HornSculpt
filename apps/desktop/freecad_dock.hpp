@@ -23,6 +23,7 @@ class FreeCadDock final : public QDockWidget {
     ~FreeCadDock() override;
     void ensureListening();
     bool isSourceAvailable() const;
+    bool hasLiveLink() const;
     bool isGeometryPending() const;
     bool setAssignments(const QString &documentId, const QString &sessionId, std::uint64_t revision,
                         const std::vector<CadFaceAssignment> &faces,
@@ -38,6 +39,7 @@ class FreeCadDock final : public QDockWidget {
     void setFaceTargets(const std::map<std::uint32_t, double> &targets);
     void setReversedFaces(const std::set<std::uint32_t> &faces);
     void setInterfaceFaces(std::set<std::uint32_t> faces, bool active);
+    void setBemInterfaceFaces(std::set<std::uint32_t> faces);
     std::function<void(std::shared_ptr<const CadSnapshot>)> onSnapshotChanged;
     std::function<void(bool)> onAvailabilityChanged;
     std::function<void(std::vector<std::uint32_t>)> onFacesSelected;
@@ -71,6 +73,7 @@ class FreeCadDock final : public QDockWidget {
     std::map<std::uint32_t, double> faceTargets_;
     std::set<std::uint32_t> reversedFaces_;
     std::set<std::uint32_t> interfaceFaces_;
+    std::set<std::uint32_t> bemInterfaceFaces_;
     bool interfacesActive_{};
 };
 

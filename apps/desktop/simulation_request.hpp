@@ -9,6 +9,7 @@ namespace hornsculpt {
 struct ResultMemoryDimensions {
     std::size_t triangles{}, vertices{}, exteriorTriangles{}, observers{}, faces{};
     std::size_t frequencies{}, excitations{}, snapshots{};
+    std::size_t domains{};
 };
 long double estimateResultBytes(const ResultMemoryDimensions &dimensions);
 

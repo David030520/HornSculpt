@@ -1,17 +1,19 @@
 #include "main_window.hpp"
+#include "draft_assembly_dialog.hpp"
 #include "draft_wizard.hpp"
 #include "freecad_dock.hpp"
 #include "galerkin/exterior_domain.hpp"
+#include "gmsh_source.hpp"
 #include "lem_editor.hpp"
+#include "mesh_import_dialog.hpp"
 #include "mesh_panel.hpp"
 #include "parameter_panel.hpp"
 #include "parameter_sweep.hpp"
+#include "project_assembly.hpp"
+#include "result_comparison.hpp"
 #include "simulation_dock.hpp"
 #include "step_export_dialog.hpp"
 #include "step_import.hpp"
-#include "draft_assembly_dialog.hpp"
-#include "project_assembly.hpp"
-#include "result_comparison.hpp"
 #include <QAbstractItemDelegate>
 #include <QAbstractItemView>
 #include <QAbstractSpinBox>
@@ -22,9 +24,9 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
-#include <QDockWidget>
 #include <QDialog>
 #include <QDir>
+#include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
@@ -44,14 +46,14 @@
 #include <QRegularExpression>
 #include <QResizeEvent>
 #include <QScopedValueRollback>
+#include <QScreen>
 #include <QScrollArea>
 #include <QScrollBar>
-#include <QScreen>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSplitter>
-#include <QStatusBar>
 #include <QStandardPaths>
+#include <QStatusBar>
 #include <QStyle>
 #include <QStyleOptionViewItem>
 #include <QTabWidget>
@@ -87,11 +89,16 @@ class GuidedDraftCommand final : public QUndoCommand {
     explicit GuidedDraftCommand(std::function<void(bool)> apply) : apply_(std::move(apply)) {
         setText(QObject::tr("Horn-Assistent"));
     }
-    void undo() override { apply_(false); }
-    void redo() override {
-        if (initial_) initial_ = false;
-        else apply_(true);
+    void undo() override {
+        apply_(false);
     }
+    void redo() override {
+        if (initial_)
+            initial_ = false;
+        else
+            apply_(true);
+    }
+
   private:
     std::function<void(bool)> apply_;
     bool initial_{true};
@@ -194,17 +201,21 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     auto *view = menuBar()->addMenu(tr("&Ansicht"));
     auto *geometryMenu = menuBar()->addMenu(tr("&Geometrie"));
     geometryMenu->addAction(tr("Draft-Baugruppe …"), this, [this] { editDraftAssembly(); });
-    geometryMenu->addAction(tr("CAD zur Draft-Baugruppe hinzufügen …"), this, [this] { addCadToDraft(); });
+    geometryMenu->addAction(tr("CAD zur Draft-Baugruppe hinzufügen …"), this,
+                            [this] { addCadToDraft(); });
     auto *studyMenu = menuBar()->addMenu(tr("&Studie"));
     auto *comparisonAction = studyMenu->addAction(tr("Ergebnisstände und Bericht …"), this, [this] {
         commitFocusedEdit();
         QImage image;
-        if (viewport_ && viewport_->isValid()) image = viewport_->grabFramebuffer();
+        if (viewport_ && viewport_->isValid())
+            image = viewport_->grabFramebuffer();
         const auto dialogEpoch = projectEpoch_;
         ResultComparisonDialog dialog(projectState(), std::move(image), this);
-        dialog.onSnapshotsChanged = [this, dialogEpoch](std::vector<NamedProjectSnapshot> snapshots) {
+        dialog.onSnapshotsChanged = [this,
+                                     dialogEpoch](std::vector<NamedProjectSnapshot> snapshots) {
             if (projectEpoch_ != dialogEpoch) {
-                setDiagnostic(tr("Projekt wurde gewechselt · Ergebnisvergleich erneut öffnen."), true);
+                setDiagnostic(tr("Projekt wurde gewechselt · Ergebnisvergleich erneut öffnen."),
+                              true);
                 return;
             }
             comparisonSnapshots_ = std::move(snapshots);
@@ -213,7 +224,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         dialog.exec();
     });
     comparisonAction->setObjectName("openResultComparison");
-    auto *sweepAction = studyMenu->addAction(tr("Parameter-Sweep …"), this, [this] { openParameterStudy(); });
+    auto *sweepAction =
+        studyMenu->addAction(tr("Parameter-Sweep …"), this, [this] { openParameterStudy(); });
     sweepAction->setObjectName("openParameterSweep");
     studyMenu->addAction(tr("Netzkonvergenz …"), this, [this] { openParameterStudy(true); });
     studyMenu->addAction(tr("Studie öffnen …"), this, [this] {
@@ -256,7 +268,35 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         confirmUnsaved([this] {
             const auto path = QFileDialog::getOpenFileName(this, tr("STEP importieren"), {},
                                                            tr("STEP (*.step *.stp)"));
-            if (!path.isEmpty()) openStep(path);
+            if (!path.isEmpty())
+                openStep(path);
+        });
+    });
+    auto *importMeshAction = file->addAction(tr("Gmsh-Netz importieren …"), this, [this] {
+        confirmUnsaved([this] {
+            const auto path = QFileDialog::getOpenFileName(this, tr("Gmsh-Netz importieren"), {},
+                                                           tr("Gmsh (*.msh)"));
+            if (path.isEmpty())
+                return;
+            MeshImportDialog dialog(path, this);
+            if (dialog.exec() != QDialog::Accepted || !dialog.selection())
+                return;
+            try {
+                Project project;
+                project.source = ProjectSource::freecad;
+                project.meshing = meshPanel_->inputSettings();
+                project.gmsh = *dialog.selection();
+                project.cad = makeGmshCadSnapshot(*project.gmsh, QFileInfo(path).fileName());
+                project.preview =
+                    std::shared_ptr<const SurfaceMesh>(project.cad, &project.cad->mesh);
+                project.geometryRevision = project.revision;
+                adoptProject(prepareProject(std::move(project), false), {});
+                markDirty();
+                setDiagnostic(tr("Gmsh-Polygonquelle importiert · Randzuordnung und Netz prüfen."));
+            } catch (const std::exception &e) {
+                QMessageBox::warning(this, tr("Gmsh-Netz importieren"),
+                                     QString::fromUtf8(e.what()));
+            }
         });
     });
     file->addAction(saveAction);
@@ -278,7 +318,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     draftWizardAction_ = new QAction(tr("Horn-Assistent …"), this);
     draftWizardAction_->setObjectName("openDraftWizard");
     draftWizardAction_->setToolTip(tr("Ein OS-SE-Grundhorn schrittweise aus Anschluss, Bauraum, "
-                                       "geometrischen Öffnungswinkeln und Querschnitt erzeugen."));
+                                      "geometrischen Öffnungswinkeln und Querschnitt erzeugen."));
     draftWizardAction_->setWhatsThis(draftWizardAction_->toolTip());
     toolbar->addAction(draftWizardAction_);
     toolbar->widgetForAction(draftWizardAction_)->setProperty("primaryAction", true);
@@ -301,12 +341,14 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         confirmUnsaved([this] {
             const auto path = QFileDialog::getOpenFileName(this, tr("Projekt öffnen"), {},
                                                            tr("HornSculpt (*.hsproj)"));
-            if (!path.isEmpty()) openProject(path);
+            if (!path.isEmpty())
+                openProject(path);
         });
     });
     connect(saveAction, &QAction::triggered, this, [this] { saveProject(false); });
     connect(saveAs, &QAction::triggered, this, [this] { saveProject(true); });
-    saveBlockedActions_ = {newAction, openAction, importStepAction, saveAction, saveAs};
+    saveBlockedActions_ = {newAction,        openAction, importStepAction,
+                           importMeshAction, saveAction, saveAs};
     connect(meshAction_, &QAction::triggered, this, &MainWindow::requestMesh);
     connect(cancelAction_, &QAction::triggered, this, [this] {
         simulationDock_->setRealtimeEnabled(false);
@@ -325,7 +367,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     workflowLayout->setContentsMargins(10, 5, 7, 5);
     auto *draftStep = new QToolButton;
     draftStep->setText(tr("1 · Entwurf"));
-    draftStep->setToolTip(tr("Draft-Parameter einblenden. Für ein neues Grundhorn den Horn-Assistenten öffnen."));
+    draftStep->setToolTip(
+        tr("Draft-Parameter einblenden. Für ein neues Grundhorn den Horn-Assistenten öffnen."));
     connect(draftStep, &QToolButton::clicked, this, [this] {
         auto *panel = cadMode() ? static_cast<QDockWidget *>(cadDock_) : parameterDock_;
         panel->show();
@@ -343,7 +386,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     workflowSimulation_ = new QToolButton;
     workflowSimulation_->setObjectName("workflowSimulation");
     workflowSimulation_->setText(tr("3 · Berechnung …"));
-    workflowSimulation_->setToolTip(tr("Berechnungseinstellungen öffnen, Frequenzen und Anregung prüfen, dann Berechnen starten."));
+    workflowSimulation_->setToolTip(tr("Berechnungseinstellungen öffnen, Frequenzen und Anregung "
+                                       "prüfen, dann Berechnen starten."));
     connect(workflowSimulation_, &QToolButton::clicked, this, [this] {
         simulationDock_->show();
         simulationDock_->raise();
@@ -369,7 +413,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     workflowScroll->setWidget(workflow);
     connect(workflowScroll->horizontalScrollBar(), &QScrollBar::rangeChanged, this,
             [this, workflowScroll, workflow](int, int maximum) {
-                workflowScroll->setFixedHeight(workflow->sizeHint().height() +
+                workflowScroll->setFixedHeight(
+                    workflow->sizeHint().height() +
                     (maximum > 0 ? style()->pixelMetric(QStyle::PM_ScrollBarExtent) : 0));
             });
     centerLayout->addWidget(workflowScroll);
@@ -381,14 +426,14 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     sourceMode_->setObjectName("sourceMode");
     sourceMode_->setAccessibleName(tr("Geometriequelle"));
     sourceMode_->setToolTip(tr("Draft bearbeitet das parametrische Horn. FreeCAD-Link verwendet "
-                                "die importierte oder live verbundene CAD-Geometrie."));
+                               "die importierte oder live verbundene CAD-Geometrie."));
     sourceMode_->addItems({tr("Draft"), tr("FreeCAD-Link")});
     viewLayout->addWidget(sourceMode_, 0, 0);
     representation_ = new QComboBox;
     representation_->setObjectName(QStringLiteral("geometryRepresentation"));
     representation_->setAccessibleName(tr("Geometriedarstellung"));
     representation_->setToolTip(tr("Vorschau folgt dem Entwurf. Netz zeigt die zuletzt erzeugte "
-                                    "Vernetzung mit ihrer Revision."));
+                                   "Vernetzung mit ihrer Revision."));
     representation_->addItems({tr("Vorschau"), tr("Netz")});
     representation_->setMinimumWidth(110);
     viewLayout->addWidget(representation_, 0, 1);
@@ -443,9 +488,10 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     viewLayout->addWidget(showAperture_, 1, 1);
     showInterfaces_ = new QCheckBox(tr("Interfaces"));
     showInterfaces_->setObjectName("showBemLemInterfaces");
-    showInterfaces_->setToolTip(
-        tr("Mathematische BEM↔LEM-Flächen anzeigen und im 3D auswählen. "
-           "Ausblenden verändert ausschließlich die Ansicht, nicht die Kopplung oder das Netz."));
+    showInterfaces_->setToolTip(tr(
+        "BE-Interfaces als cyanfarbenes Drahtnetz; Auswahl importierter Flächen in der "
+        "Flächentabelle. "
+        "BEM↔LEM-Flächen bleiben getrennt zugeordnet. Die Sichtbarkeit verändert keine Rechnung."));
     showInterfaces_->setWhatsThis(showInterfaces_->toolTip());
     showInterfaces_->setEnabled(false);
     viewLayout->addWidget(showInterfaces_, 1, 2);
@@ -464,7 +510,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     viewScroll->setWidget(viewBar);
     connect(viewScroll->horizontalScrollBar(), &QScrollBar::rangeChanged, this,
             [this, viewScroll, viewBar](int, int maximum) {
-                viewScroll->setFixedHeight(viewBar->sizeHint().height() +
+                viewScroll->setFixedHeight(
+                    viewBar->sizeHint().height() +
                     (maximum > 0 ? style()->pixelMetric(QStyle::PM_ScrollBarExtent) : 0));
             });
     centerLayout->addWidget(viewScroll);
@@ -481,14 +528,13 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     compactToolsDialog_->setWindowTitle(tr("Arbeitsablauf und 3D-Ansicht"));
     compactToolsDialog_->resize(700, 170);
     new QVBoxLayout(compactToolsDialog_);
-    connect(compactTools, &QToolButton::toggled, this,
-            [this, compactTools](bool expanded) {
-                if (compactHeight_ && expanded)
-                    compactToolsDialog_->show();
-                else
-                    compactToolsDialog_->hide();
-                compactTools->setText(expanded ? tr("Werkzeuge geöffnet") : tr("Werkzeuge öffnen"));
-            });
+    connect(compactTools, &QToolButton::toggled, this, [this, compactTools](bool expanded) {
+        if (compactHeight_ && expanded)
+            compactToolsDialog_->show();
+        else
+            compactToolsDialog_->hide();
+        compactTools->setText(expanded ? tr("Werkzeuge geöffnet") : tr("Werkzeuge öffnen"));
+    });
     connect(compactToolsDialog_, &QDialog::finished, compactTools, [compactTools] {
         compactTools->setChecked(false);
         QSettings().setValue("view/compactToolsExpanded", false);
@@ -500,14 +546,13 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     centerLayout->addWidget(viewport_, 1);
     setCentralWidget(center);
     connect(wireframe, &QCheckBox::toggled, viewport_, &MeshViewport::setWireframe);
-    connect(wireframe, &QCheckBox::toggled, this, [](bool enabled) {
-        QSettings().setValue("view/wireframe", enabled);
-    });
+    connect(wireframe, &QCheckBox::toggled, this,
+            [](bool enabled) { QSettings().setValue("view/wireframe", enabled); });
     auto *backgroundGrid = view->addAction(tr("Hintergrundraster"));
     backgroundGrid->setObjectName("showBackgroundGrid");
     backgroundGrid->setCheckable(true);
     backgroundGrid->setToolTip(tr("Orientierungsraster im 3D-Hintergrund anzeigen. "
-                                   "Dreieckskanten werden separat über Kanten geschaltet."));
+                                  "Dreieckskanten werden separat über Kanten geschaltet."));
     backgroundGrid->setWhatsThis(backgroundGrid->toolTip());
     backgroundGrid->setChecked(QSettings().value("view/backgroundGrid", false).toBool());
     viewport_->setBackgroundGrid(backgroundGrid->isChecked());
@@ -565,7 +610,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
                                                        "HornSculpt-3D.png", tr("PNG (*.png)"));
         if (!path.isEmpty() && !viewport_->grabFramebuffer().save(path, "PNG"))
             QMessageBox::warning(this, tr("3D-Bild exportieren"),
-                                  tr("Die Bilddatei konnte nicht gespeichert werden."));
+                                 tr("Die Bilddatei konnte nicht gespeichert werden."));
     });
 
     auto *tree = new QTreeWidget;
@@ -579,6 +624,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     new QTreeWidgetItem(facesItem_, {tr("Hornwand · Wall")});
     new QTreeWidgetItem(facesItem_, {tr("Hals · Driven")});
     meshItem_ = new QTreeWidgetItem(projectItem_, {tr("Netz · nicht erzeugt")});
+    domainsItem_ = new QTreeWidgetItem(projectItem_, {tr("Akustische Gebiete")});
+    domainsItem_->setHidden(true);
     tree->expandAll();
     auto *treeDock = dock(this, tr("Projekt"), "projectDock", tree, Qt::LeftDockWidgetArea);
     view->addAction(treeDock->toggleViewAction());
@@ -593,9 +640,9 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     addDockWidget(Qt::RightDockWidgetArea, cadDock_);
     view->addAction(cadDock_->toggleViewAction());
     meshPanel_ = new MeshPanel;
-    meshSettingsDock_ =
-        dock(this, tr("Netzeinstellungen"), "meshSettingsDock",
-             scrollableDockContent(meshPanel_, "meshSettingsDockScroll", 160), Qt::LeftDockWidgetArea);
+    meshSettingsDock_ = dock(this, tr("Netzeinstellungen"), "meshSettingsDock",
+                             scrollableDockContent(meshPanel_, "meshSettingsDockScroll", 160),
+                             Qt::LeftDockWidgetArea);
     splitDockWidget(treeDock, meshSettingsDock_, Qt::Vertical);
     view->addAction(meshSettingsDock_->toggleViewAction());
 
@@ -660,9 +707,9 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         verticalSection_->focusDriven();
     });
     connect(sectionMesh_, &QCheckBox::toggled, this, [this] { updateDisplay(); });
-    analysisDock_ = dock(this, tr("Geometrieanalyse"), "geometryAnalysisDock",
-                         scrollableDockContent(geometryTabs_, "geometryDockScroll"),
-                         Qt::BottomDockWidgetArea);
+    analysisDock_ =
+        dock(this, tr("Geometrieanalyse"), "geometryAnalysisDock",
+             scrollableDockContent(geometryTabs_, "geometryDockScroll"), Qt::BottomDockWidgetArea);
     view->addAction(analysisDock_->toggleViewAction());
     simulationDock_ = new SimulationDock(this);
     addDockWidget(Qt::BottomDockWidgetArea, simulationDock_);
@@ -671,7 +718,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     enlargeResults->setObjectName("enlargeResults");
     enlargeResults->setShortcut(QKeySequence("Ctrl+Shift+E"));
     enlargeResults->setCheckable(true);
-    enlargeResults->setToolTip(tr("Ergebnisdock vergrößern; erneut wählen zeigt die 3D-Ansicht wieder."));
+    enlargeResults->setToolTip(
+        tr("Ergebnisdock vergrößern; erneut wählen zeigt die 3D-Ansicht wieder."));
     connect(enlargeResults, &QAction::toggled, this, [this](bool enlarged) {
         viewport_->setVisible(!enlarged);
         simulationDock_->show();
@@ -679,7 +727,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         simulationDock_->revealResultView();
         const auto generation = ++dockResizeGeneration_;
         QTimer::singleShot(0, this, [this, enlarged, generation] {
-            if (generation != dockResizeGeneration_) return;
+            if (generation != dockResizeGeneration_)
+                return;
             resizeDocks({simulationDock_}, {height() * (enlarged ? 7 : 3) / 10}, Qt::Vertical);
         });
     });
@@ -688,7 +737,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     lemEditor_->setObjectName("lemEditor");
     auto *lemDock =
         dock(this, tr("Treiber / LEM"), "lemDock",
-              scrollableDockContent(lemEditor_, "lemDockScroll"), Qt::BottomDockWidgetArea);
+             scrollableDockContent(lemEditor_, "lemDockScroll"), Qt::BottomDockWidgetArea);
     view->addAction(lemDock->toggleViewAction());
     tabifyDockWidget(simulationDock_, lemDock);
     lemEditor_->onChanged = [this] { couplingChanged(); };
@@ -710,10 +759,12 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
                                                  bool stale) {
         lemEditor_->setSolution(std::move(solution), stale);
     };
-    simulationDock_->onFieldChanged = [this, enlargeResults, resultTabs](std::shared_ptr<const PressureFieldPlane> plane,
-                                                            PressureFieldAppearance appearance) {
+    simulationDock_->onFieldChanged = [this, enlargeResults,
+                                       resultTabs](std::shared_ptr<const PressureFieldPlane> plane,
+                                                   PressureFieldAppearance appearance) {
         auto *page = resultTabs->currentWidget();
-        if (plane && page && page->findChild<QWidget *>("acousticField") && enlargeResults->isChecked())
+        if (plane && page && page->findChild<QWidget *>("acousticField") &&
+            enlargeResults->isChecked())
             enlargeResults->setChecked(false);
         fieldVisibility_->setEnabled(bool(plane));
         viewport_->setPressureField(std::move(plane), appearance);
@@ -754,6 +805,11 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
         markDirty();
         configureLemFaces();
         updateDisplay();
+    };
+    simulationDock_->onAcousticRegionsChanged = [this] {
+        rememberEdit(true);
+        if (gmsh_)
+            meshingChanged();
     };
     simulationDock_->onObservationFrameChanged = [this] {
         viewport_->setObservationFrame(simulationDock_->observationFrame());
@@ -850,7 +906,7 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     auto *resetLayout = view->addAction(tr("Docklayout zurücksetzen"));
     resetLayout->setObjectName("resetDockLayout");
     resetLayout->setToolTip(tr("Projekt links, Parameter rechts und Ergebnisse unten anordnen. "
-                                "Modell und Ergebnisse bleiben erhalten."));
+                               "Modell und Ergebnisse bleiben erhalten."));
     const auto applyDefaultLayout = [this, defaultLayout, treeDock, compactTools] {
         restoreState(defaultLayout);
         updateSourcePresentation();
@@ -865,8 +921,8 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
             tabifyDockWidget(treeDock, parameterDock_);
             tabifyDockWidget(treeDock, cadDock_);
             (cadMode() ? static_cast<QDockWidget *>(cadDock_) : parameterDock_)->raise();
-            resizeDocks({cadMode() ? static_cast<QDockWidget *>(cadDock_) : parameterDock_},
-                        {320}, Qt::Horizontal);
+            resizeDocks({cadMode() ? static_cast<QDockWidget *>(cadDock_) : parameterDock_}, {320},
+                        Qt::Horizontal);
         } else {
             resizeDocks({treeDock, parameterDock_}, {250, 340}, Qt::Horizontal);
         }
@@ -892,10 +948,10 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     const bool restoredLayout = restoreState(settings.value("window/state").toByteArray());
     const bool compactHeight = height() < 650;
     setCompactToolsMode(compactHeight);
-    compactTools->setChecked(compactHeight && settings.value("view/compactToolsExpanded", false).toBool());
-    connect(compactTools, &QToolButton::clicked, this, [](bool expanded) {
-        QSettings().setValue("view/compactToolsExpanded", expanded);
-    });
+    compactTools->setChecked(compactHeight &&
+                             settings.value("view/compactToolsExpanded", false).toBool());
+    connect(compactTools, &QToolButton::clicked, this,
+            [](bool expanded) { QSettings().setValue("view/compactToolsExpanded", expanded); });
     updateSourcePresentation();
     analysisDock_->show();
     analysisDock_->raise();
@@ -911,9 +967,10 @@ MainWindow::MainWindow(QWidget *parent, ProjectSaveWorker::Writer writer,
     if (!restoredLayout)
         QTimer::singleShot(0, this, applyDefaultLayout);
     const auto arguments = QCoreApplication::arguments();
-    const bool automated = arguments.contains("--smoke-test") || arguments.contains("--mesh-test") ||
-                           arguments.contains("--solver-test") || arguments.contains("--project-test") ||
-                           arguments.contains("--screenshot");
+    const bool automated =
+        arguments.contains("--smoke-test") || arguments.contains("--mesh-test") ||
+        arguments.contains("--solver-test") || arguments.contains("--project-test") ||
+        arguments.contains("--screenshot");
     if (!recoveryRoot_.isEmpty() ||
         (QCoreApplication::applicationName() == QStringLiteral("HornSculpt") && !automated))
         QTimer::singleShot(0, this, &MainWindow::startRecovery);
@@ -942,6 +999,7 @@ MainWindow::~MainWindow() {
     cadDock_->onFacesSelected = {};
     cadDock_->onFaceTargetChanged = {};
     simulationDock_->onChanged = {};
+    simulationDock_->onAcousticRegionsChanged = {};
     simulationDock_->onRealtimeChanged = {};
     simulationDock_->onObservationFrameChanged = {};
     simulationDock_->onLemResultChanged = {};
@@ -1069,8 +1127,7 @@ void MainWindow::startGeometry() {
 
 void MainWindow::acceptGeometry(std::uint64_t revision,
                                 std::shared_ptr<const DraftGeometry> geometry,
-                                std::shared_ptr<const SurfaceMesh> preview,
-                                QString error) {
+                                std::shared_ptr<const SurfaceMesh> preview, QString error) {
     if (closing_)
         return;
     if (revision == revision_ && !cadMode()) {
@@ -1104,16 +1161,18 @@ void MainWindow::acceptGeometry(std::uint64_t revision,
             setDiagnostic({});
             analysisDock_->setWindowTitle(
                 tr("Geometrieanalyse · Rev. %1 · veraltet · wird aktualisiert für Rev. %2")
-                    .arg(analysisRevision_).arg(revision));
+                    .arg(analysisRevision_)
+                    .arg(revision));
             revisionLabel_->setText(tr("Geometrie Rev. %1").arg(revision_));
             meshAction_->setEnabled(!meshBusy_);
         } else {
-            parameters_->setGeometryStatus(
-                tr("Vorschau nicht aktuell\n") + error +
-                    tr("\nLetzte gültige Vorschau bleibt sichtbar."), true);
+            parameters_->setGeometryStatus(tr("Vorschau nicht aktuell\n") + error +
+                                               tr("\nLetzte gültige Vorschau bleibt sichtbar."),
+                                           true);
             setDiagnostic(error + tr(" Letzte gültige Vorschau bleibt sichtbar."), true);
             analysisDock_->setWindowTitle(
-                tr("Geometrieanalyse · Rev. %1 · veraltet · Geometrie ungültig").arg(analysisRevision_));
+                tr("Geometrieanalyse · Rev. %1 · veraltet · Geometrie ungültig")
+                    .arg(analysisRevision_));
             revisionLabel_->setText(tr("Geometrie Rev. %1 · ungültig").arg(revision_));
         }
     }
@@ -1158,15 +1217,18 @@ void MainWindow::requestMesh() {
         options.quality = meshing_.quality;
         options.faceTargetEdgeLengths = activeFaceTargets();
         const auto cad = cadMode() ? cadSnapshot_ : nullptr;
+        const bool importedGmsh =
+            gmsh_.has_value() && cad && cad->sessionId == "gmsh-import-offline";
+        const auto regions = simulationDock_->archive().settings.acousticRegions;
         if (cad)
             options.geometry = cad->geometry;
         meshBusy_ = true;
         meshError_.clear();
         meshAction_->setEnabled(false);
         cancelAction_->setEnabled(true);
-        setDiagnostic(tr("Isotrope Vernetzung …"));
+        setDiagnostic(importedGmsh ? tr("Importnetz prüfen …") : tr("Isotrope Vernetzung …"));
         meshWorker_.submit([this, snapshot, revision, epoch, jobId, options, reversed, cad,
-                            assemblyProject](std::stop_token stop) {
+                            assemblyProject, importedGmsh, regions](std::stop_token stop) {
             std::shared_ptr<const MeshingResult> result;
             QString error;
             try {
@@ -1179,10 +1241,16 @@ void MainWindow::requestMesh() {
                         jobOptions.parameterization = source->parameters;
                     }
                     auto generated =
-                        assemblyProject
-                            ? meshDraftAssembly(*assemblyProject, *snapshot, stop)
-                            : remeshIsotropic(source ? source->mesh : *snapshot, jobOptions, stop);
-                    if (!assemblyProject && !reversed.empty()) {
+                        importedGmsh
+                            ? validateGmshMesh(reversed.empty()
+                                                   ? source->mesh
+                                                   : applyFaceOrientation(source->mesh, reversed),
+                                               regions, jobOptions, stop)
+                            : (assemblyProject
+                                   ? meshDraftAssembly(*assemblyProject, *snapshot, stop)
+                                   : remeshIsotropic(source ? source->mesh : *snapshot, jobOptions,
+                                                     stop));
+                    if (!importedGmsh && !assemblyProject && !reversed.empty()) {
                         try {
                             generated.mesh = applyFaceOrientation(generated.mesh, reversed);
                             generated.quality = inspectMesh(generated.mesh);
@@ -1273,7 +1341,8 @@ void MainWindow::updateDisplay() {
                 colors.emplace(id + assemblyCadFaceOffset, color);
     }
     viewport_->setFaceColors(currentView ? colors : FaceColors{});
-    const auto baffle = simulationDock_->archive().settings.infiniteBaffle;
+    const auto simulationState = simulationDock_->archive();
+    const auto baffle = simulationState.settings.infiniteBaffle;
     showAperture_->setEnabled(baffle.has_value());
     std::set<std::uint32_t> interfaceFaces;
     for (const auto *element : lem::bemPorts(lemEditor_->network())) {
@@ -1281,12 +1350,20 @@ void MainWindow::updateDisplay() {
         if (port.kind == lem::BemPortKind::interfacePort)
             interfaceFaces.insert(port.faceIds.begin(), port.faceIds.end());
     }
-    showInterfaces_->setEnabled(!interfaceFaces.empty());
+    std::set<std::uint32_t> beInterfaces;
+    for (const auto &region : simulationState.settings.acousticRegions)
+        beInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+    const bool computedInterfaces = simulationState.current && simulationState.request &&
+                                    simulationState.request->subdomains.has_value();
+    showInterfaces_->setEnabled(!interfaceFaces.empty() || !beInterfaces.empty() ||
+                                computedInterfaces);
     std::set<std::uint32_t> hidden;
     if (baffle && !showAperture_->isChecked())
         hidden.insert(baffle->apertureFaceIds.begin(), baffle->apertureFaceIds.end());
     if (!showInterfaces_->isChecked())
         hidden.insert(interfaceFaces.begin(), interfaceFaces.end());
+    // Transparent BE interfaces are drawn separately, never as opaque material.
+    hidden.insert(beInterfaces.begin(), beInterfaces.end());
     viewport_->setHiddenFaces({hidden.begin(), hidden.end()});
     if (cadMode() && cadSnapshot_)
         simulationDock_->setAcousticAxis(cadSnapshot_->acousticOrigin, cadSnapshot_->acousticAxis);
@@ -1296,9 +1373,10 @@ void MainWindow::updateDisplay() {
     }
     viewport_->setObservationFrame(simulationDock_->observationFrame());
     const auto draftPreview = !cadMode() ? rawPreview_ : nullptr;
-    const auto overlay = !cadMode() && !isPlacedAssembly(assembly_) && sectionMesh_->isChecked() && mesh_
-                             ? std::shared_ptr<const SurfaceMesh>(mesh_, &mesh_->mesh)
-                             : nullptr;
+    const auto overlay =
+        !cadMode() && !isPlacedAssembly(assembly_) && sectionMesh_->isChecked() && mesh_
+            ? std::shared_ptr<const SurfaceMesh>(mesh_, &mesh_->mesh)
+            : nullptr;
     horizontalSection_->setMeshes(draftPreview, overlay);
     verticalSection_->setMeshes(draftPreview, overlay);
     sectionMesh_->setEnabled(!cadMode() && static_cast<bool>(mesh_));
@@ -1318,8 +1396,10 @@ void MainWindow::updateDisplay() {
                                 .arg(geometryRevision_)
                                 .arg(geometryRevision_ == revision_ ? "" : tr(" · veraltet")));
     }
-    viewport_->setSelectedFaces(placedSelection(cadMode() ? cadDock_->selectedFaces()
-                                          : meshPanel_->selectedFaces()));
+    viewport_->setSelectedFaces(
+        placedSelection(cadMode() ? cadDock_->selectedFaces() : meshPanel_->selectedFaces()));
+    updateAcousticDomainDisplay(simulationState);
+    updateInterfacePresentation();
     updateFaceColorActions();
 }
 
@@ -1436,8 +1516,8 @@ bool MainWindow::geometryReady() const noexcept {
            !geometryPending_ &&
            (cadMode() ? cadDock_->isSourceAvailable() && cadSnapshot_ &&
                             !cadSnapshot_->hasUnresolvedAssignments()
-                      : geometry_ &&
-                        (!assembly_.includeCad || (cadSnapshot_ && !cadSnapshot_->hasUnresolvedAssignments())));
+                      : geometry_ && (!assembly_.includeCad ||
+                                      (cadSnapshot_ && !cadSnapshot_->hasUnresolvedAssignments())));
 }
 bool MainWindow::meshReady() const noexcept {
     return mesh_ && meshRevision_ == revision_ && !meshBusy_;
@@ -1458,7 +1538,8 @@ void MainWindow::setDiagnostic(const QString &message, bool error) {
 }
 void MainWindow::openParameterStudy(bool convergence, const QString &manifestPath) {
     if (isPlacedAssembly(assembly_)) {
-        setDiagnostic(tr("Baugruppen-Sweeps sind nicht verfügbar; die gemeinsame Simulation bleibt nutzbar."));
+        setDiagnostic(tr(
+            "Baugruppen-Sweeps sind nicht verfügbar; die gemeinsame Simulation bleibt nutzbar."));
         return;
     }
     commitFocusedEdit();
@@ -1540,13 +1621,16 @@ void MainWindow::openParameterStudy(bool convergence, const QString &manifestPat
                 auto ready = std::move(handoff->ready);
                 release();
                 setDiagnostic(tr("Projekt wurde gewechselt · Studie erneut öffnen."), true);
-                if (ready) ready(false);
+                if (ready)
+                    ready(false);
                 return;
             }
-            if (!handoff->reserved || !simulationDock_->externalJobReady()) return;
+            if (!handoff->reserved || !simulationDock_->externalJobReady())
+                return;
             handoff->timer->stop();
             auto ready = std::move(handoff->ready);
-            if (ready) ready(true);
+            if (ready)
+                ready(true);
         });
         study.gpuWaitMessage = [this] {
             return simulationDock_->isBusy() ? tr("Laufende Berechnung wird beendet …")
@@ -1660,7 +1744,11 @@ void MainWindow::updateMeshStatus() {
         tr("Netz Rev. %1 · %2 Dreiecke%3 · kleinste Kante %4 mm")
             .arg(meshRevision_)
             .arg(mesh_->mesh.triangles.size())
-            .arg(meshRevision_ == revision_ ? tr(" · geschlossen") : tr(" · veraltet"))
+            .arg(meshRevision_ != revision_
+                     ? tr(" · veraltet")
+                     : (gmsh_ && !simulationDock_->archive().settings.acousticRegions.empty()
+                            ? tr(" · Gebiete geprüft")
+                            : tr(" · geschlossen")))
             .arg(locale().toString(mesh_->quality.minimumEdgeLength * 1000, 'f', 3)));
     const auto &q = mesh_->quality;
     qualityLabel_->setToolTip(
@@ -1698,6 +1786,8 @@ Project MainWindow::projectState() const {
     project.preview = preview_;
     project.mesh = mesh_;
     project.cad = cadDock_->snapshot();
+    if (project.cad && project.cad->sessionId == "gmsh-import-offline")
+        project.gmsh = gmsh_;
     project.simulation = simulationDock_->archive();
     project.comparisonSnapshots = comparisonSnapshots_;
     return project;
@@ -1717,7 +1807,8 @@ MainWindow::PreparedProject MainWindow::prepareProject(Project project, bool ver
         prepared.geometry = std::make_shared<DraftGeometry>(project.parameters);
         prepared.rawPreview = std::make_shared<SurfaceMesh>(
             prepared.geometry->previewMesh(project.meshing.adaptive.geometricTolerance, stop));
-        auto composed = std::make_shared<SurfaceMesh>(assemblyPreview(*prepared.rawPreview, project));
+        auto composed =
+            std::make_shared<SurfaceMesh>(assemblyPreview(*prepared.rawPreview, project));
         if (project.preview && project.geometryRevision == project.revision &&
             *project.preview != *composed) {
             ++project.revision;
@@ -1775,6 +1866,9 @@ void MainWindow::applyProject(const Project &project) {
 
 void MainWindow::applyProject(const PreparedProject &prepared) {
     const auto &project = prepared.project;
+    if (project.gmsh && cadDock_->hasLiveLink())
+        throw std::invalid_argument("Gmsh-Quelle kann bei aktiver FreeCAD-Verbindung nicht "
+                                    "geöffnet werden. Verbindung zuerst trennen.");
     // Widgets remain on their Qt thread. Validate all control domains before mutation;
     // the owned CAD snapshot and numerical geometry were already prepared separately.
     ParameterPanel checkedParameters;
@@ -1814,6 +1908,7 @@ void MainWindow::applyProject(const PreparedProject &prepared) {
     rawPreview_ = prepared.rawPreview;
     mesh_ = project.mesh;
     cadSnapshot_ = project.cad;
+    gmsh_ = project.gmsh;
     meshError_.clear();
     cancelAction_->setEnabled(false);
     viewport_->setSelectedFaces({});
@@ -1848,7 +1943,8 @@ void MainWindow::applyProject(const PreparedProject &prepared) {
     dirty_ = false;
     loading_ = false;
     if (cadMode()) {
-        cadDock_->ensureListening();
+        if (!project.gmsh)
+            cadDock_->ensureListening();
         simulationDock_->show();
         simulationDock_->raise();
     }
@@ -1861,8 +1957,11 @@ void MainWindow::adoptProject(const PreparedProject &prepared, const QString &pa
     if (recoveryStore_) {
         ++recoveryGeneration_;
         recoveryHasSaved_ = false;
-        try { recoveryStore_->newSession(); }
-        catch (const std::exception &e) { setDiagnostic(QString::fromUtf8(e.what()), true); }
+        try {
+            recoveryStore_->newSession();
+        } catch (const std::exception &e) {
+            setDiagnostic(QString::fromUtf8(e.what()), true);
+        }
     }
     projectPath_ = path;
     if (prepared.rebuiltDraft) {
@@ -1899,7 +1998,8 @@ void MainWindow::queueSourceImport(const QString &path, bool step, bool openAsCo
         return;
     if (recoveryOpening_ && path != recoveryOpening_->path)
         recoveryOpening_.reset();
-    SourceImport request{path, step, ++sourceImportId_, projectEpoch_, revision_, changeSerial_, meshing_};
+    SourceImport request{path,      step,          ++sourceImportId_, projectEpoch_,
+                         revision_, changeSerial_, meshing_};
     request.openAsCopy = openAsCopy;
     sourceImportError_.clear();
     if (sourceImportBusy_) {
@@ -2010,16 +2110,17 @@ void MainWindow::startSourceImport(SourceImport request) {
                     sourceImportError_ = error;
                     if (sourceImportError_.isEmpty()) {
                         try {
-                            const bool restoring = recoveryOpening_ && request.path == recoveryOpening_->path;
-                            adoptProject(*prepared,
-                                         restoring || request.openAsCopy ? QString{}
-                                         : request.appendToDraft        ? projectPath_
-                                         : request.step                 ? QString{}
-                                                                        : request.path);
+                            const bool restoring =
+                                recoveryOpening_ && request.path == recoveryOpening_->path;
+                            adoptProject(*prepared, restoring || request.openAsCopy ? QString{}
+                                                    : request.appendToDraft         ? projectPath_
+                                                    : request.step                  ? QString{}
+                                                                                    : request.path);
                             if (restoring) {
                                 recoveredEntry_ = std::move(recoveryOpening_);
                                 markDirty();
-                                setDiagnostic(tr("Wiederhergestellt · zum Erhalt als neue Datei speichern."));
+                                setDiagnostic(
+                                    tr("Wiederhergestellt · zum Erhalt als neue Datei speichern."));
                             } else if (request.step || request.openAsCopy)
                                 markDirty();
                         } catch (const std::exception &e) {
@@ -2047,18 +2148,24 @@ void MainWindow::startSourceImport(SourceImport request) {
     }
 }
 
-bool MainWindow::saveInProgress() const noexcept { return saveWorker_->busy(); }
+bool MainWindow::saveInProgress() const noexcept {
+    return saveWorker_->busy();
+}
 
 void MainWindow::setSaveActionsEnabled(bool enabled) {
-    for (auto *action : saveBlockedActions_) action->setEnabled(enabled);
+    for (auto *action : saveBlockedActions_)
+        action->setEnabled(enabled);
 }
 
 void MainWindow::startRecovery() {
-    if (closing_ || recoveryStore_) return;
+    if (closing_ || recoveryStore_)
+        return;
     try {
         if (recoveryRoot_.isEmpty()) {
-            const QString base = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-            if (base.isEmpty()) throw std::runtime_error("Kein Wiederherstellungsordner verfügbar.");
+            const QString base =
+                QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+            if (base.isEmpty())
+                throw std::runtime_error("Kein Wiederherstellungsordner verfügbar.");
             recoveryRoot_ = QDir(base).filePath("recovery");
         }
         recoveryStore_ = std::make_unique<RecoveryStore>(recoveryRoot_);
@@ -2069,19 +2176,23 @@ void MainWindow::startRecovery() {
         recoveryTimer_->start();
         offerRecovery();
     } catch (const std::exception &e) {
-        setDiagnostic(tr("Automatische Sicherung nicht verfügbar: %1").arg(QString::fromUtf8(e.what())), true);
+        setDiagnostic(
+            tr("Automatische Sicherung nicht verfügbar: %1").arg(QString::fromUtf8(e.what())),
+            true);
     }
 }
 
 void MainWindow::offerRecovery() {
-    if (closing_ || !recoveryStore_) return;
+    if (closing_ || !recoveryStore_)
+        return;
     if (sourceImportBusy_) {
         QTimer::singleShot(250, this, &MainWindow::offerRecovery);
         return;
     }
     auto entries = RecoveryStore::available(recoveryRoot_);
     for (auto &entry : entries) {
-        QMessageBox question(QMessageBox::Question, tr("Wiederherstellung"),
+        QMessageBox question(
+            QMessageBox::Question, tr("Wiederherstellung"),
             tr("Eine nicht regulär beendete Sicherung vom %1 wurde gefunden.\n"
                "Ursprüngliches Projekt: %2\n\n"
                "Wiederhergestellte Daten werden zunächst ohne Dateinamen geöffnet; "
@@ -2109,7 +2220,8 @@ void MainWindow::offerRecovery() {
 }
 
 void MainWindow::saveRecovery() {
-    if (closing_ || !dirty_ || !recoveryStore_ || recoveryStore_->busy()) return;
+    if (closing_ || !dirty_ || !recoveryStore_ || recoveryStore_->busy())
+        return;
     try {
         auto snapshot = projectState();
         const auto serial = changeSerial_, generation = recoveryGeneration_;
@@ -2118,17 +2230,20 @@ void MainWindow::saveRecovery() {
         if (recoveryHasSaved_ && serial == recoverySavedSerial_ &&
             recoverySavedResult_.lock() == result && recoverySavedComplete_ == complete)
             return;
-        recoveryStore_->save(std::move(snapshot), projectPath_, [this, serial, generation, result, complete](QString error) {
-            if (!closing_ && error.isEmpty() && generation == recoveryGeneration_) {
-                recoverySavedSerial_ = serial;
-                recoverySavedResult_ = result;
-                recoverySavedComplete_ = complete;
-                recoveryHasSaved_ = true;
-            } else if (!closing_ && !error.isEmpty())
-                setDiagnostic(tr("Automatische Sicherung fehlgeschlagen: %1").arg(error), true);
-        });
+        recoveryStore_->save(
+            std::move(snapshot), projectPath_,
+            [this, serial, generation, result, complete](QString error) {
+                if (!closing_ && error.isEmpty() && generation == recoveryGeneration_) {
+                    recoverySavedSerial_ = serial;
+                    recoverySavedResult_ = result;
+                    recoverySavedComplete_ = complete;
+                    recoveryHasSaved_ = true;
+                } else if (!closing_ && !error.isEmpty())
+                    setDiagnostic(tr("Automatische Sicherung fehlgeschlagen: %1").arg(error), true);
+            });
     } catch (const std::exception &e) {
-        setDiagnostic(tr("Automatische Sicherung fehlgeschlagen: %1").arg(QString::fromUtf8(e.what())), true);
+        setDiagnostic(
+            tr("Automatische Sicherung fehlgeschlagen: %1").arg(QString::fromUtf8(e.what())), true);
     }
 }
 
@@ -2139,12 +2254,17 @@ void MainWindow::clearRecovery(bool newSession) {
         RecoveryStore::discard(*recoveredEntry_);
         recoveredEntry_.reset();
     }
-    if (!recoveryStore_) return;
+    if (!recoveryStore_)
+        return;
     try {
-        if (newSession) recoveryStore_->newSession();
-        else recoveryStore_->retire();
+        if (newSession)
+            recoveryStore_->newSession();
+        else
+            recoveryStore_->retire();
     } catch (const std::exception &e) {
-        setDiagnostic(tr("Automatische Sicherung nicht verfügbar: %1").arg(QString::fromUtf8(e.what())), true);
+        setDiagnostic(
+            tr("Automatische Sicherung nicht verfügbar: %1").arg(QString::fromUtf8(e.what())),
+            true);
     }
 }
 
@@ -2158,8 +2278,10 @@ void MainWindow::saveProject(bool choosePath, std::function<void()> continuation
     if (path.isEmpty() || choosePath)
         path = QFileDialog::getSaveFileName(this, tr("Projekt speichern"), path,
                                             tr("HornSculpt (*.hsproj)"));
-    if (path.isEmpty()) return;
-    if (!path.endsWith(".hsproj", Qt::CaseInsensitive)) path += ".hsproj";
+    if (path.isEmpty())
+        return;
+    if (!path.endsWith(".hsproj", Qt::CaseInsensitive))
+        path += ".hsproj";
     try {
         auto snapshot = projectState();
         const auto epoch = projectEpoch_, revision = revision_, serial = changeSerial_;
@@ -2168,7 +2290,8 @@ void MainWindow::saveProject(bool choosePath, std::function<void()> continuation
         afterSave_ = std::move(continuation);
         setSaveActionsEnabled(false);
         setDiagnostic(tr("Projekt wird gespeichert …"));
-        const bool started = saveWorker_->start(path, std::move(snapshot),
+        const bool started = saveWorker_->start(
+            path, std::move(snapshot),
             [this, path, epoch, revision, serial, result, complete](QString error) {
                 setSaveActionsEnabled(true);
                 auto continuation = std::move(afterSave_);
@@ -2185,13 +2308,16 @@ void MainWindow::saveProject(bool choosePath, std::function<void()> continuation
                 projectPath_ = path;
                 const auto current = simulationDock_->archive();
                 const bool unchanged = revision == revision_ && serial == changeSerial_ &&
-                    current.result == result && current.resultComplete == complete;
+                                       current.result == result &&
+                                       current.resultComplete == complete;
                 dirty_ = !unchanged;
-                if (unchanged) clearRecovery();
+                if (unchanged)
+                    clearRecovery();
                 updateTitle();
                 setDiagnostic(unchanged ? tr("Projekt gespeichert")
                                         : tr("Projekt gespeichert · neuere Änderungen offen"));
-                if (continuation) confirmUnsaved(std::move(continuation));
+                if (continuation)
+                    confirmUnsaved(std::move(continuation));
             });
         if (!started) {
             afterSave_ = {};
@@ -2208,16 +2334,24 @@ void MainWindow::saveProject(bool choosePath, std::function<void()> continuation
 void MainWindow::confirmUnsaved(std::function<void()> continuation) {
     commitFocusedEdit();
     if (saveWorker_->busy()) {
-        if (!afterSave_) afterSave_ = std::move(continuation);
-        else setDiagnostic(tr("Speichern läuft · eine Aktion wartet bereits."));
+        if (!afterSave_)
+            afterSave_ = std::move(continuation);
+        else
+            setDiagnostic(tr("Speichern läuft · eine Aktion wartet bereits."));
         return;
     }
-    if (!dirty_) { continuation(); return; }
+    if (!dirty_) {
+        continuation();
+        return;
+    }
     const auto answer = QMessageBox::question(
         this, tr("Projekt speichern"), tr("Änderungen speichern?"),
         QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
-    if (answer == QMessageBox::Discard) { clearRecovery(); continuation(); }
-    else if (answer == QMessageBox::Save) saveProject(false, std::move(continuation));
+    if (answer == QMessageBox::Discard) {
+        clearRecovery();
+        continuation();
+    } else if (answer == QMessageBox::Save)
+        saveProject(false, std::move(continuation));
 }
 void MainWindow::newProject() {
     confirmUnsaved([this] {
@@ -2231,7 +2365,8 @@ void MainWindow::openDraftWizard() {
     if (cadMode() || sourceImportBusy_ || loading_)
         return;
     if (meshBusy_ || simulationDock_->isBusy() || simulationDock_->realtimeEnabled()) {
-        setDiagnostic(tr("Bitte laufende Netz-/Berechnungsaufträge und Echtzeit zuerst beenden."), true);
+        setDiagnostic(tr("Bitte laufende Netz-/Berechnungsaufträge und Echtzeit zuerst beenden."),
+                      true);
         return;
     }
     commitFocusedEdit();
@@ -2240,7 +2375,8 @@ void MainWindow::openDraftWizard() {
     if (wizard.exec() != QDialog::Accepted)
         return;
     if (cadMode() || sourceImportBusy_) {
-        setDiagnostic(tr("Geometriequelle inzwischen geändert · Assistent erneut im Draft öffnen."));
+        setDiagnostic(
+            tr("Geometriequelle inzwischen geändert · Assistent erneut im Draft öffnen."));
         return;
     }
     try {
@@ -2261,24 +2397,28 @@ void MainWindow::openDraftWizard() {
         const auto minimum = wizard.minimumFrequency(), maximum = wizard.maximumFrequency();
         const auto count = static_cast<std::size_t>(wizard.frequencyCount());
         const bool stateChanged = !sameEditState(before, after);
-        const bool solverChanged = calculate &&
-            (previousMode != 0 || previousSettings.minimumFrequency != minimum ||
-             previousSettings.maximumFrequency != maximum || previousSettings.frequencyCount != count);
-        if (stateChanged) applyEditState(after);
+        const bool solverChanged =
+            calculate && (previousMode != 0 || previousSettings.minimumFrequency != minimum ||
+                          previousSettings.maximumFrequency != maximum ||
+                          previousSettings.frequencyCount != count);
+        if (stateChanged)
+            applyEditState(after);
         if (calculate) {
             mode->setCurrentIndex(0);
             simulationDock_->setFrequencySweep(minimum, maximum, count);
         }
         if (stateChanged || solverChanged) {
-            undoStack_->push(new GuidedDraftCommand(
-                [this, before, after, previousSettings, previousMode, minimum, maximum, count, calculate](bool redo) {
+            undoStack_->push(
+                new GuidedDraftCommand([this, before, after, previousSettings, previousMode,
+                                        minimum, maximum, count, calculate](bool redo) {
                     applyEditState(redo ? after : before);
                     if (calculate) {
                         simulationDock_->findChild<QComboBox *>("bemGeometryMode")
                             ->setCurrentIndex(redo ? 0 : previousMode);
-                        simulationDock_->setFrequencySweep(redo ? minimum : previousSettings.minimumFrequency,
-                                                           redo ? maximum : previousSettings.maximumFrequency,
-                                                           redo ? count : previousSettings.frequencyCount);
+                        simulationDock_->setFrequencySweep(
+                            redo ? minimum : previousSettings.minimumFrequency,
+                            redo ? maximum : previousSettings.maximumFrequency,
+                            redo ? count : previousSettings.frequencyCount);
                     }
                 }));
         }
@@ -2287,7 +2427,8 @@ void MainWindow::openDraftWizard() {
         parameterDock_->raise();
         setDiagnostic(tr("Grundhorn übernommen · Parameter rechts bearbeiten oder Netz erzeugen."));
         updateWorkflow();
-        if (calculate) startGuidedCalculation();
+        if (calculate)
+            startGuidedCalculation();
     } catch (const std::invalid_argument &error) {
         setDiagnostic(QString::fromUtf8(error.what()), true);
     }
@@ -2316,7 +2457,8 @@ void MainWindow::startGuidedCalculation() {
     timer->setObjectName("guidedCalculationTimer");
     timer->setInterval(50);
     const auto finish = [this, progress, timer, state](const QString &message, bool error) {
-        if (state->finished) return;
+        if (state->finished)
+            return;
         state->finished = true;
         timer->stop();
         progress->close();
@@ -2327,12 +2469,13 @@ void MainWindow::startGuidedCalculation() {
         if (state->ownsMesh && state->epoch == projectEpoch_ && meshBusy_ &&
             state->meshJobId == meshJobId_)
             meshWorker_.request_stop();
-        if (state->ownsSolve && state->epoch == projectEpoch_ &&
-            state->solveJobId != 0 && state->solveJobId == simulationDock_->activeSolveJobId())
+        if (state->ownsSolve && state->epoch == projectEpoch_ && state->solveJobId != 0 &&
+            state->solveJobId == simulationDock_->activeSolveJobId())
             simulationDock_->cancelSolve();
     };
     connect(progress, &QProgressDialog::canceled, this, [state, finish, cancelOwnedJobs] {
-        if (state->finished) return;
+        if (state->finished)
+            return;
         cancelOwnedJobs();
         finish(tr("Geführter Ablauf abgebrochen."), false);
     });
@@ -2357,8 +2500,12 @@ void MainWindow::startGuidedCalculation() {
             if (!meshReady()) {
                 requestMesh();
                 state->ownsMesh = meshBusy_;
-                if (state->ownsMesh) state->meshJobId = meshJobId_;
-                if (!state->ownsMesh) finish(meshError_.isEmpty() ? tr("Netz konnte nicht gestartet werden.") : meshError_, true);
+                if (state->ownsMesh)
+                    state->meshJobId = meshJobId_;
+                if (!state->ownsMesh)
+                    finish(meshError_.isEmpty() ? tr("Netz konnte nicht gestartet werden.")
+                                                : meshError_,
+                           true);
             }
             return;
         }
@@ -2377,7 +2524,9 @@ void MainWindow::startGuidedCalculation() {
                 return;
             }
             if (!meshReady()) {
-                finish(meshError_.isEmpty() ? tr("Das Qualitätsnetz ist nicht verfügbar.") : meshError_, true);
+                finish(meshError_.isEmpty() ? tr("Das Qualitätsnetz ist nicht verfügbar.")
+                                            : meshError_,
+                       true);
                 return;
             }
             if (!simulationDock_->hasConfiguredExcitation()) {
@@ -2386,18 +2535,24 @@ void MainWindow::startGuidedCalculation() {
             }
             const double dofs = static_cast<double>(mesh_->mesh.vertices.size());
             const double denseMiB = dofs * dofs * sizeof(std::complex<double>) / (1024.0 * 1024.0);
-            progress->setLabelText(tr("Netz: %1 Dreiecke, %2 P1-Knoten. Eine dichte komplexe "
-                "Knotenmatrix allein benötigt rechnerisch etwa %3 MiB; der tatsächliche Bedarf "
-                "hängt vom Verfahren ab. Die Berechnung läuft …").arg(mesh_->mesh.triangles.size())
-                .arg(mesh_->mesh.vertices.size()).arg(locale().toString(denseMiB, 'f', 1)));
+            progress->setLabelText(
+                tr("Netz: %1 Dreiecke, %2 P1-Knoten. Eine dichte komplexe "
+                   "Knotenmatrix allein benötigt rechnerisch etwa %3 MiB; der tatsächliche Bedarf "
+                   "hängt vom Verfahren ab. Die Berechnung läuft …")
+                    .arg(mesh_->mesh.triangles.size())
+                    .arg(mesh_->mesh.vertices.size())
+                    .arg(locale().toString(denseMiB, 'f', 1)));
             state->phase = State::Phase::solve;
             state->generation = simulationDock_->inputGeneration();
             requestSolve();
             state->ownsSolve = simulationDock_->isBusy();
-            if (state->ownsSolve) state->solveJobId = simulationDock_->activeSolveJobId();
+            if (state->ownsSolve)
+                state->solveJobId = simulationDock_->activeSolveJobId();
             if (!state->ownsSolve)
-                finish(simulationDock_->lastError().isEmpty() ? tr("Berechnung konnte nicht gestartet werden.")
-                                                              : simulationDock_->lastError(), true);
+                finish(simulationDock_->lastError().isEmpty()
+                           ? tr("Berechnung konnte nicht gestartet werden.")
+                           : simulationDock_->lastError(),
+                       true);
             return;
         }
         if (state->generation != simulationDock_->inputGeneration()) {
@@ -2406,13 +2561,16 @@ void MainWindow::startGuidedCalculation() {
             finish(tr("Geführter Ablauf beendet: Berechnungseingaben wurden geändert."), true);
             return;
         }
-        if (simulationDock_->isBusy()) return;
+        if (simulationDock_->isBusy())
+            return;
         state->ownsSolve = false;
         if (simulationDock_->hasCurrentResult())
             finish(tr("Netz und Berechnung abgeschlossen · Ergebnisse unten wählen."), false);
         else
-            finish(simulationDock_->lastError().isEmpty() ? tr("Berechnung lieferte kein aktuelles Ergebnis.")
-                                                          : simulationDock_->lastError(), true);
+            finish(simulationDock_->lastError().isEmpty()
+                       ? tr("Berechnung lieferte kein aktuelles Ergebnis.")
+                       : simulationDock_->lastError(),
+                   true);
     });
     progress->show();
     timer->start();
@@ -2466,12 +2624,15 @@ void MainWindow::exportDraftStep() {
     dialog->show();
 }
 
-std::vector<std::uint32_t> MainWindow::placedSelection(const std::vector<std::uint32_t> &ids) const {
-    if (cadMode()) return ids;
+std::vector<std::uint32_t>
+MainWindow::placedSelection(const std::vector<std::uint32_t> &ids) const {
+    if (cadMode())
+        return ids;
     std::vector<std::uint32_t> result;
     for (const auto &instance : assembly_.instances)
         for (const auto id : ids)
-            if (id >= 1 && id <= 8) result.push_back(instanceFaceId(instance.id, id));
+            if (id >= 1 && id <= 8)
+                result.push_back(instanceFaceId(instance.id, id));
     return result;
 }
 
@@ -2482,7 +2643,8 @@ void MainWindow::editDraftAssembly() {
     }
     commitFocusedEdit();
     DraftAssemblyDialog dialog(assembly_, static_cast<bool>(cadSnapshot_), this);
-    if (dialog.exec() != QDialog::Accepted) return;
+    if (dialog.exec() != QDialog::Accepted)
+        return;
     flushEdit();
     assembly_ = dialog.assembly();
     parametersChanged();
@@ -2491,16 +2653,19 @@ void MainWindow::editDraftAssembly() {
 }
 
 void MainWindow::addCadToDraft() {
-    if (sourceImportBusy_) return;
+    if (sourceImportBusy_)
+        return;
     if (cadMode()) {
         setDiagnostic(tr("Zuerst den Draft öffnen, zu dem das CAD-Modell gehören soll."));
         return;
     }
     commitFocusedEdit();
     const auto path = QFileDialog::getOpenFileName(this, tr("CAD zur Draft-Baugruppe hinzufügen"),
-                                                  {}, tr("STEP (*.step *.stp)"));
-    if (path.isEmpty()) return;
-    SourceImport request{path, true, ++sourceImportId_, projectEpoch_, revision_, changeSerial_, meshing_};
+                                                   {}, tr("STEP (*.step *.stp)"));
+    if (path.isEmpty())
+        return;
+    SourceImport request{path,      true,          ++sourceImportId_, projectEpoch_,
+                         revision_, changeSerial_, meshing_};
     request.appendToDraft = std::make_shared<Project>(projectState());
     startSourceImport(std::move(request));
 }
@@ -2514,7 +2679,8 @@ void MainWindow::setCompactToolsMode(bool compact) {
         compactToolsDialog_->layout()->addWidget(viewScroll_);
         workflowScroll_->show();
         viewScroll_->show();
-        if (compactTools_->isChecked()) compactToolsDialog_->show();
+        if (compactTools_->isChecked())
+            compactToolsDialog_->show();
     } else {
         compactToolsDialog_->hide();
         centerLayout_->insertWidget(1, workflowScroll_);
@@ -2530,7 +2696,8 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
     if (!compactTools_ || compact == compactHeight_)
         return;
     setCompactToolsMode(compact);
-    compactTools_->setChecked(compact && QSettings().value("view/compactToolsExpanded", false).toBool());
+    compactTools_->setChecked(compact &&
+                              QSettings().value("view/compactToolsExpanded", false).toBool());
     QTimer::singleShot(0, this, [this] {
         layout()->invalidate();
         layout()->activate();
@@ -2540,14 +2707,20 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
 void MainWindow::closeEvent(QCloseEvent *event) {
     commitFocusedEdit();
     if (!closeApproved_ && saveWorker_->busy() && afterSave_) {
-        afterSave_ = [this] { closeApproved_ = true; close(); };
+        afterSave_ = [this] {
+            closeApproved_ = true;
+            close();
+        };
         event->ignore();
         setDiagnostic(tr("Nach dem Speichern wird geschlossen."));
         return;
     }
     if (!closeApproved_ && (saveWorker_->busy() || dirty_)) {
         event->ignore();
-        confirmUnsaved([this] { closeApproved_ = true; close(); });
+        confirmUnsaved([this] {
+            closeApproved_ = true;
+            close();
+        });
         return;
     }
     closeApproved_ = false;
@@ -2568,7 +2741,8 @@ void MainWindow::sourceModeChanged() {
     if (isPlacedAssembly(assembly_)) {
         const QSignalBlocker blocker(sourceMode_);
         sourceMode_->setCurrentIndex(0);
-        setDiagnostic(tr("Baugruppe aktiv · CAD über Geometrie → CAD zur Draft-Baugruppe hinzufügen."));
+        setDiagnostic(
+            tr("Baugruppe aktiv · CAD über Geometrie → CAD zur Draft-Baugruppe hinzufügen."));
         return;
     }
     flushEdit();
@@ -2596,7 +2770,8 @@ void MainWindow::sourceModeChanged() {
     if (tabifiedDockWidgets(parameterDock_).contains(cadDock_))
         (cadMode() ? static_cast<QDockWidget *>(cadDock_) : parameterDock_)->raise();
     if (cadMode()) {
-        cadDock_->ensureListening();
+        if (!gmsh_)
+            cadDock_->ensureListening();
         if (const auto current = cadDock_->snapshot())
             acceptCadSnapshot(current);
         else {
@@ -2613,6 +2788,11 @@ void MainWindow::sourceModeChanged() {
 }
 
 void MainWindow::updateSourcePresentation() {
+    meshAction_->setText(gmsh_ ? tr("Importnetz prüfen") : tr("Netz erzeugen"));
+    meshAction_->setToolTip(
+        gmsh_ ? tr("Importiertes Netz unverändert auf Qualität und Gebietsabschluss prüfen.")
+              : tr("Isotropes Netz erzeugen und auf geschlossenen Rand, Orientierung und "
+                   "Elementqualität prüfen."));
     updateMeshFaces();
     meshSettingsDock_->show();
     geometryTabs_->setTabVisible(0, !cadMode());
@@ -2634,21 +2814,26 @@ void MainWindow::updateSourcePresentation() {
     } else {
         cadDock_->hide();
         parameterDock_->show();
-        projectItem_->setText(0, isPlacedAssembly(assembly_) ? tr("Draft-Baugruppe") : tr("Entwurf"));
-        sourceItem_->setText(0, tr("%1 gekoppelte Draft-Instanz(en)").arg(assembly_.instances.size()));
+        projectItem_->setText(0,
+                              isPlacedAssembly(assembly_) ? tr("Draft-Baugruppe") : tr("Entwurf"));
+        sourceItem_->setText(0,
+                             tr("%1 gekoppelte Draft-Instanz(en)").arg(assembly_.instances.size()));
         for (const auto &instance : assembly_.instances)
-            new QTreeWidgetItem(sourceItem_, {QString::fromStdString(instance.name) +
-                (instance.mirrorHorizontal ? tr(" · gespiegelt") : QString{})});
+            new QTreeWidgetItem(sourceItem_,
+                                {QString::fromStdString(instance.name) +
+                                 (instance.mirrorHorizontal ? tr(" · gespiegelt") : QString{})});
         if (assembly_.includeCad && cadSnapshot_)
             new QTreeWidgetItem(sourceItem_, {tr("CAD · %1 · h = %2 mm")
-                .arg(cadSnapshot_->documentName).arg(assembly_.cadTargetEdgeLength*1000)});
+                                                  .arg(cadSnapshot_->documentName)
+                                                  .arg(assembly_.cadTargetEdgeLength * 1000)});
         sourceItem_->setExpanded(true);
         new QTreeWidgetItem(facesItem_, {tr("Hornwand · Wall")});
         new QTreeWidgetItem(facesItem_, {tr("Hals · Driven")});
         analysisDock_->setWindowTitle(
             analysisRevision_ == geometryRevision_ && analysisRevision_ != 0
                 ? tr("Geometrieanalyse · Rev. %1").arg(analysisRevision_)
-                : tr("Geometrieanalyse · Rev. %1 · veraltet · wird aktualisiert").arg(analysisRevision_));
+                : tr("Geometrieanalyse · Rev. %1 · veraltet · wird aktualisiert")
+                      .arg(analysisRevision_));
     }
 }
 
@@ -2665,6 +2850,9 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
     auto network =
         reconciledCadBemAssignments(lemEditor_->network(), cadSnapshot_.get(), snapshot.get());
     const bool removedPorts = !lem::samePhysics(network, lemEditor_->network());
+    auto regions = reconciledCadAcousticRegions(simulationDock_->archive().settings.acousticRegions,
+                                                cadSnapshot_.get(), snapshot.get());
+    const bool changedRegions = regions != simulationDock_->archive().settings.acousticRegions;
     cadFaceColors_ = retainedCadFaceColors(cadFaceColors_, cadSnapshot_.get(), snapshot.get());
     if (cadSnapshot_ && cadSnapshot_->documentId == snapshot->documentId) {
         // FreeCadLink carries an ID forward only after unique mapped-name,
@@ -2696,6 +2884,10 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
         setDiagnostic(tr("CAD · %1 nicht mehr zuordenbare Flächenfarben entfernt")
                           .arg(colorsBefore - cadFaceColors_.size()));
     cadSnapshot_ = snapshot;
+    if (changedRegions) {
+        simulationDock_->setAcousticRegions(std::move(regions));
+        setDiagnostic(tr("Gebietszuordnungen nach CAD-Änderung prüfen."), true);
+    }
     if (removedPorts) {
         lemEditor_->setNetwork(std::move(network));
         simulationDock_->setCoupling(lemEditor_->network(), lemEditor_->couplingEnabled());
@@ -2711,7 +2903,7 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
         }
         if (!meshSettingsValid_ && before != cadFaceTargetEdgeLengths_.size())
             meshingChanged();
-        if (sameGeometry)
+        if (sameGeometry && !changedRegions)
             rememberEdit(true);
         else
             resetEditHistory();
@@ -2727,12 +2919,16 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
         meshSettingsValid_ = false;
         sizingError = QString::fromUtf8(error.what());
     }
-    const bool reusableMesh = sameGeometry && mesh_ && meshRevision_ == revision_;
+    const bool reusableMesh =
+        sameGeometry && !changedRegions && mesh_ && meshRevision_ == revision_ &&
+        !(gmsh_ && !simulationDock_->archive().settings.acousticRegions.empty());
     ++revision_;
     geometryPending_ = false;
     meshWorker_.request_stop();
     simulationDock_->invalidate(revision_);
     cadSnapshot_ = std::move(snapshot);
+    if (cadSnapshot_ && cadSnapshot_->sessionId != "gmsh-import-offline")
+        gmsh_.reset();
     rawPreview_ = std::shared_ptr<const SurfaceMesh>(cadSnapshot_, &cadSnapshot_->mesh);
     updateOrientedPreview();
     geometryRevision_ = revision_;
@@ -2749,9 +2945,7 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
             triangle.boundary = boundaries.value(triangle.faceId, BoundaryCondition::wall);
         mesh_ = std::move(updated);
         meshRevision_ = revision_;
-        qualityLabel_->setText(tr("Netz Rev. %1 · %2 Dreiecke · geschlossen")
-                                   .arg(revision_)
-                                   .arg(mesh_->mesh.triangles.size()));
+        updateMeshStatus();
     } else {
         if (mesh_)
             qualityLabel_->setText(tr("Netz Rev. %1 · veraltet").arg(meshRevision_));
@@ -2763,7 +2957,11 @@ void MainWindow::acceptCadSnapshot(std::shared_ptr<const CadSnapshot> snapshot) 
     updateDisplay();
     if (newDocument)
         viewport_->fitView();
-    if (cadSnapshot_->hasUnresolvedAssignments())
+    const auto currentRegions = simulationDock_->archive().settings.acousticRegions;
+    if (std::any_of(currentRegions.begin(), currentRegions.end(),
+                    [](const auto &region) { return region.needsAssignmentReview; }))
+        setDiagnostic(tr("Gebietszuordnungen nach CAD-Änderung prüfen."), true);
+    else if (cadSnapshot_->hasUnresolvedAssignments())
         setDiagnostic(tr("Flächenzuordnungen prüfen."), true);
     else if (!sizingError.isEmpty())
         setDiagnostic(sizingError, true);
@@ -3010,8 +3208,14 @@ void MainWindow::configureLemFaces() {
     if (preview_)
         for (const auto &triangle : preview_->triangles)
             groups.emplace(triangle.faceId, triangle.boundary);
-    const auto baffle = simulationDock_->archive().settings.infiniteBaffle;
+    const auto simulationState = simulationDock_->archive();
+    const auto baffle = simulationState.settings.infiniteBaffle;
+    std::set<std::uint32_t> bemInterfaces;
+    for (const auto &region : simulationState.settings.acousticRegions)
+        bemInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
     for (const auto &[id, boundary] : groups) {
+        if (bemInterfaces.contains(id))
+            continue;
         const bool aperture =
             baffle && std::find(baffle->apertureFaceIds.begin(), baffle->apertureFaceIds.end(),
                                 id) != baffle->apertureFaceIds.end();
@@ -3041,29 +3245,118 @@ void MainWindow::updateInterfacePresentation() {
         needsReview |= port.needsAssignmentReview;
     }
     cadDock_->setInterfaceFaces(interfaces, lemEditor_->couplingEnabled());
+    std::set<std::uint32_t> beInterfaces;
+    for (const auto &region : simulationDock_->archive().settings.acousticRegions)
+        beInterfaces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+    cadDock_->setBemInterfaceFaces(beInterfaces);
     if (cadMode()) {
         while (facesItem_->childCount())
             delete facesItem_->takeChild(0);
-        std::size_t driven = 0, virtualFaces = 0;
+        std::size_t driven = 0, virtualFaces = 0, beFaces = 0;
         if (cadSnapshot_)
             for (const auto &face : cadSnapshot_->faces) {
-                driven += face.boundary == BoundaryCondition::driven;
-                virtualFaces +=
-                    interfaces.contains(face.id) && face.boundary == BoundaryCondition::wall;
+                beFaces += beInterfaces.contains(face.id);
+                driven +=
+                    face.boundary == BoundaryCondition::driven && !beInterfaces.contains(face.id);
+                virtualFaces += interfaces.contains(face.id) && !beInterfaces.contains(face.id) &&
+                                face.boundary == BoundaryCondition::wall;
             }
         const auto count = cadSnapshot_ ? cadSnapshot_->faces.size() : 0;
-        new QTreeWidgetItem(facesItem_, {tr("%1 Wall").arg(count - driven - virtualFaces)});
+        new QTreeWidgetItem(facesItem_,
+                            {tr("%1 Wall").arg(count - driven - virtualFaces - beFaces)});
         new QTreeWidgetItem(facesItem_, {tr("%1 Driven").arg(driven)});
         if (virtualFaces)
             new QTreeWidgetItem(
                 facesItem_, {tr("%1 Interface ↔ LEM%2")
                                  .arg(virtualFaces)
                                  .arg(lemEditor_->couplingEnabled() ? QString{} : tr(" · aus"))});
+        if (beFaces)
+            new QTreeWidgetItem(facesItem_, {tr("%1 Interface ↔ BEM").arg(beFaces)});
         if (needsReview)
             new QTreeWidgetItem(facesItem_, {tr("BEM↔LEM-Zuordnung prüfen")});
     }
 }
 
+void MainWindow::updateAcousticDomainDisplay(const SimulationArchive &archive) {
+    const auto &regions = archive.settings.acousticRegions;
+    const bool computed = archive.current && archive.revision == revision_ && archive.mesh &&
+                          archive.request && archive.request->subdomains;
+    std::set<std::uint32_t> faces;
+    bool review = false;
+    for (const auto &region : regions) {
+        faces.insert(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end());
+        review |= region.needsAssignmentReview;
+    }
+    const auto source =
+        computed
+            ? archive.mesh
+            : (geometryRevision_ == revision_ && !review && !faces.empty()
+                   ? (representation_->currentIndex() == 1 && mesh_ && meshRevision_ == revision_
+                          ? std::shared_ptr<const SurfaceMesh>(mesh_, &mesh_->mesh)
+                          : preview_)
+                   : nullptr);
+    const bool changed = source != interfaceOverlaySource_ ||
+                         computed != interfaceOverlayFromResult_ ||
+                         faces != interfaceOverlayFaceIds_ || displayedAcousticRegions_ != regions;
+    if (changed) {
+        interfaceOverlaySource_ = source;
+        interfaceOverlayFromResult_ = computed;
+        interfaceOverlayFaceIds_ = faces;
+        displayedAcousticRegions_ = regions;
+        interfaceOverlay_.reset();
+        if (source) {
+            auto overlay = std::make_shared<SurfaceMesh>();
+            overlay->vertices = source->vertices;
+            if (computed) {
+                for (const auto &interface : archive.request->subdomains->interfaces)
+                    for (const auto triangle : interface.triangleIndices)
+                        overlay->triangles.push_back(source->triangles.at(triangle));
+            } else {
+                for (const auto &triangle : source->triangles)
+                    if (faces.contains(triangle.faceId))
+                        overlay->triangles.push_back(triangle);
+            }
+            if (!overlay->triangles.empty())
+                interfaceOverlay_ = std::move(overlay);
+        }
+        while (domainsItem_->childCount())
+            delete domainsItem_->takeChild(0);
+        domainsItem_->setHidden(regions.empty());
+        if (computed) {
+            const auto &model = *archive.request->subdomains;
+            for (const auto &domain : model.domains)
+                new QTreeWidgetItem(domainsItem_, {tr("%1 · %2 · ID %3")
+                                                       .arg(QString::fromStdString(domain.name))
+                                                       .arg(domain.kind == BemDomainKind::interior
+                                                                ? tr("Innenraum")
+                                                                : tr("Außenraum"))
+                                                       .arg(domain.id)});
+            for (const auto &interface : model.interfaces)
+                new QTreeWidgetItem(domainsItem_, {tr("%1 · %2 ↔ %3")
+                                                       .arg(QString::fromStdString(interface.name))
+                                                       .arg(interface.firstDomainId)
+                                                       .arg(interface.secondDomainId)});
+        } else {
+            for (const auto &region : regions) {
+                auto *item = new QTreeWidgetItem(
+                    domainsItem_, {QString::fromStdString(region.name) +
+                                   (region.needsAssignmentReview ? tr(" · Zuordnung prüfen")
+                                                                 : tr(" · noch nicht gerechnet"))});
+                QStringList physical, interfaces;
+                for (auto id : region.faceIds)
+                    physical << QString::number(id);
+                for (auto id : region.interfaceFaceIds)
+                    interfaces << QString::number(id);
+                new QTreeWidgetItem(item, {tr("Wall / Driven: %1").arg(physical.join(", "))});
+                if (!interfaces.empty())
+                    new QTreeWidgetItem(item, {tr("Interface: %1").arg(interfaces.join(", "))});
+            }
+        }
+        domainsItem_->setExpanded(true);
+    }
+    viewport_->setInterfaceMesh(interfaceOverlay_);
+    viewport_->setInterfaceVisible(showInterfaces_->isChecked());
+}
 void MainWindow::configureSimulation() {
     // Changes of the derived source frame are not user edits. In particular,
     // the first generated model must not dirty an untouched new project.
@@ -3084,25 +3377,38 @@ void MainWindow::configureSimulation() {
             std::complex<double> velocity{1, 0};
             if (face >= assemblyCadFaceOffset && cadSnapshot_) {
                 const auto local = face - assemblyCadFaceOffset;
-                const auto found = std::find_if(cadSnapshot_->faces.begin(), cadSnapshot_->faces.end(),
-                    [local](const auto &f) { return f.id == local; });
-                if (found != cadSnapshot_->faces.end()) velocity = found->normalVelocity;
+                const auto found =
+                    std::find_if(cadSnapshot_->faces.begin(), cadSnapshot_->faces.end(),
+                                 [local](const auto &f) { return f.id == local; });
+                if (found != cadSnapshot_->faces.end())
+                    velocity = found->normalVelocity;
             }
             velocities.push_back({face, velocity});
         }
+    }
+    {
+        const auto settings = meshPanel_->inputSettings();
+        MeshingOptions options;
+        options.targetEdgeLength = settings.targetEdgeLength;
+        options.adaptive = settings.adaptive;
+        options.quality = settings.quality;
+        options.faceTargetEdgeLengths = activeFaceTargets();
+        simulationDock_->setPartitionMeshingOptions(std::move(options));
     }
     simulationDock_->setMesh(currentGeometry && meshReady()
                                  ? std::shared_ptr<const SurfaceMesh>(mesh_, &mesh_->mesh)
                                  : nullptr,
                              revision_, std::move(velocities));
-    simulationDock_->setGeometrySource(currentGeometry && !cadMode() && !isPlacedAssembly(assembly_) ? geometry_ : nullptr,
-                                       currentGeometry && cadMode() ? cadSnapshot_ : nullptr,
-                                       revision_, activeFaceTargets(), activeReversedFaces());
+    simulationDock_->setGeometrySource(
+        currentGeometry && !cadMode() && !isPlacedAssembly(assembly_) ? geometry_ : nullptr,
+        currentGeometry && cadMode() ? cadSnapshot_ : nullptr, revision_, activeFaceTargets(),
+        activeReversedFaces());
     if (!currentGeometry)
         return;
     // The source frame remains separate from a user-defined observation frame.
     if (cadMode())
-        simulationDock_->setAcousticAxis(cadSnapshot_->acousticOrigin, cadSnapshot_->acousticAxis, true);
+        simulationDock_->setAcousticAxis(cadSnapshot_->acousticOrigin, cadSnapshot_->acousticAxis,
+                                         true);
     else {
         const auto frame = assemblyAcousticFrame(assembly_, geometry_->length());
         simulationDock_->setAcousticAxis(frame.origin, frame.forward, true);
@@ -3148,18 +3454,17 @@ void MainWindow::setSimulationView(const QString &view) {
         panel->show();
         panel->raise();
         resizeDocks({panel}, {height() * 3 / 5}, Qt::Vertical);
-        QTimer::singleShot(0, lemEditor_, [this] {
-            lemEditor_->findChild<QPushButton *>("lemFit")->click();
-        });
+        QTimer::singleShot(0, lemEditor_,
+                           [this] { lemEditor_->findChild<QPushButton *>("lemFit")->click(); });
         return;
     }
     const auto target = view == "frequency" ? "acousticOnAxis"
-                      : view == "polar"   ? "acousticPolarH"
-                      : view == "isobar"  ? "acousticIsobarH"
-                      : view == "angular" ? "angularResponses"
-                      : view == "phase"   ? "phaseResponses"
-                      : view == "field"   ? "acousticField"
-                                          : nullptr;
+                        : view == "polar"   ? "acousticPolarH"
+                        : view == "isobar"  ? "acousticIsobarH"
+                        : view == "angular" ? "angularResponses"
+                        : view == "phase"   ? "phaseResponses"
+                        : view == "field"   ? "acousticField"
+                                            : nullptr;
     if (!target)
         throw std::invalid_argument("Unbekannte Ergebnisansicht.");
     if (view == "field") {
@@ -3183,9 +3488,11 @@ void MainWindow::setSimulationView(const QString &view) {
     simulationDock_->revealResultView();
     // Explicitly opening an acoustic view should give the result room; the
     // native dock layout still respects the viewport and side-dock limits.
-    resizeDocks({simulationDock_}, {view == "field" ? std::clamp(height() * 32 / 100, 200, 280)
-                                                  : height() * 3 / 5}, Qt::Vertical);
-    if (view == "field") fieldVisibility_->setChecked(true);
+    resizeDocks({simulationDock_},
+                {view == "field" ? std::clamp(height() * 32 / 100, 200, 280) : height() * 3 / 5},
+                Qt::Vertical);
+    if (view == "field")
+        fieldVisibility_->setChecked(true);
 }
 void MainWindow::requestFieldEvaluation() {
     simulationDock_->requestFieldEvaluation();
@@ -3601,6 +3908,7 @@ EditState MainWindow::editState() const {
     state.cadReversedFaceIds = cadReversedFaceIds_;
     state.couplingNetwork = lemEditor_->network();
     state.couplingEnabled = lemEditor_->couplingEnabled();
+    state.acousticRegions = simulationDock_->archive().settings.acousticRegions;
     if (const auto cad = cadDock_->snapshot()) {
         state.cad = CadAssignmentState{
             cad->documentId, cad->sessionId, cad->revision, {}, cad->unresolvedPreviousFaces};
@@ -3668,8 +3976,10 @@ void MainWindow::resetEditHistory() {
 }
 void MainWindow::applyEditState(const EditState &state) {
     auto withoutCoupling = editState();
+    const bool regionsChanged = withoutCoupling.acousticRegions != state.acousticRegions;
     withoutCoupling.couplingNetwork = state.couplingNetwork;
     withoutCoupling.couplingEnabled = state.couplingEnabled;
+    withoutCoupling.acousticRegions = state.acousticRegions;
     const bool onlyCoupling = sameEditState(withoutCoupling, state);
     const auto current = cadDock_->snapshot();
     if (state.cad.has_value() != static_cast<bool>(current) ||
@@ -3689,8 +3999,11 @@ void MainWindow::applyEditState(const EditState &state) {
         lemEditor_->setCouplingEnabled(state.couplingEnabled);
     }
     simulationDock_->setCoupling(state.couplingNetwork, state.couplingEnabled);
+    simulationDock_->setAcousticRegions(state.acousticRegions);
     updateInterfacePresentation();
     if (onlyCoupling) {
+        if (gmsh_ && regionsChanged)
+            meshingChanged();
         markDirty();
         historyState_ = state;
         historyReady_ = true;
@@ -3780,9 +4093,9 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event) {
                     field = field->parentWidget();
                 if (field && field != this) {
                     QWhatsThis::showText(field->mapToGlobal(QPoint(0, field->height())),
-                                        field->whatsThis().isEmpty() ? field->toolTip()
-                                                                    : field->whatsThis(),
-                                        field);
+                                         field->whatsThis().isEmpty() ? field->toolTip()
+                                                                      : field->whatsThis(),
+                                         field);
                     return true;
                 }
             }

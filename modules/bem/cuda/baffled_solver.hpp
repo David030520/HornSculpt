@@ -69,7 +69,7 @@ class BaffledPlanCache {
             return {entry_->plan, 0, true};
         const auto start = std::chrono::steady_clock::now();
         auto plan = std::make_shared<const galerkin::InteractionPlan>(
-            galerkin::makeInteractionPlan(space, settings, maximumWavenumber, stop, 0, testPanels));
+            galerkin::makeInteractionPlan(space, settings, maximumWavenumber, stop, 0, std::size_t{1024} * 1024 * 1024, testPanels));
         const double milliseconds =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();

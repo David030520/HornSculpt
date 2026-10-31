@@ -24,7 +24,7 @@ struct NearInteraction {
 struct InteractionPlan {
     // Ordered (test,trial), including self and both directions of touching pairs.
     std::vector<TouchingInteraction> touching;
-    // Ordered (test,trial), disjoint pairs satisfying isNearPair only.
+    // Ordered disjoint pairs: explicit geometric near OR not qualified regular.
     std::vector<NearInteraction> near;
     std::vector<PairQuadraturePatch> patches;
     // Exact near membership: nearTrials[nearOffsets[t]..nearOffsets[t+1]) is
@@ -40,11 +40,12 @@ struct InteractionPlan {
 // is deterministic across worker counts. Cancellation is checked between pairs
 // and during indexing; quadrature failures propagate without a coarser fallback.
 // maximumThreads=0 uses at most eight hardware threads; explicit values are also
-// capped at eight. nearDistanceRatio=0 builds touching interactions only.
-// A nonempty testPanels list restricts target rows without changing source
-// integration. This is used for one sector of the explicit rotational space.
+// capped at eight. nearDistanceRatio=0 disables geometric correction only;
+// numerical regular qualification still applies. The payload budget includes
+// candidates, retained patches and bounded concurrent adaptive workspaces.
 InteractionPlan makeInteractionPlan(const Space &space, const PairQuadratureSettings &settings,
                                     double maximumWavenumber, std::stop_token stop = {},
                                     unsigned maximumThreads = 0,
+                                    std::size_t maximumHostBytes = std::size_t{1024} * 1024 * 1024,
                                     std::span<const std::uint32_t> testPanels = {});
 } // namespace hornsculpt::galerkin

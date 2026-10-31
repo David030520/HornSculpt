@@ -1,0 +1,22 @@
+# External numerical reference; pinned BEAT CUDA P1/DP0 Burton-Miller Float64/ComplexF64 LU.
+# BEAT commit: 96cb77e5eb5b8c15c6bbf50b73c4737028ab6cea
+# Engine archive SHA256: 8d44fc6b78a0746dc6f5a47ce765a79d39732317fa47737eeebf0d0705d8cb57
+# Source/project manifest SHA256: b87d277c8110b8d5c7c8b74e41821cc1f132ac156268dfdc2c920caa124d247f
+# External adapter SHA256: 168b1bd4f4f4a48602d9c76be61372254d52204f59d4e50be5802b4b9acd891c
+# Input SHA256: bf4fdd910fd207d544294d6e3540822b2e800f68982f0ed5ebc106e8a7e3ad52
+# Singular12 result SHA256: 7e0371d311e028ecb6a9619621a9e1467292f1715c225f57b45602a216e1d71e
+# Singular10 result SHA256: 6e85a36d2abe75535f706d7bdf1c0e4bd40ef8c807d795889692a7a39c2e3413
+# Regular4 (6 points), singular12; all16 ordered panel pairs touch; no disjoint Near cache.
+# Closed outward scalene tetra: SI vertices (0,0,0),(.2,0,0),(.03,.14,0),(.02,.025,.09).
+# Triangles/tags: (0,2,1)/50, (0,1,3)/51 Driven; (0,3,2)/52, (1,2,3)/53 Wall.
+# frequency400Hz, rho1.21kg/m3, c343m/s, exp(+iwt), outgoing exp(-ikr), RMS outward velocity.
+# uniform: Face50/51 +1/+1m/s; antisymmetric: +1/-1m/s. Each port uses its own Q, never net Q.
+# Singular10->12 max relative complex port change9.01888690415e-8; max phase3.49206816388e-6deg.
+# Singular12 original L2 residuals1.5977340934970642e-16,2.377524979354357e-16.
+# Singular12 infinity backward errors8.471302188593021e-17,9.87075891499268e-17.
+# Port means are exact P1 surface averages; no observer-field golden values or field convergence claim.
+# excitation,face_id,area_m2,Q_real_m3_s,Q_imag_m3_s,p_real_Pa,p_imag_Pa,Z_real_Pa_s_m3,Z_imag_Pa_s_m3
+uniform,50,0.014000000000000002,0.014000000000000002,0,41.52075847287964,112.71241236321991,2965.768462348545,8050.88659737285
+uniform,51,0.009340770846134702,0.009340770846134702,0,40.69802735257169,102.29112790249444,4357.030915645781,10951.03708114448
+antisymmetric,50,0.014000000000000002,0.014000000000000002,0,16.94631778751471,60.01384624710891,1210.451270536765,4286.703303364921
+antisymmetric,51,0.009340770846134702,-0.009340770846134702,0,-6.040949172753433,-20.819626558775216,646.7291910124563,2228.898117909677

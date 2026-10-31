@@ -1,6 +1,12 @@
 #pragma once
 
+#include <array>
+#include <complex>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <span>
 #include <stop_token>
 #include <vector>
 
@@ -226,6 +232,9 @@ struct PairQuadratureSettings {
     double nearDistanceRatio{1.0}; // Zero explicitly disables near correction for diagnostics.
     double relativeTolerance{1e-5};
     unsigned maximumSubdivisionDepth{8};
+    // Owned vector payloads, including transient old+new capacity during growth.
+    // Shared immutable rule tables and stack/allocator bookkeeping are excluded.
+    std::size_t maximumWorkspaceBytes{std::numeric_limits<std::size_t>::max()};
 };
 
 struct PairQuadratureRule {
@@ -235,16 +244,68 @@ struct PairQuadratureRule {
     std::vector<PairQuadraturePatch> patches;
     double estimatedRelativeError{-1.0}; // Negative means no embedded estimate (far/singular rule).
     unsigned maximumDepth{};
+    std::size_t peakWorkspaceBytes{};
 };
+
+struct PairPatchEstimate {
+    std::array<std::complex<double>, 36> integral{};
+    double absoluteError{}, innerError{}, outerError{};
+};
+
+// A shared, single-threaded bound for concurrently advancing adaptive pairs.
+// Payload reservations include transient vector growth; allocator bookkeeping
+// and immutable quadrature tables are excluded. No pair owns an unbounded pool.
+class AdaptiveQuadratureWorkspace {
+  public:
+    explicit AdaptiveQuadratureWorkspace(std::size_t maximumBytes);
+    void acquire(std::size_t bytes);
+    void release(std::size_t bytes) noexcept;
+    std::size_t liveBytes() const noexcept;
+    std::size_t peakBytes() const noexcept;
+
+  private:
+    std::size_t maximum_, live_{}, peak_{};
+};
+
+// One identical largest-error state machine is driven by either CPU estimates
+// (dense integration/reference) or batched CUDA estimates (support near build).
+// A commit supplies all currently requested patches in their original order.
+// The stopping norm is the sum of leaf errors relative to the complete 36-
+// moment integral, with the original .2 safety factor and depth/patch limits.
+class AdaptivePairQuadratureState {
+  public:
+    AdaptivePairQuadratureState(const Panel &test, const Panel &trial,
+                                const PairQuadratureSettings &settings, double wavenumber,
+                                AdaptiveQuadratureWorkspace &workspace, std::stop_token stop = {});
+    ~AdaptivePairQuadratureState();
+    AdaptivePairQuadratureState(const AdaptivePairQuadratureState &) = delete;
+    AdaptivePairQuadratureState &operator=(const AdaptivePairQuadratureState &) = delete;
+    std::span<const PairQuadraturePatch> requests() const noexcept;
+    void commit(std::span<const PairPatchEstimate> estimates);
+    bool done() const noexcept;
+    const PairQuadratureRule &result() const;
+    PairQuadratureRule takeResult();
+
+  private:
+    struct Implementation;
+    std::unique_ptr<Implementation> impl_;
+};
+
+PairPatchEstimate estimatePairPatchCpu(const Panel &test, const Panel &trial,
+                                       const PairQuadraturePatch &patch, double wavenumber,
+                                       std::stop_token stop = {});
 
 // Returns points in each panel's ORIGINAL local vertex order. Near-disjoint
 // pairs use embedded degree-6/8 comparisons for G and its gradient. The sum of
 // patch errors is controlled relative to the complete pair integral; refinement
 // targets the largest remaining contribution. At the spatial depth limit,
 // degree-12/14 estimates can promote individual leaves. Unresolved limits fail.
+// forceAdaptive bypasses the geometric-far shortcut for pairs that fail a
+// separate frequency-dependent regular-quadrature qualification.
 PairQuadratureRule makePairQuadrature(const Panel &test, const Panel &trial,
                                       const PairQuadratureSettings &settings = {},
-                                      double wavenumber = 0.0, std::stop_token stop = {});
+                                      double wavenumber = 0.0, std::stop_token stop = {},
+                                      bool forceAdaptive = false);
 } // namespace hornsculpt::galerkin
 
 #undef HS_QUAD_HD

@@ -41,6 +41,74 @@ void require(bool condition, const char *message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+QJsonObject preWidebandArchive(QJsonObject root, unsigned version) {
+    root.insert("version", int(version));
+    if (version < 15)
+        root.remove("comparisonSnapshots");
+    if (version < 13)
+        root.remove("slot");
+    auto simulation = root["simulation"].toObject();
+    const auto historicalSettings = [](QJsonObject settings) {
+        auto fmm = settings["fastMultipole"].toObject();
+        if (!fmm.isEmpty()) {
+            fmm.remove("preconditioner_block_width");
+            fmm.insert("leafPanelCapacity", fmm.take("leaf_support_capacity"));
+            fmm.insert("interpolationOrder", 6);
+            settings.insert("fastMultipole", fmm);
+        }
+        return settings;
+    };
+    simulation.insert("settings", historicalSettings(simulation["settings"].toObject()));
+    auto request = simulation["request"].toObject();
+    if (!request.isEmpty()) {
+        request.insert("numerics", historicalSettings(request["numerics"].toObject()));
+        simulation.insert("request", request);
+    }
+    root.insert("simulation", simulation);
+    auto result = simulation["result"].toObject();
+    if (result.isEmpty())
+        return root;
+    result.remove("liveDeviceBytes");
+    auto frequencies = result["frequencies"].toArray();
+    for (qsizetype i = 0; i < frequencies.size(); ++i) {
+        auto f = frequencies[i].toObject();
+        auto stats = f["fastMultipole"].toObject();
+        if (!stats.isEmpty()) {
+            const auto history = stats["historicalChebyshevStatistics"].toObject();
+            for (const auto *name :
+                 {"pressurePressureNearPairs", "pressurePressureFarPairs", "pressureFluxNearPairs",
+                  "pressureFluxFarPairs", "historicalChebyshevStatistics", "graphExecution"})
+                stats.remove(name);
+            stats.insert("directPanelPairCount",
+                         history.isEmpty() ? QJsonValue("0") : history["directPanelPairCount"]);
+            stats.insert("representedFarPanelPairs",
+                         history.isEmpty() ? QJsonValue("0") : history["representedFarPanelPairs"]);
+            f.insert("fastMultipole", stats);
+        }
+        auto excitations = f["excitations"].toArray();
+        for (qsizetype j = 0; j < excitations.size(); ++j) {
+            auto e = excitations[j].toObject();
+            const auto history = e["historicalChebyshevEvidence"].toObject();
+            for (const auto *name :
+                 {"fastMultipoleAccuracySeed", "fastMultipoleComparisonAccuracySeed",
+                  "fastMultipoleVerificationAccuracySeed", "fastMultipoleAccuracyRefinements",
+                  "fastMultipoleComparisonLevels", "fastMultipoleVerificationLevels",
+                  "historicalChebyshevEvidence", "quadratureEvidence", "fastMultipoleKrylovTarget"})
+                e.remove(name);
+            e.insert("fastMultipoleComparisonOrder",
+                     history.isEmpty() ? QJsonValue(0) : history["comparisonOrder"]);
+            e.insert("fastMultipoleAuditOrder",
+                     history.isEmpty() ? QJsonValue(0) : history["auditOrder"]);
+            excitations[j] = e;
+        }
+        f.insert("excitations", excitations);
+        frequencies[i] = f;
+    }
+    result.insert("frequencies", frequencies);
+    simulation.insert("result", result);
+    root.insert("simulation", simulation);
+    return root;
+}
 void close(double actual, double expected, const char *message) {
     require(std::isfinite(actual) && std::isfinite(expected) &&
                 std::abs(actual - expected) <= 1e-14 * std::max(1.0, std::abs(expected)),
@@ -168,7 +236,7 @@ SimulationArchive syntheticTestArchive(std::shared_ptr<const SurfaceMesh> mesh) 
         frame.fieldMilliseconds = .5;
         for (std::size_t excitation = 0; excitation < request.excitations.size(); ++excitation) {
             BemExcitationResult output;
-    BemBoundaryData boundary;
+            BemBoundaryData boundary;
             output.name = request.excitations[excitation].name;
             output.refinementSteps = 1;
             output.boundaryResidual = 2e-6;
@@ -189,7 +257,7 @@ SimulationArchive syntheticTestArchive(std::shared_ptr<const SurfaceMesh> mesh) 
                 output.impedances.push_back({face.faceId, area, mean, volume, mean / volume});
             }
             output.setBoundary(std::move(boundary));
-    frame.excitations.push_back(std::move(output));
+            frame.excitations.push_back(std::move(output));
         }
         result->frequencies.push_back(std::move(frame));
     }
@@ -283,6 +351,7 @@ void sameSettings(const SimulationSettings &a, const SimulationSettings &b) {
     require(a.acceleration == b.acceleration && a.fastMultipole == b.fastMultipole,
             "Fast Multipole settings changed");
     require(a.nearMaximumDepth == b.nearMaximumDepth, "Near quadrature depth changed");
+    require(a.singularOrder == b.singularOrder, "Singular quadrature order changed");
     close(a.minimumFrequency, b.minimumFrequency, "Minimum frequency changed");
     close(a.maximumFrequency, b.maximumFrequency, "Maximum frequency changed");
     require(a.frequencyCount == b.frequencyCount, "Frequency count changed");
@@ -521,7 +590,7 @@ void sameResult(const BemResult &a, const BemResult &b) {
     require(a.acceleration == b.acceleration, "BEM backend identity changed");
     require(a.device == b.device && a.triangleCount == b.triangleCount &&
                 a.pressureDofCount == b.pressureDofCount &&
-                a.peakDeviceBytes == b.peakDeviceBytes &&
+                a.peakDeviceBytes == b.peakDeviceBytes && a.liveDeviceBytes == b.liveDeviceBytes &&
                 a.frequencies.size() == b.frequencies.size(),
             "BEM result metadata changed");
     for (std::size_t index = 0; index < a.frequencies.size(); ++index) {
@@ -540,21 +609,63 @@ void sameResult(const BemResult &a, const BemResult &b) {
         require(x.fastMultipole.nodeCount == y.fastMultipole.nodeCount &&
                     x.fastMultipole.leafCount == y.fastMultipole.leafCount &&
                     x.fastMultipole.farInteractionCount == y.fastMultipole.farInteractionCount &&
-                    x.fastMultipole.directPanelPairCount == y.fastMultipole.directPanelPairCount &&
-                    x.fastMultipole.representedFarPanelPairs ==
-                        y.fastMultipole.representedFarPanelPairs,
+                    x.fastMultipole.pressurePressureNearPairs ==
+                        y.fastMultipole.pressurePressureNearPairs &&
+                    x.fastMultipole.pressurePressureFarPairs ==
+                        y.fastMultipole.pressurePressureFarPairs &&
+                    x.fastMultipole.pressureFluxNearPairs ==
+                        y.fastMultipole.pressureFluxNearPairs &&
+                    x.fastMultipole.pressureFluxFarPairs == y.fastMultipole.pressureFluxFarPairs &&
+                    x.fastMultipole.historicalChebyshevStatistics ==
+                        y.fastMultipole.historicalChebyshevStatistics &&
+                    x.fastMultipole.graphExecution == y.fastMultipole.graphExecution,
                 "Fast Multipole hierarchy diagnostics changed");
         require(x.excitations.size() == y.excitations.size(), "Result RHS count changed");
         for (std::size_t excitation = 0; excitation < x.excitations.size(); ++excitation) {
             const auto &u = x.excitations[excitation], &v = y.excitations[excitation];
             require(u.name == v.name && u.refinementSteps == v.refinementSteps &&
-                        u.iterations == v.iterations && u.boundary()->surfacePressure == v.boundary()->surfacePressure &&
+                        u.iterations == v.iterations &&
+                        u.boundary()->surfacePressure == v.boundary()->surfacePressure &&
                         u.observerPressure == v.observerPressure &&
                         u.boundary()->pressureTrace == v.boundary()->pressureTrace &&
                         u.boundary()->normalDerivative == v.boundary()->normalDerivative &&
                         u.impedances.size() == v.impedances.size(),
                     "Complex pressure result changed");
-            close(u.boundaryResidual, v.boundaryResidual, "Original residual changed");
+            close(u.boundaryResidual, v.boundaryResidual, "Boundary residual changed");
+            require(u.residualEvaluation == v.residualEvaluation,
+                    "Residual evaluation metadata changed");
+            close(u.fastMultipoleKrylovResidual, v.fastMultipoleKrylovResidual,
+                  "Krylov residual changed");
+            close(u.fastMultipoleKrylovTarget, v.fastMultipoleKrylovTarget,
+                  "Configured inner Krylov target changed");
+            close(u.fastMultipoleOperatorDiscrepancy, v.fastMultipoleOperatorDiscrepancy,
+                  "Operator discrepancy changed");
+            require(u.historicalChebyshevEvidence == v.historicalChebyshevEvidence &&
+                        u.fastMultipoleComparisonLevels == v.fastMultipoleComparisonLevels &&
+                        u.fastMultipoleVerificationLevels == v.fastMultipoleVerificationLevels &&
+                        u.fastMultipoleAccuracyRefinements == v.fastMultipoleAccuracyRefinements,
+                    "Automatic level evidence or historical provenance changed");
+            close(u.fastMultipoleAccuracySeed, v.fastMultipoleAccuracySeed,
+                  "Accuracy seed changed");
+            close(u.fastMultipoleComparisonAccuracySeed, v.fastMultipoleComparisonAccuracySeed,
+                  "Comparison seed changed");
+            close(u.fastMultipoleVerificationAccuracySeed, v.fastMultipoleVerificationAccuracySeed,
+                  "Verification seed changed");
+            require(u.farQuadratureComparisonDegree == v.farQuadratureComparisonDegree &&
+                        u.farQuadratureVerificationDegree == v.farQuadratureVerificationDegree &&
+                        u.farQuadratureRefinements == v.farQuadratureRefinements &&
+                        u.fieldQuadratureComparisonDegree == v.fieldQuadratureComparisonDegree &&
+                        u.fieldQuadratureVerificationDegree == v.fieldQuadratureVerificationDegree,
+                    "Quadrature-rule evidence changed");
+            for (const auto [before, after] :
+                 {std::pair{u.farQuadratureDiscrepancy, v.farQuadratureDiscrepancy},
+                  std::pair{u.farQuadraturePreparationMilliseconds,
+                            v.farQuadraturePreparationMilliseconds},
+                  std::pair{u.farQuadraturePressureMilliseconds,
+                            v.farQuadraturePressureMilliseconds},
+                  std::pair{u.farQuadratureFluxMilliseconds, v.farQuadratureFluxMilliseconds},
+                  std::pair{u.fieldQuadratureDiscrepancy, v.fieldQuadratureDiscrepancy}})
+                close(before, after, "Quadrature comparison metric changed");
             require(bool(u.lemSolution) == bool(v.lemSolution) &&
                         u.solvedVelocities.size() == v.solvedVelocities.size(),
                     "Coupled solution or physical velocity data disappeared");
@@ -671,7 +782,8 @@ void roundTripTests(const QTemporaryDir &directory) {
         writeProject(path, project);
         const auto restoredCurrent = readProject(path);
         sameProject(restoredCurrent, project);
-        require(restoredCurrent.simulation.current && restoredCurrent.simulation.resultComplete == std::optional{true},
+        require(restoredCurrent.simulation.current &&
+                    restoredCurrent.simulation.resultComplete == std::optional{true},
                 "A legacy current archive was not recognized as a completed solve");
         const auto root = QJsonDocument::fromJson(bytes(path)).object();
         require(root.value("revision").isString() && root.value("geometryRevision").isString() &&
@@ -681,6 +793,45 @@ void roundTripTests(const QTemporaryDir &directory) {
                 "Revision above 2^53 lost precision in the file");
     }
 
+    {
+        auto project = fullTestProject(ProjectSource::draft);
+        project.simulation.current = false;
+        project.simulation.settings.acousticRegions = {{7, "Kammer", {1, 2}, {4}},
+                                                       {8, "Hals", {3}, {4}}};
+        const auto path = directory.filePath("regions.json");
+        writeProject(path, project);
+        require(readProject(path).simulation.settings.acousticRegions ==
+                    project.simulation.settings.acousticRegions,
+                "Acoustic region definitions did not survive project round trip");
+    }
+    {
+        auto previous = *testCad(testMesh());
+        auto current = previous;
+        const auto id = previous.faces.front().id;
+        std::vector<AcousticRegionDefinition> regions{{7, "Innen", {id}, {}, false}};
+        require(!reconciledCadAcousticRegions(regions, &previous, &current)
+                     .front()
+                     .needsAssignmentReview,
+                "Stable CAD region was flagged for review");
+        current.documentId += "-different";
+        const auto changed = reconciledCadAcousticRegions(regions, &previous, &current);
+        require(changed.front().needsAssignmentReview &&
+                    changed.front().faceIds == regions.front().faceIds,
+                "Document change silently reused a region face ID");
+        current = previous;
+        current.faces.clear();
+        require(reconciledCadAcousticRegions(regions, &previous, &current)
+                    .front()
+                    .needsAssignmentReview,
+                "Missing CAD region face was accepted");
+        auto project = fullTestProject(ProjectSource::draft);
+        project.simulation.current = false;
+        project.simulation.settings.acousticRegions = changed;
+        const auto path = directory.filePath("regions-review.json");
+        writeProject(path, project);
+        require(readProject(path).simulation.settings.acousticRegions.front().needsAssignmentReview,
+                "CAD region review obligation did not survive project round trip");
+    }
     auto stale = fullTestProject(ProjectSource::freecad);
     stale.revision += 3;
     stale.geometryRevision = stale.meshRevision = stale.revision;
@@ -701,7 +852,8 @@ void roundTripTests(const QTemporaryDir &directory) {
     for (const auto complete : {false, true}) {
         auto tagged = stale;
         tagged.simulation.resultComplete = complete;
-        const auto taggedPath = directory.filePath(complete ? "complete-result.json" : "partial-result.json");
+        const auto taggedPath =
+            directory.filePath(complete ? "complete-result.json" : "partial-result.json");
         writeProject(taggedPath, tagged);
         require(readProject(taggedPath).simulation.resultComplete == std::optional{complete},
                 "Result completeness was not preserved in the archive");
@@ -710,8 +862,9 @@ void roundTripTests(const QTemporaryDir &directory) {
             "A legacy stale result without completeness metadata was guessed complete or partial");
     auto invalidComplete = fullTestProject(ProjectSource::freecad);
     invalidComplete.simulation.resultComplete = false;
-    expectRejected([&] { writeProject(directory.filePath("invalid-partial.json"), invalidComplete); },
-                   "An incomplete result was marked current");
+    expectRejected(
+        [&] { writeProject(directory.filePath("invalid-partial.json"), invalidComplete); },
+        "An incomplete result was marked current");
 
     auto pending = stale;
     pending.simulation.settings.normalizeToOnAxis = false;
@@ -769,7 +922,7 @@ Project coupledTestProject(bool silent) {
         BemFrequencyResult frame;
         frame.frequency = frequency;
         BemExcitationResult excitation;
-    BemBoundaryData boundary;
+        BemBoundaryData boundary;
         excitation.name = "LEM";
         excitation.lemSolution = lem::solve(*request.coupling, frequency, load,
                                             {request.medium.density, request.medium.soundSpeed});
@@ -793,7 +946,7 @@ Project coupledTestProject(bool silent) {
                                                  physical.pressure / physical.volumeVelocity});
         }
         excitation.setBoundary(std::move(boundary));
-    frame.excitations.push_back(std::move(excitation));
+        frame.excitations.push_back(std::move(excitation));
         result->frequencies.push_back(std::move(frame));
     }
     archive.result = result;
@@ -1570,7 +1723,7 @@ void exactCadRoundTrip(const QTemporaryDir &directory) {
         expectRejected([&] { (void)readProject(damaged); },
                        "Corrupt exact CAD geometry or face binding was accepted");
     }
-    auto legacy = original;
+    auto legacy = preWidebandArchive(original, 6);
     legacy.remove("draftReversedFaces");
     legacy.remove("cadReversedFaces");
     legacy.insert("version", 6);
@@ -1610,7 +1763,7 @@ void farFieldRoundTrip(const QTemporaryDir &directory) {
         expectRejected([&] { (void)readProject(damaged); },
                        "Invalid far-field request was accepted");
     }
-    auto legacy = json;
+    auto legacy = preWidebandArchive(json, 7);
     legacy.remove("draftReversedFaces");
     legacy.remove("cadReversedFaces");
     legacy.insert("version", 7);
@@ -1775,7 +1928,8 @@ void angularResponsesRoundTrip(const QTemporaryDir &directory) {
 
     auto oldFieldSettings = settings;
     auto oldField = oldFieldSettings["fieldDisplay"].toObject();
-    oldField.remove("frequencyHz"); oldField.remove("excitationIndex");
+    oldField.remove("frequencyHz");
+    oldField.remove("excitationIndex");
     oldFieldSettings.insert("fieldDisplay", oldField);
     oldFieldSettings.remove("ctaExcitationIndex");
     auto oldFieldSimulation = simulation;
@@ -1786,9 +1940,9 @@ void angularResponsesRoundTrip(const QTemporaryDir &directory) {
     saveBytes(oldFieldPath, QJsonDocument(oldFieldProject).toJson());
     const auto oldFieldLoaded = readProject(oldFieldPath);
     require(oldFieldLoaded.simulation.settings.fieldDisplay.frequencyHz == 0 &&
-            oldFieldLoaded.simulation.settings.fieldDisplay.excitationIndex == -1 &&
-            oldFieldLoaded.simulation.settings.ctaExcitationIndex == -1 &&
-            oldFieldLoaded.simulation.current,
+                oldFieldLoaded.simulation.settings.fieldDisplay.excitationIndex == -1 &&
+                oldFieldLoaded.simulation.settings.ctaExcitationIndex == -1 &&
+                oldFieldLoaded.simulation.current,
             "Old project selection fallback damaged the result");
     auto oldSettings = settings;
     oldSettings.remove("angularResponses");
@@ -1912,7 +2066,8 @@ void savedFieldTracesRoundTrip(const QTemporaryDir &directory) {
         for (std::size_t e = 0; e < result->frequencies[f].excitations.size(); ++e) {
             const auto &a = result->frequencies[f].excitations[e];
             const auto &b = restored.simulation.result->frequencies[f].excitations[e];
-            require(a.boundary()->pressureTrace == b.boundary()->pressureTrace && a.boundary()->normalDerivative == b.boundary()->normalDerivative,
+            require(a.boundary()->pressureTrace == b.boundary()->pressureTrace &&
+                        a.boundary()->normalDerivative == b.boundary()->normalDerivative,
                     "Saved P1/DP0 Cauchy traces changed on project reload.");
         }
     auto broken = std::make_shared<BemResult>(*result);
@@ -2002,8 +2157,10 @@ void axisymmetricRoundTrip(const QTemporaryDir &directory) {
     sameProject(restored, project);
     require(!restored.mesh && restored.meshRevision == 0 && restored.simulation.current &&
                 restored.simulation.result->pressureDofCount == 4 &&
-                restored.simulation.result->frequencies[0].excitations[0].boundary()->surfacePressure.size() ==
-                    restored.simulation.mesh->triangles.size(),
+                restored.simulation.result->frequencies[0]
+                        .excitations[0]
+                        .boundary()
+                        ->surfacePressure.size() == restored.simulation.mesh->triangles.size(),
             "2D results require a 3D quality mesh or lost expanded surface fields.");
     const auto continuousCsv = resultCsv(restored.simulation);
     require(continuousCsv.contains("surface_contract=continuousRevolution") &&
@@ -2081,11 +2238,12 @@ void axisymmetricRoundTrip(const QTemporaryDir &directory) {
     require(historicalCsv.contains("surface_contract=triangulatedOrbit") &&
                 historicalCsv.contains("integration_triangles="),
             "Historical polygonal CSV changed its surface interpretation.");
-    require(historical.simulation.request->axisymmetric->surfaceContract ==
-                    AxisymmetricSurfaceContract::triangulatedOrbit &&
-                historical.simulation.result->frequencies[0].excitations[0].boundary()->pressureTrace ==
-                    restored.simulation.result->frequencies[0].excitations[0].boundary()->pressureTrace,
-            "Historical triangular traces were reinterpreted as a continuous revolution.");
+    require(
+        historical.simulation.request->axisymmetric->surfaceContract ==
+                AxisymmetricSurfaceContract::triangulatedOrbit &&
+            historical.simulation.result->frequencies[0].excitations[0].boundary()->pressureTrace ==
+                restored.simulation.result->frequencies[0].excitations[0].boundary()->pressureTrace,
+        "Historical triangular traces were reinterpreted as a continuous revolution.");
     writeProject(historicalPath, historical);
     sameProject(readProject(historicalPath), historical);
     reject(reduction + QStringList{"pressureDofs"}, QJsonArray{});
@@ -2281,22 +2439,44 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
     auto project = fullTestProject(ProjectSource::draft);
     auto &settings = project.simulation.settings;
     settings.acceleration = BemAcceleration::fastMultipole;
-    settings.fastMultipole = {6, 24, 2.75, 275, 37};
+    settings.fastMultipole = {24, 2.75, 275, 37};
     auto &numerics = project.simulation.request->numerics;
     numerics.acceleration = settings.acceleration;
     numerics.fastMultipole = settings.fastMultipole;
     auto result = std::make_shared<BemResult>(*project.simulation.result);
     result->acceleration = BemAcceleration::fastMultipole;
     for (auto &frequency : result->frequencies) {
-        frequency.fastMultipole = {3, 2, 2, 32, 32};
+        frequency.fastMultipole = {};
+        frequency.fastMultipole.nodeCount = 3;
+        frequency.fastMultipole.leafCount = 2;
+        frequency.fastMultipole.farInteractionCount = 2;
+        frequency.fastMultipole.historicalChebyshevStatistics =
+            BemHistoricalChebyshevStatistics{32, 32};
         frequency.residualCheckMilliseconds = 2.75;
-        for (auto &excitation : frequency.excitations)
+        for (auto &excitation : frequency.excitations) {
             excitation.iterations = 37;
+            excitation.residualEvaluation = BemResidualEvaluation::higherOrderFastMultipole;
+            excitation.fastMultipoleKrylovResidual = 1e-7;
+            excitation.fastMultipoleOperatorDiscrepancy = 3e-6;
+            excitation.historicalChebyshevEvidence = BemHistoricalChebyshevEvidence{7, 8};
+        }
     }
     project.simulation.result = result;
     const auto path = directory.filePath("fast-multipole.json");
     writeProject(path, project);
     sameProject(readProject(path), project);
+    for (const unsigned width : {64U, 128U, 256U, 512U, 1024U, 2048U}) {
+        settings.fastMultipole.preconditionerBlockWidth = width;
+        numerics.fastMultipole.preconditionerBlockWidth = width;
+        const auto selectedRequest =
+            makeSimulationRequest(settings, std::vector<FaceVelocity>{{1, {1, 0}}});
+        require(selectedRequest.numerics.fastMultipole.preconditionerBlockWidth == width,
+                "Desktop/study request lost the selected Jacobi-block width");
+        writeProject(path, project);
+        sameProject(readProject(path), project);
+    }
+    settings.fastMultipole.preconditionerBlockWidth = 32;
+    numerics.fastMultipole.preconditionerBlockWidth = 32;
     const auto request = makeSimulationRequest(settings, std::vector<FaceVelocity>{{1, {1, 0}}});
     require(request.numerics.acceleration == settings.acceleration &&
                 request.numerics.fastMultipole == settings.fastMultipole,
@@ -2307,6 +2487,46 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
     sameProject(readProject(path), project);
     const auto json = QJsonDocument::fromJson(bytes(path)).object();
     const auto damaged = directory.filePath("bad-fast-multipole.json");
+    auto missingWidth = json;
+    auto oldSimulation = missingWidth["simulation"].toObject();
+    const auto removeWidth = [](QJsonObject container) {
+        auto fmm = container["fastMultipole"].toObject();
+        fmm.remove("preconditioner_block_width");
+        container.insert("fastMultipole", fmm);
+        return container;
+    };
+    oldSimulation.insert("settings", removeWidth(oldSimulation["settings"].toObject()));
+    auto requestWithoutWidth = oldSimulation["request"].toObject();
+    requestWithoutWidth.insert("numerics", removeWidth(requestWithoutWidth["numerics"].toObject()));
+    oldSimulation.insert("request", requestWithoutWidth);
+    missingWidth.insert("simulation", oldSimulation);
+    saveBytes(damaged, QJsonDocument(missingWidth).toJson());
+    sameProject(readProject(damaged), project);
+    for (const auto width : {0, 31, 33, 129, 255, 257, 513, 1023, 1025, 2047, 2049}) {
+        auto mutation = replaceAt(
+            json, {"simulation", "settings", "fastMultipole", "preconditioner_block_width"}, 0,
+            width);
+        saveBytes(damaged, QJsonDocument(mutation.toObject()).toJson());
+        expectRejected([&] { (void)readProject(damaged); },
+                       "Unsupported spatial preconditioner block width accepted.");
+    }
+    const auto currentFmm =
+        json["simulation"].toObject()["settings"].toObject()["fastMultipole"].toObject();
+    require(currentFmm.contains("leaf_support_capacity") &&
+                !currentFmm.contains("interpolationOrder") &&
+                !currentFmm.contains("leafPanelCapacity"),
+            "New settings retained an obsolete manual order or panel-only leaf contract.");
+    saveBytes(damaged, QJsonDocument(preWidebandArchive(json, 11)).toJson());
+    sameProject(readProject(damaged), project);
+    // Both historical p values migrate to the same automatic solver settings.
+    auto historical = QJsonValue(preWidebandArchive(json, 11));
+    historical = replaceAt(historical,
+                           {"simulation", "settings", "fastMultipole", "interpolationOrder"}, 0, 3);
+    historical = replaceAt(
+        historical, {"simulation", "request", "numerics", "fastMultipole", "interpolationOrder"}, 0,
+        3);
+    saveBytes(damaged, QJsonDocument(historical.toObject()).toJson());
+    sameProject(readProject(damaged), project);
     const auto frequencyJson =
         json["simulation"].toObject()["result"].toObject()["frequencies"].toArray()[0].toObject();
     for (const auto *field : {"fastMultipole", "residualCheckMilliseconds"}) {
@@ -2326,12 +2546,44 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
     saveBytes(damaged, QJsonDocument(missingIterationMutation.toObject()).toJson());
     expectRejected([&] { (void)readProject(damaged); },
                    "FMM result without its iteration counter was accepted");
+    for (const auto *field : {"fastMultipoleKrylovResidual", "fastMultipoleOperatorDiscrepancy",
+                              "fastMultipoleAccuracySeed", "fastMultipoleComparisonAccuracySeed",
+                              "fastMultipoleVerificationAccuracySeed",
+                              "fastMultipoleAccuracyRefinements", "fastMultipoleComparisonLevels",
+                              "fastMultipoleVerificationLevels", "historicalChebyshevEvidence"}) {
+        auto missing = frequencyJson["excitations"].toArray()[0].toObject();
+        missing.remove(field);
+        saveBytes(damaged, QJsonDocument(replaceAt(json,
+                                                   {"simulation", "result", "frequencies", "0",
+                                                    "excitations", "0"},
+                                                   0, missing)
+                                             .toObject())
+                               .toJson());
+        expectRejected([&] { (void)readProject(damaged); }, "Incomplete audit metadata accepted");
+    }
+    for (const auto &mutation :
+         {replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "residualEvaluation"},
+                    0, "exactFmm"),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "historicalChebyshevEvidence", "auditOrder"},
+                    0, 7),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleOperatorDiscrepancy"},
+                    0, numerics.relativeResidualTolerance)}) {
+        saveBytes(damaged, QJsonDocument(mutation.toObject()).toJson());
+        expectRejected([&] { (void)readProject(damaged); }, "Invalid audit metadata accepted");
+    }
     for (const auto &value :
          {replaceAt(json, {"simulation", "settings", "acceleration"}, 0, "automatic"),
-          replaceAt(json, {"simulation", "settings", "fastMultipole", "interpolationOrder"}, 0, 2),
+          replaceAt(json, {"simulation", "settings", "fastMultipole", "leaf_support_capacity"}, 0,
+                    2),
           replaceAt(json,
-                    {"simulation", "request", "numerics", "fastMultipole", "leafPanelCapacity"}, 0,
-                    0),
+                    {"simulation", "request", "numerics", "fastMultipole", "leaf_support_capacity"},
+                    0, 0),
           replaceAt(json, {"simulation", "request", "numerics", "fastMultipole", "separationRatio"},
                     0, 1),
           replaceAt(json,
@@ -2348,18 +2600,18 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
           replaceAt(json,
                     {"simulation", "result", "frequencies", "0", "fastMultipole", "leafCount"}, 0,
                     QString("0")),
-          replaceAt(
-              json,
-              {"simulation", "result", "frequencies", "0", "fastMultipole", "directPanelPairCount"},
-              0, QString("31")),
           replaceAt(json,
                     {"simulation", "result", "frequencies", "0", "fastMultipole",
-                     "representedFarPanelPairs"},
+                     "historicalChebyshevStatistics", "directPanelPairCount"},
+                    0, QString("31")),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole",
+                     "historicalChebyshevStatistics", "representedFarPanelPairs"},
                     0, QString("33")),
-          replaceAt(
-              json,
-              {"simulation", "result", "frequencies", "0", "fastMultipole", "directPanelPairCount"},
-              0, QString::number(std::numeric_limits<qulonglong>::max())),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole",
+                     "historicalChebyshevStatistics", "directPanelPairCount"},
+                    0, QString::number(std::numeric_limits<qulonglong>::max())),
           replaceAt(json, {"simulation", "result", "frequencies", "0", "fastMultipole"}, 0,
                     QJsonObject{{"nodeCount", "0"},
                                 {"leafCount", "0"},
@@ -2368,7 +2620,7 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
                                 {"representedFarPanelPairs", "0"}}),
           replaceAt(json,
                     {"simulation", "result", "frequencies", "0", "excitations", "0", "iterations"},
-                    0, 1101)}) {
+                    0, 100000)}) {
         saveBytes(damaged, QJsonDocument(value.toObject()).toJson());
         expectRejected([&] { (void)readProject(damaged); },
                        "Invalid Fast Multipole archive was accepted");
@@ -2385,6 +2637,21 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
     require(zeroCounterResult->frequencies.front().excitations.front().iterations == 0 &&
                 zeroCounterResult->frequencies.front().residualCheckMilliseconds == 0,
             "Valid zero FMM counters were rejected or changed");
+    auto directFmm = project;
+    auto directFmmResult = std::make_shared<BemResult>(*project.simulation.result);
+    for (auto &frequency : directFmmResult->frequencies)
+        for (auto &excitation : frequency.excitations) {
+            excitation.residualEvaluation = BemResidualEvaluation::directGalerkin;
+            excitation.historicalChebyshevEvidence = BemHistoricalChebyshevEvidence{};
+            excitation.fastMultipoleOperatorDiscrepancy = 0;
+            excitation.fastMultipoleKrylovResidual = 2e-6;
+            excitation.refinementSteps = 4;
+            excitation.iterations = 1125;
+        }
+    directFmm.simulation.result = directFmmResult;
+    const auto directPath = directory.filePath("fmm-direct-audit.json");
+    writeProject(directPath, directFmm);
+    sameProject(readProject(directPath), directFmm);
     auto baseline = fullTestProject(ProjectSource::draft);
     writeProject(path, baseline);
     auto old = QJsonDocument::fromJson(bytes(path)).object();
@@ -2420,14 +2687,415 @@ void fastMultipoleRoundTrip(const QTemporaryDir &directory) {
     old.insert("simulation", simulation);
     saveBytes(damaged, QJsonDocument(old).toJson());
     sameProject(readProject(damaged), baseline);
+
+    auto directArchive = preWidebandArchive(QJsonDocument::fromJson(bytes(path)).object(), 10);
+    auto archivedSimulation = directArchive["simulation"].toObject();
+    auto archivedResult = archivedSimulation["result"].toObject();
+    auto archivedFrequencies = archivedResult["frequencies"].toArray();
+    for (qsizetype i = 0; i < archivedFrequencies.size(); ++i) {
+        auto frequency = archivedFrequencies[i].toObject();
+        auto excitations = frequency["excitations"].toArray();
+        for (qsizetype j = 0; j < excitations.size(); ++j) {
+            auto excitation = excitations[j].toObject();
+            for (const auto *field :
+                 {"residualEvaluation", "fastMultipoleKrylovResidual", "fastMultipoleKrylovTarget",
+                  "fastMultipoleOperatorDiscrepancy", "fastMultipoleComparisonOrder",
+                  "fastMultipoleAuditOrder"})
+                excitation.remove(field);
+            excitations[j] = excitation;
+        }
+        frequency.insert("excitations", excitations);
+        archivedFrequencies[i] = frequency;
+    }
+    archivedResult.insert("frequencies", archivedFrequencies);
+    archivedSimulation.insert("result", archivedResult);
+    directArchive.insert("simulation", archivedSimulation);
+    saveBytes(damaged, QJsonDocument(directArchive).toJson());
+    sameProject(readProject(damaged), baseline);
+    directArchive.insert("version", 11);
+    saveBytes(damaged, QJsonDocument(directArchive).toJson());
+    sameProject(readProject(damaged), baseline);
 }
 
+void widebandEvidenceRoundTrip(const QTemporaryDir &directory) {
+    // Metadata-only synthetic fixture; it does not claim a numerical solve.
+    auto project = fullTestProject(ProjectSource::draft);
+    project.simulation.settings.acceleration = BemAcceleration::fastMultipole;
+    project.simulation.request->numerics.acceleration = BemAcceleration::fastMultipole;
+    auto result = std::make_shared<BemResult>(*project.simulation.result);
+    result->acceleration = BemAcceleration::fastMultipole;
+    result->liveDeviceBytes = 456789;
+    const auto n = result->pressureDofCount, t = result->triangleCount;
+    for (auto &frequency : result->frequencies) {
+        auto &s = frequency.fastMultipole;
+        s.nodeCount = 3;
+        s.leafCount = 2;
+        s.farInteractionCount = 2;
+        s.pressurePressureNearPairs = n * n - 12;
+        s.pressurePressureFarPairs = 12;
+        s.pressureFluxNearPairs = n * t - 16;
+        s.pressureFluxFarPairs = 16;
+        s.graphExecution = BemFastMultipoleGraphEvidence{};
+        auto &graph = *s.graphExecution;
+        graph.captureAttempts = 7;
+        graph.instantiations = 6;
+        graph.launches = 13;
+        graph.reuses = 7;
+        graph.executedBatches = 41;
+        graph.canonicalChunks = 9;
+        graph.canonicalBatches = 27;
+        graph.invalidatedExecutables = 4;
+        graph.budgetBypasses = 2;
+        graph.admissionClosures = 1;
+        graph.captureMilliseconds = 1.25;
+        graph.instantiationMilliseconds = 2.5;
+        graph.maximumCachedExecutables = 4;
+        graph.maximumCachedNodes = 108;
+        graph.peakOwnedHostMetadataBytes = 16384;
+        graph.memoryObservationAvailable = true;
+        graph.minimumObservedFreeDeviceBytes = 3000000000;
+        graph.totalDeviceBytes = 8000000000;
+        graph.requiredFreeReserveBytes = 1600000000;
+        for (auto &e : frequency.excitations) {
+            e.iterations = 37;
+            e.residualEvaluation = BemResidualEvaluation::higherOrderFastMultipole;
+            e.fastMultipoleKrylovResidual = 1e-7;
+            e.fastMultipoleKrylovTarget = 2.5e-7;
+            e.fastMultipoleOperatorDiscrepancy = 3e-6;
+            e.fastMultipoleAccuracySeed = 1e-5;
+            e.fastMultipoleComparisonAccuracySeed = 2.5e-6;
+            e.fastMultipoleVerificationAccuracySeed = 6.25e-7;
+            e.fastMultipoleAccuracyRefinements = 1;
+            e.farQuadratureComparisonDegree = 8;
+            e.farQuadratureVerificationDegree = 12;
+            e.farQuadratureRefinements = 2;
+            e.farQuadratureDiscrepancy = 2e-7;
+            e.farQuadraturePreparationMilliseconds = 1.25;
+            e.farQuadraturePressureMilliseconds = 2.5;
+            e.farQuadratureFluxMilliseconds = 3.75;
+            e.fieldQuadratureComparisonDegree = 12;
+            e.fieldQuadratureVerificationDegree = 14;
+            e.fieldQuadratureDiscrepancy = 1e-7;
+            e.fastMultipoleComparisonLevels = {
+                {2, BemFastMultipoleRepresentation::regularSpherical, 5, 10, 10},
+                {3, BemFastMultipoleRepresentation::planeWave, 8, 16, 16}};
+            e.fastMultipoleVerificationLevels = {
+                {2, BemFastMultipoleRepresentation::regularSpherical, 6, 12, 12},
+                {3, BemFastMultipoleRepresentation::planeWave, 9, 18, 18}};
+        }
+    }
+    project.simulation.result = result;
+    const auto path = directory.filePath("wideband-evidence.json"),
+               bad = directory.filePath("bad-wideband-evidence.json");
+    writeProject(path, project);
+    sameProject(readProject(path), project);
+    const auto json = QJsonDocument::fromJson(bytes(path)).object();
+    require(json["version"].toInt() == 16,
+            "Automatic evidence was written in a format an old reader can misinterpret.");
+    for (const auto *field : {"residualEvaluation", "quadratureEvidence"}) {
+        auto missing = json["simulation"]
+                           .toObject()["result"]
+                           .toObject()["frequencies"]
+                           .toArray()[0]
+                           .toObject()["excitations"]
+                           .toArray()[0]
+                           .toObject();
+        missing.remove(field);
+        saveBytes(bad, QJsonDocument(replaceAt(json,
+                                               {"simulation", "result", "frequencies", "0",
+                                                "excitations", "0"},
+                                               0, missing)
+                                         .toObject())
+                           .toJson());
+        expectRejected([&] { (void)readProject(bad); },
+                       "Format 16 accepted incomplete numerical provenance");
+    }
+    auto earlierArchive = json;
+    earlierArchive.insert("version", 14);
+    earlierArchive.remove("comparisonSnapshots");
+    auto earlierSimulation = earlierArchive["simulation"].toObject();
+    auto earlierResult = earlierSimulation["result"].toObject();
+    auto earlierFrequencies = earlierResult["frequencies"].toArray();
+    for (qsizetype i = 0; i < earlierFrequencies.size(); ++i) {
+        auto f = earlierFrequencies[i].toObject();
+        auto stats = f["fastMultipole"].toObject();
+        stats.remove("graphExecution");
+        f.insert("fastMultipole", stats);
+        auto excitations = f["excitations"].toArray();
+        for (qsizetype j = 0; j < excitations.size(); ++j) {
+            auto e = excitations[j].toObject();
+            e.remove("quadratureEvidence");
+            e.remove("fastMultipoleKrylovTarget");
+            excitations[j] = e;
+        }
+        f.insert("excitations", excitations);
+        earlierFrequencies[i] = f;
+    }
+    earlierResult.insert("frequencies", earlierFrequencies);
+    earlierSimulation.insert("result", earlierResult);
+    earlierArchive.insert("simulation", earlierSimulation);
+    auto earlierExpected = project;
+    auto earlierData = std::make_shared<BemResult>(*result);
+    for (auto &f : earlierData->frequencies) {
+        f.fastMultipole.graphExecution.reset();
+        for (auto &e : f.excitations) {
+            e.farQuadratureComparisonDegree = e.farQuadratureVerificationDegree =
+                e.farQuadratureRefinements = 0;
+            e.fastMultipoleKrylovTarget = 0;
+            e.farQuadratureDiscrepancy = e.farQuadraturePreparationMilliseconds =
+                e.farQuadraturePressureMilliseconds = e.farQuadratureFluxMilliseconds = 0;
+            e.fieldQuadratureComparisonDegree = e.fieldQuadratureVerificationDegree = 0;
+            e.fieldQuadratureDiscrepancy = 0;
+        }
+    }
+    earlierExpected.simulation.result = earlierData;
+    saveBytes(bad, QJsonDocument(earlierArchive).toJson());
+    sameProject(readProject(bad), earlierExpected);
+    for (const auto mutation :
+         {replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleKrylovTarget"},
+                    0, -1.0),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "quadratureEvidence", "farVerificationDegree"},
+                    0, 6),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "quadratureEvidence", "farRefinements"},
+                    0, 3),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "quadratureEvidence", "fieldDiscrepancy"},
+                    0, 1.0)}) {
+        saveBytes(bad, QJsonDocument(mutation.toObject()).toJson());
+        expectRejected([&] { (void)readProject(bad); }, "Invalid quadrature evidence accepted");
+    }
+    for (const auto mutation :
+         {replaceAt(json, {"simulation", "result", "liveDeviceBytes"}, 0, QString("99999999")),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole",
+                     "pressurePressureNearPairs"},
+                    0, QString("64")),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleVerificationAccuracySeed"},
+                    0, 2.5e-6),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleComparisonLevels", "0", "representation"},
+                    0, "chebyshev"),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleVerificationLevels", "0", "momentBandlimit"},
+                    0, 4),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "fastMultipoleVerificationLevels", "1", "level"},
+                    0, 2),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "excitations", "0",
+                     "historicalChebyshevEvidence"},
+                    0, QJsonObject{{"comparisonOrder", 7}, {"auditOrder", 8}})}) {
+        saveBytes(bad, QJsonDocument(mutation.toObject()).toJson());
+        expectRejected([&] { (void)readProject(bad); },
+                       "Contradictory automatic/historical FMM evidence was accepted");
+    }
+    // An observed zero free-memory value is different from no observation.
+    const auto zeroFree = replaceAt(json,
+                                    {"simulation", "result", "frequencies", "0", "fastMultipole",
+                                     "graphExecution", "minimumObservedFreeDeviceBytes"},
+                                    0, "0");
+    saveBytes(bad, QJsonDocument(zeroFree.toObject()).toJson());
+    const auto observedZero =
+        readProject(bad).simulation.result->frequencies.front().fastMultipole.graphExecution;
+    require(observedZero && observedZero->memoryObservationAvailable &&
+                observedZero->minimumObservedFreeDeviceBytes == 0,
+            "Observed zero free VRAM was confused with unavailable memory evidence.");
+    // All-zero execution is a real recorded NoFar case, unlike an absent block.
+    auto noFar = std::make_shared<BemResult>(*result);
+    for (auto &f : noFar->frequencies) {
+        auto &stats = f.fastMultipole;
+        stats.farInteractionCount = 0;
+        stats.pressurePressureNearPairs = n * n;
+        stats.pressurePressureFarPairs = 0;
+        stats.pressureFluxNearPairs = n * t;
+        stats.pressureFluxFarPairs = 0;
+        stats.graphExecution = BemFastMultipoleGraphEvidence{};
+        for (auto &e : f.excitations) {
+            e.residualEvaluation = BemResidualEvaluation::directGalerkin;
+            e.fastMultipoleComparisonAccuracySeed = e.fastMultipoleVerificationAccuracySeed = 0;
+            e.fastMultipoleComparisonLevels.clear();
+            e.fastMultipoleVerificationLevels.clear();
+            e.fastMultipoleOperatorDiscrepancy = 0;
+            e.farQuadratureComparisonDegree = e.farQuadratureVerificationDegree =
+                e.farQuadratureRefinements = 0;
+            e.farQuadratureDiscrepancy = e.farQuadraturePreparationMilliseconds =
+                e.farQuadraturePressureMilliseconds = e.farQuadratureFluxMilliseconds = 0;
+        }
+    }
+    auto noFarProject = project;
+    noFarProject.simulation.result = noFar;
+    writeProject(path, noFarProject);
+    sameProject(readProject(path), noFarProject);
+    for (const auto &mutation :
+         {replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole", "graphExecution",
+                     "reuses"},
+                    0, "14"),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole", "graphExecution",
+                     "instantiations"},
+                    0, "8"),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole", "graphExecution",
+                     "captureMilliseconds"},
+                    0, -1),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole", "graphExecution",
+                     "memoryObservationAvailable"},
+                    0, false),
+          replaceAt(json,
+                    {"simulation", "result", "frequencies", "0", "fastMultipole", "graphExecution",
+                     "minimumObservedFreeDeviceBytes"},
+                    0, "9000000000")}) {
+        saveBytes(bad, QJsonDocument(mutation.toObject()).toJson());
+        expectRejected([&] { (void)readProject(bad); },
+                       "Inconsistent graph execution evidence accepted");
+    }
+    auto denseProject = fullTestProject(ProjectSource::draft);
+    writeProject(path, denseProject);
+    const auto denseJson = QJsonDocument::fromJson(bytes(path)).object();
+    const auto graphBlock = json["simulation"]
+                                .toObject()["result"]
+                                .toObject()["frequencies"]
+                                .toArray()[0]
+                                .toObject()["fastMultipole"]
+                                .toObject()["graphExecution"];
+    saveBytes(bad, QJsonDocument(replaceAt(denseJson,
+                                           {"simulation", "result", "frequencies", "0",
+                                            "fastMultipole", "graphExecution"},
+                                           0, graphBlock)
+                                     .toObject())
+                       .toJson());
+    expectRejected([&] { (void)readProject(bad); },
+                   "Dense result accepted FMM graph execution evidence");
+    auto direct = std::make_shared<BemResult>(*result);
+    for (auto &frequency : direct->frequencies)
+        for (auto &e : frequency.excitations) {
+            e.residualEvaluation = BemResidualEvaluation::directGalerkin;
+            e.fastMultipoleComparisonAccuracySeed = e.fastMultipoleVerificationAccuracySeed = 0;
+            e.fastMultipoleComparisonLevels.clear();
+            e.fastMultipoleVerificationLevels.clear();
+            e.fastMultipoleOperatorDiscrepancy = 0;
+        }
+    project.simulation.result = direct;
+    writeProject(path, project);
+    sameProject(readProject(path), project);
+}
+void previousFormatRoundTrip(const QTemporaryDir &directory) {
+    // Format 14 predates wideband evidence even though the isolated FMM branch
+    // used format 12. Detect the archived field contract, not that branch number.
+    for (bool multipole : {false, true}) {
+        auto project = fullTestProject(ProjectSource::draft);
+        if (multipole) {
+            project.simulation.settings.acceleration = BemAcceleration::fastMultipole;
+            project.simulation.request->numerics.acceleration = BemAcceleration::fastMultipole;
+            auto result = std::make_shared<BemResult>(*project.simulation.result);
+            result->acceleration = BemAcceleration::fastMultipole;
+            for (auto &frequency : result->frequencies) {
+                frequency.fastMultipole.nodeCount = 3;
+                frequency.fastMultipole.leafCount = 2;
+                frequency.fastMultipole.farInteractionCount = 2;
+                frequency.fastMultipole.historicalChebyshevStatistics =
+                    BemHistoricalChebyshevStatistics{32, 32};
+                for (auto &excitation : frequency.excitations)
+                    excitation.historicalChebyshevEvidence = BemHistoricalChebyshevEvidence{};
+            }
+            project.simulation.result = result;
+        }
+        const auto path =
+            directory.filePath(multipole ? "previous-fmm.json" : "previous-dense.json");
+        writeProject(path, project);
+        auto previous = preWidebandArchive(QJsonDocument::fromJson(bytes(path)).object(), 14);
+        auto simulation = previous["simulation"].toObject();
+        auto settings = simulation["settings"].toObject();
+        settings.remove("singularOrder");
+        simulation.insert("settings", settings);
+        auto result = simulation["result"].toObject();
+        auto frequencies = result["frequencies"].toArray();
+        for (qsizetype fi = 0; fi < frequencies.size(); ++fi) {
+            auto frequency = frequencies[fi].toObject();
+            auto excitations = frequency["excitations"].toArray();
+            for (qsizetype ei = 0; ei < excitations.size(); ++ei) {
+                auto excitation = excitations[ei].toObject();
+                for (const auto *field :
+                     {"residualEvaluation", "fastMultipoleKrylovResidual",
+                      "fastMultipoleOperatorDiscrepancy", "fastMultipoleComparisonOrder",
+                      "fastMultipoleAuditOrder"})
+                    excitation.remove(field);
+                excitations[ei] = excitation;
+            }
+            frequency.insert("excitations", excitations);
+            frequencies[fi] = frequency;
+        }
+        result.insert("frequencies", frequencies);
+        simulation.insert("result", result);
+        previous.insert("simulation", simulation);
+        saveBytes(path, QJsonDocument(previous).toJson());
+        const auto restored = readProject(path);
+        sameProject(restored, project);
+        // Rewriting an old result preserves its historical provenance in format 16.
+        writeProject(path, restored);
+        sameProject(readProject(path), project);
+    }
+}
+void silentExcitationRoundTrip(const QTemporaryDir &directory) {
+    // Persistence fixture only; numerical zero-RHS behavior is tested on CUDA.
+    auto project = fullTestProject(ProjectSource::draft);
+    for (auto &excitation : project.simulation.request->excitations)
+        for (auto &face : excitation.faces)
+            face.normalVelocity = {};
+    auto result = std::make_shared<BemResult>(*project.simulation.result);
+    for (auto &frequency : result->frequencies)
+        for (auto &excitation : frequency.excitations) {
+            auto boundary = *excitation.boundary();
+            std::fill(boundary.surfacePressure.begin(), boundary.surfacePressure.end(),
+                      std::complex<double>{});
+            std::fill(boundary.pressureTrace.begin(), boundary.pressureTrace.end(),
+                      std::complex<double>{});
+            std::fill(boundary.normalDerivative.begin(), boundary.normalDerivative.end(),
+                      std::complex<double>{});
+            excitation.setBoundary(std::move(boundary));
+            std::fill(excitation.observerPressure.begin(), excitation.observerPressure.end(),
+                      std::complex<double>{});
+            excitation.impedances.clear();
+            excitation.boundaryResidual = 0;
+            excitation.refinementSteps = 0;
+        }
+    project.simulation.result = result;
+    const auto path = directory.filePath("silent-explicit-face.json");
+    writeProject(path, project);
+    sameProject(readProject(path), project);
+    const auto json = QJsonDocument::fromJson(bytes(path)).object();
+    const auto empty =
+        replaceAt(json, {"simulation", "request", "excitations", "0", "faces"}, 0, QJsonArray{});
+    saveBytes(path, QJsonDocument(empty.toObject()).toJson());
+    expectRejected([&] { (void)readProject(path); },
+                   "Empty face assignment was confused with a valid zero RHS");
+}
 void nearQuadratureDepthRoundTrip(const QTemporaryDir &directory) {
     auto project = fullTestProject(ProjectSource::draft);
     const auto path = directory.filePath("near-quadrature-depth.json");
     for (const unsigned depth : {0u, 8u, 10u}) {
         project.simulation.settings.nearMaximumDepth = depth;
         project.simulation.request->numerics.nearMaximumDepth = depth;
+        writeProject(path, project);
+        sameProject(readProject(path), project);
+    }
+    for (const unsigned order : {2u, 8u, 20u}) {
+        project.simulation.settings.singularOrder = order;
+        project.simulation.request->numerics.singularOrder = order;
         writeProject(path, project);
         sameProject(readProject(path), project);
     }
@@ -2440,12 +3108,20 @@ void nearQuadratureDepthRoundTrip(const QTemporaryDir &directory) {
         expectRejected([&] { (void)readProject(damaged); },
                        "Invalid near quadrature depth was accepted");
     }
+    for (const double order : {1.0, 21.0, 3.5}) {
+        const auto replacement =
+            replaceAt(json, {"simulation", "settings", "singularOrder"}, 0, order);
+        saveBytes(damaged, QJsonDocument(replacement.toObject()).toJson());
+        expectRejected([&] { (void)readProject(damaged); },
+                       "Invalid singular quadrature order was accepted");
+    }
     const auto baseline = fullTestProject(ProjectSource::draft);
     writeProject(path, baseline);
     auto old = QJsonDocument::fromJson(bytes(path)).object();
     auto simulation = old["simulation"].toObject();
     auto settings = simulation["settings"].toObject();
     settings.remove("nearMaximumDepth");
+    settings.remove("singularOrder");
     simulation.insert("settings", settings);
     old.insert("simulation", simulation);
     saveBytes(path, QJsonDocument(old).toJson());
@@ -2536,8 +3212,9 @@ void comparisonSnapshotsRoundTrip(const QTemporaryDir &directory) {
     auto first = project;
     auto second = project;
     second.simulation.current = false;
-    project.comparisonSnapshots = {{QStringLiteral("Referenz"), std::make_shared<const Project>(first)},
-                                   {QStringLiteral("Variante"), std::make_shared<const Project>(second)}};
+    project.comparisonSnapshots = {
+        {QStringLiteral("Referenz"), std::make_shared<const Project>(first)},
+        {QStringLiteral("Variante"), std::make_shared<const Project>(second)}};
     const auto path = directory.filePath("comparison-snapshots.hsproj");
     writeProject(path, project);
     auto loaded = readProject(path);
@@ -2555,12 +3232,15 @@ void comparisonSnapshotsRoundTrip(const QTemporaryDir &directory) {
     loaded.comparisonSnapshots[1].name = QStringLiteral("Umbenannt");
     expectRejected([&] { writeProject(path, loaded); }, "Duplicate comparison names accepted");
     auto nested = first;
-    nested.comparisonSnapshots = {{QStringLiteral("Innen"), std::make_shared<const Project>(first)}};
-    loaded.comparisonSnapshots = {{QStringLiteral("Außen"), std::make_shared<const Project>(nested)}};
+    nested.comparisonSnapshots = {
+        {QStringLiteral("Innen"), std::make_shared<const Project>(first)}};
+    loaded.comparisonSnapshots = {
+        {QStringLiteral("Außen"), std::make_shared<const Project>(nested)}};
     expectRejected([&] { writeProject(path, loaded); }, "Nested comparison snapshots accepted");
     loaded.comparisonSnapshots.clear();
     for (int i = 0; i < 65; ++i)
-        loaded.comparisonSnapshots.push_back({QString::number(i), std::make_shared<const Project>(first)});
+        loaded.comparisonSnapshots.push_back(
+            {QString::number(i), std::make_shared<const Project>(first)});
     expectRejected([&] { writeProject(path, loaded); }, "Too many comparison snapshots accepted");
     QFile oversized(directory.filePath("oversized-project.hsproj"));
     require(oversized.open(QIODevice::WriteOnly) && oversized.resize(256LL * 1024 * 1024 + 1),
@@ -2602,8 +3282,9 @@ void legacyFormatTest(const QTemporaryDir &directory) {
     const auto currentPath = directory.filePath("legacy-source.json");
     writeProject(currentPath, project);
     auto current = QJsonDocument::fromJson(bytes(currentPath)).object();
-    require(current["version"].toInt() == 14, "Projects must use physical-slot-radius format 14");
+    require(current["version"].toInt() == 16, "Projects must use integrated FMM format 16");
     current.remove("slot");
+    current = preWidebandArchive(current, 11);
     auto version8 = current;
     version8.insert("version", 8);
     version8.remove("draftReversedFaces");
@@ -2838,9 +3519,8 @@ void diffractionSlotRoundTrip(const QTemporaryDir &directory) {
     reject({"slot", "transitionLength"}, -.001);
     reject({"slot", "transitionLength"}, .2);
     reject({"transition", "startFraction"}, 0);
-    for (const auto field :
-         {"enabled", "aperture", "adapterLength", "straightLength", "transitionLength",
-          "contour", "cornerRadius", "exit", "exitRadius"}) {
+    for (const auto field : {"enabled", "aperture", "adapterLength", "straightLength",
+                             "transitionLength", "contour", "cornerRadius", "exit", "exitRadius"}) {
         auto missing = original["slot"].toObject();
         missing.remove(field);
         reject({"slot"}, missing);
@@ -2851,6 +3531,7 @@ void diffractionSlotRoundTrip(const QTemporaryDir &directory) {
     expectRejected([&] { (void)readProject(path); }, "Format 14 omitted required slot parameters");
     auto format13 = original;
     format13.insert("version", 13);
+    format13.remove("comparisonSnapshots");
     auto oldSlot = format13["slot"].toObject();
     for (const auto field : {"contour", "cornerRadius", "exit", "exitRadius"})
         oldSlot.remove(field);
@@ -2862,6 +3543,7 @@ void diffractionSlotRoundTrip(const QTemporaryDir &directory) {
     sameProject(readProject(path), expected13);
     auto old = missingSlot;
     old.insert("version", 12);
+    old.remove("comparisonSnapshots");
     saveBytes(path, QJsonDocument(old).toJson());
     auto expected = project;
     expected.parameters.slot = {};
@@ -2891,6 +3573,7 @@ void asymmetricDraftRoundTrip(const QTemporaryDir &directory) {
     auto original = QJsonDocument::fromJson(bytes(path)).object();
     auto old = original;
     old.insert("version", 10);
+    old.remove("comparisonSnapshots");
     old.remove("slot");
     old.remove("asymmetry");
     saveBytes(path, QJsonDocument(old).toJson());
@@ -3116,18 +3799,32 @@ void ctaExportContract() {
     request.observers.resize(75);
     // Use a valid legacy ±90° raster generated from the full request.
     const auto full = makeSimulationRequest(settings, velocity);
-    request.observers.clear(); request.observers.push_back(full.observers[0]);
-    for (int i = 18; i <= 54; ++i) request.observers.push_back(full.observers[1+i]);
-    for (int i = 18; i <= 54; ++i) request.observers.push_back(full.observers[74+i]);
-    a.request = request; a.revision = 23; a.current = false; a.resultComplete = false;
+    request.observers.clear();
+    request.observers.push_back(full.observers[0]);
+    for (int i = 18; i <= 54; ++i)
+        request.observers.push_back(full.observers[1 + i]);
+    for (int i = 18; i <= 54; ++i)
+        request.observers.push_back(full.observers[74 + i]);
+    a.request = request;
+    a.revision = 23;
+    a.current = false;
+    a.resultComplete = false;
     auto result = std::make_shared<BemResult>();
-    BemFrequencyResult f; f.frequency = 1000;
-    BemExcitationResult first; first.name = "A"; first.observerPressure.assign(75, {.002, 0});
-    BemExcitationResult second; second.name = "B"; second.observerPressure.assign(75, {.004, 0});
-    f.excitations = {first, second}; result->frequencies.push_back(f); a.result = result;
-    const auto one = ctaResults(*a.request, *a.result, 0), two = ctaResults(*a.request, *a.result, 1);
-    require(one.size() == 1 && two.size() == 1 && one[0].curves.onAxisDb &&
-            two[0].curves.onAxisDb, "CTA excitation selection missing");
+    BemFrequencyResult f;
+    f.frequency = 1000;
+    BemExcitationResult first;
+    first.name = "A";
+    first.observerPressure.assign(75, {.002, 0});
+    BemExcitationResult second;
+    second.name = "B";
+    second.observerPressure.assign(75, {.004, 0});
+    f.excitations = {first, second};
+    result->frequencies.push_back(f);
+    a.result = result;
+    const auto one = ctaResults(*a.request, *a.result, 0),
+               two = ctaResults(*a.request, *a.result, 1);
+    require(one.size() == 1 && two.size() == 1 && one[0].curves.onAxisDb && two[0].curves.onAxisDb,
+            "CTA excitation selection missing");
     close(*two[0].curves.onAxisDb - *one[0].curves.onAxisDb, 20 * std::log10(2.),
           "CTA selected wrong excitation");
     require(!two[0].curves.soundPowerDb, "Incomplete rear angles fabricated power");
@@ -3143,14 +3840,17 @@ void ctaExportContract() {
     for (const double scale : {1e-4, 1e4}) {
         auto scaled = a;
         for (auto &point : scaled.request->observers) {
-            point.x *= scale; point.y *= scale; point.z *= scale;
+            point.x *= scale;
+            point.y *= scale;
+            point.z *= scale;
         }
         require(!ctaCsv(scaled, 1).isEmpty(), "A scaled valid directional raster was rejected");
     }
     const auto csv = ctaCsv(a, 1);
     require(csv.contains("excitation=B") && csv.contains("revision=23; current=false") &&
-            csv.contains("completeness=partial") && csv.contains("70_direction_approximation") &&
-            csv.contains("reference_pressure_Pa_RMS=2e-5") && csv.contains(";;;"),
+                csv.contains("completeness=partial") &&
+                csv.contains("70_direction_approximation") &&
+                csv.contains("reference_pressure_Pa_RMS=2e-5") && csv.contains(";;;"),
             "CTA export omitted metadata or empty incomplete values");
 }
 
@@ -3164,11 +3864,9 @@ void resultMemoryEstimateContract() {
     d.snapshots = 4;
     const auto fourSnapshots = estimateResultBytes(d);
     d.exteriorTriangles = 0;
-    require(fourSnapshots - estimateResultBytes(d) ==
-                10.L * 2 * 17 * sizeof(std::complex<double>),
+    require(fourSnapshots - estimateResultBytes(d) == 10.L * 2 * 17 * sizeof(std::complex<double>),
             "Shared boundary data was multiplied by snapshot count.");
-    require(fourSnapshots > withRayleigh,
-            "Independent snapshot data was not counted per owner.");
+    require(fourSnapshots > withRayleigh, "Independent snapshot data was not counted per owner.");
     d.frequencies = std::numeric_limits<std::size_t>::max();
     require(estimateResultBytes(d) >
                 static_cast<long double>(std::numeric_limits<std::size_t>::max()),
@@ -3188,11 +3886,24 @@ int main(int argc, char **argv) {
             std::cout << "Exported offline CAD geometry fixture without acoustic results.\n";
             return 0;
         }
+        const bool legacyOnly = argc == 2 && QString::fromLocal8Bit(argv[1]) == "--legacy-only";
+        const bool regionsOnly =
+            argc == 2 && QString::fromLocal8Bit(argv[1]) == "--subdomain-settings-only";
         const bool axisymmetricOnly =
             argc == 2 && QString::fromLocal8Bit(argv[1]) == "--axisymmetric-only";
-        require(argc == 1 || axisymmetricOnly, "Unexpected project test arguments");
+        require(argc == 1 || axisymmetricOnly || legacyOnly || regionsOnly,
+                "Unexpected project test arguments");
         QTemporaryDir directory;
         require(directory.isValid(), "Temporary project directory cannot be created");
+        if (legacyOnly) {
+            legacyFormatTest(directory);
+            previousFormatRoundTrip(directory);
+            return 0;
+        }
+        if (regionsOnly) {
+            roundTripTests(directory);
+            return 0;
+        }
         if (axisymmetricOnly) {
             axisymmetricRoundTrip(directory);
             interactionPlanningRoundTrip(directory);
@@ -3200,35 +3911,45 @@ int main(int argc, char **argv) {
                          "rejection tests passed.\n";
             return 0;
         }
-        resultMemoryEstimateContract();
-        roundTripTests(directory);
-        coupledRoundTrip(directory);
-        unfinishedLemGraphRoundTrip(directory);
-        interfaceRoundTrip(directory);
-        weightedPortRoundTrip(directory);
-        acousticSlitRoundTrip(directory);
-        closedSlitCavityRoundTrip(directory);
-        orientationRoundTrip(directory);
-        exactCadRoundTrip(directory);
-        farFieldRoundTrip(directory);
-        faceColorsRoundTrip(directory);
-        angularResponsesRoundTrip(directory);
-        ctaExportContract();
-        savedFieldTracesRoundTrip(directory);
-        axisymmetricRoundTrip(directory);
-        interactionPlanningRoundTrip(directory);
-        infiniteBaffleRoundTrip(directory);
-        fastMultipoleRoundTrip(directory);
-        nearQuadratureDepthRoundTrip(directory);
-        observationFrameRoundTrip(directory);
-        comparisonSnapshotsRoundTrip(directory);
-        largeFrequencyRoundTrip(directory);
-        legacyFormatTest(directory);
-        asymmetricDraftRoundTrip(directory);
-        diffractionSlotRoundTrip(directory);
-        relaxedMeshRoundTrip(directory);
-        invalidWriteAndAtomicTests(directory);
-        damagedFileTests(directory);
+        const auto runStage = [](const char *name, auto test) {
+            try {
+                test();
+            } catch (const std::exception &e) {
+                throw std::runtime_error(std::string(name) + ": " + e.what());
+            }
+        };
+        runStage("resultMemoryEstimateContract", [&] { resultMemoryEstimateContract(); });
+        runStage("roundTripTests", [&] { roundTripTests(directory); });
+        runStage("coupledRoundTrip", [&] { coupledRoundTrip(directory); });
+        runStage("unfinishedLemGraphRoundTrip", [&] { unfinishedLemGraphRoundTrip(directory); });
+        runStage("interfaceRoundTrip", [&] { interfaceRoundTrip(directory); });
+        runStage("weightedPortRoundTrip", [&] { weightedPortRoundTrip(directory); });
+        runStage("acousticSlitRoundTrip", [&] { acousticSlitRoundTrip(directory); });
+        runStage("closedSlitCavityRoundTrip", [&] { closedSlitCavityRoundTrip(directory); });
+        runStage("orientationRoundTrip", [&] { orientationRoundTrip(directory); });
+        runStage("exactCadRoundTrip", [&] { exactCadRoundTrip(directory); });
+        runStage("farFieldRoundTrip", [&] { farFieldRoundTrip(directory); });
+        runStage("faceColorsRoundTrip", [&] { faceColorsRoundTrip(directory); });
+        runStage("angularResponsesRoundTrip", [&] { angularResponsesRoundTrip(directory); });
+        runStage("ctaExportContract", [&] { ctaExportContract(); });
+        runStage("savedFieldTracesRoundTrip", [&] { savedFieldTracesRoundTrip(directory); });
+        runStage("axisymmetricRoundTrip", [&] { axisymmetricRoundTrip(directory); });
+        runStage("interactionPlanningRoundTrip", [&] { interactionPlanningRoundTrip(directory); });
+        runStage("infiniteBaffleRoundTrip", [&] { infiniteBaffleRoundTrip(directory); });
+        runStage("fastMultipoleRoundTrip", [&] { fastMultipoleRoundTrip(directory); });
+        runStage("nearQuadratureDepthRoundTrip", [&] { nearQuadratureDepthRoundTrip(directory); });
+        runStage("observationFrameRoundTrip", [&] { observationFrameRoundTrip(directory); });
+        runStage("comparisonSnapshotsRoundTrip", [&] { comparisonSnapshotsRoundTrip(directory); });
+        runStage("largeFrequencyRoundTrip", [&] { largeFrequencyRoundTrip(directory); });
+        runStage("legacyFormatTest", [&] { legacyFormatTest(directory); });
+        runStage("asymmetricDraftRoundTrip", [&] { asymmetricDraftRoundTrip(directory); });
+        runStage("diffractionSlotRoundTrip", [&] { diffractionSlotRoundTrip(directory); });
+        runStage("relaxedMeshRoundTrip", [&] { relaxedMeshRoundTrip(directory); });
+        runStage("invalidWriteAndAtomicTests", [&] { invalidWriteAndAtomicTests(directory); });
+        runStage("damagedFileTests", [&] { damagedFileTests(directory); });
+        runStage("previousFormatRoundTrip", [&] { previousFormatRoundTrip(directory); });
+        runStage("widebandEvidenceRoundTrip", [&] { widebandEvidenceRoundTrip(directory); });
+        runStage("silentExcitationRoundTrip", [&] { silentExcitationRoundTrip(directory); });
         std::cout << "Draft/CAD/mesh/synthetic archive persistence and rejection tests passed.\n";
         return 0;
     } catch (const std::exception &error) {

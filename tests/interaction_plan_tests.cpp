@@ -1,6 +1,7 @@
 #include "fixture_geometry.hpp"
 #include <galerkin/interaction_plan.hpp>
 #include <galerkin/near_projection.hpp>
+#include <galerkin/regular_qualification.hpp>
 #include <galerkin/space.hpp>
 
 #include <algorithm>
@@ -39,14 +40,19 @@ void appendSphere(SurfaceMesh &mesh, Vec3 origin, double scale, unsigned refinem
     }
 }
 
-void checkMembership(const Space &space, const InteractionPlan &plan, double ratio) {
+void checkMembership(const Space &space, const InteractionPlan &plan, double ratio, double k = .7,
+                     double tolerance = 1e-5) {
     std::set<Pair> touching, near;
+    std::vector<RegularPanelBounds> bounds;
+    for (const auto &panel : space.panels)
+        bounds.push_back(makeRegularPanelBounds(panel));
     for (std::uint32_t test = 0; test < space.panels.size(); ++test)
         for (std::uint32_t trial = 0; trial < space.panels.size(); ++trial) {
             const auto topology = classifyPair(space.panels[test], space.panels[trial]).topology;
             if (topology != PairTopology::disjoint)
                 touching.emplace(test, trial);
-            else if (isNearPair(space.panels[test], space.panels[trial], ratio))
+            else if (isNearPair(space.panels[test], space.panels[trial], ratio) ||
+                     qualifiedRegularDegree(bounds[test], bounds[trial], k, tolerance) == 0)
                 near.emplace(test, trial);
         }
     std::set<Pair> actualTouching, actualNear;
@@ -195,7 +201,7 @@ void membershipAndParallelTests() {
     settings.maximumSubdivisionDepth = 6;
     const auto serial = makeInteractionPlan(space, settings, .7, {}, 1),
                parallel = makeInteractionPlan(space, settings, .7, {}, 4);
-    checkMembership(space, serial, settings.nearDistanceRatio);
+    checkMembership(space, serial, settings.nearDistanceRatio, .7, settings.relativeTolerance);
     comparePlans(serial, parallel);
     require(serial.candidatePairs > serial.near.size() / 2,
             "Fixture does not exercise rejection of spatial false positives");
@@ -204,9 +210,9 @@ void membershipAndParallelTests() {
     checkSwappedPatches(space, serial);
     settings.nearDistanceRatio = 0;
     const auto disabled = makeInteractionPlan(space, settings, .7);
-    checkMembership(space, disabled, 0);
-    require(disabled.near.empty() && disabled.patches.empty() && disabled.candidatePairs == 0,
-            "Disabled near correction still generates integration jobs");
+    checkMembership(space, disabled, 0, .7, settings.relativeTolerance);
+    require(!disabled.near.empty() && !disabled.patches.empty(),
+            "Disabling geometric near correction must retain unqualified adaptive pairs");
     std::cout << "Variable-size plan: " << serial.candidatePairs << " candidates, "
               << serial.near.size() / 2 << " unique near pairs, " << serial.patches.size()
               << " shared patches\n";
@@ -232,7 +238,7 @@ void targetSectorTest() {
     settings.relativeTolerance = 1e-4;
     const auto full = makeInteractionPlan(space, settings, .7, {}, 1);
     const std::vector<std::uint32_t> targets{0, 3, 9};
-    const auto selected = makeInteractionPlan(space, settings, .7, {}, 2, targets);
+    const auto selected = makeInteractionPlan(space, settings, .7, {}, 2, std::size_t{1024} * 1024 * 1024, targets);
     const auto active = [&](unsigned test) {
         return std::find(targets.begin(), targets.end(), test) != targets.end();
     };
@@ -269,7 +275,7 @@ void targetSectorTest() {
           std::vector<std::uint32_t>{static_cast<std::uint32_t>(space.panels.size())}}) {
         bool rejected{};
         try {
-            (void)makeInteractionPlan(space, settings, .7, {}, 1, invalid);
+            (void)makeInteractionPlan(space, settings, .7, {}, 1, std::size_t{1024} * 1024 * 1024, invalid);
         } catch (const std::invalid_argument &) {
             rejected = true;
         }
@@ -298,6 +304,13 @@ void coordinateRangeTest() {
 void failureAndCancellationTests() {
     const auto space = buildSpace(hornsculpt::testing::sphere(0));
     auto insufficient = PairQuadratureSettings{};
+    bool budgetRejected = false;
+    try {
+        makeInteractionPlan(space, insufficient, .7, {}, 4, 128);
+    } catch (const std::runtime_error &error) {
+        budgetRejected = std::string(error.what()).find("budget") != std::string::npos;
+    }
+    require(budgetRejected, "Dense plan exceeded its hard host payload budget.");
     insufficient.relativeTolerance = 1e-10;
     insufficient.maximumSubdivisionDepth = 0;
     bool rejected = false;

@@ -8,7 +8,6 @@
 #include <complex>
 #include <limits>
 #include <numbers>
-#include <queue>
 #include <stdexcept>
 
 namespace hornsculpt::galerkin {
@@ -330,17 +329,17 @@ double maxNorm(const Moments &values) {
 struct AdaptiveRule {
     const Panel &test;
     const Panel &trial;
-    const PairQuadratureSettings &settings;
-    double k, scale;
-    std::stop_token stop;
+    PairQuadratureSettings settings;
+    double k;
     bool projection{};
-    std::vector<TriangleQuadraturePoint> coarse = triangleRule(6), fine = triangleRule(8);
+    std::stop_token stop;
+    AdaptiveQuadratureWorkspace &workspace;
     PairQuadratureRule result;
     Moments integral{};
     double absoluteError{};
     struct Leaf {
         Subtriangle test, trial;
-        Moments integral;
+        Moments integral{};
         double error{}, testDiameter{}, trialDiameter{}, innerError{}, outerError{};
         unsigned depth{}, degree{8}, innerIntervals{1};
     };
@@ -349,126 +348,332 @@ struct AdaptiveRule {
             return a.error < b.error;
         }
     };
+    std::vector<Leaf> pending, atLimit;
+    std::array<Leaf, 4> requestedLeaves;
+    std::array<PairQuadraturePatch, 4> requestedPatches;
+    // Three projected edge lines split a triangle into at most seven polygons;
+    // their fan triangulation has at most sixteen triangles. Requests remain
+    // bounded to four so CPU and CUDA batch consumers share the same contract.
+    std::array<Subtriangle, 16> initialParts;
+    unsigned initialCount{}, nextInitial{}, requestedCount{};
+    bool finished{};
+    std::size_t charged{sizeof(AdaptiveRule)};
+    PairQuadraturePatch patch(const Leaf &leaf) const {
+        PairQuadraturePatch mappedPatch{};
+        mappedPatch.degree = leaf.degree;
+        mappedPatch.projection = projection ? 1 : 0;
+        mappedPatch.projectionIntervals = leaf.innerIntervals;
+        mappedPatch.areaFraction = leaf.test.fraction * leaf.trial.fraction;
+        for (unsigned i = 0; i < 3; ++i)
+            for (unsigned j = 0; j < 3; ++j) {
+                mappedPatch.test[3 * i + j] = leaf.test.vertices[i][j];
+                mappedPatch.trial[3 * i + j] = leaf.trial.vertices[i][j];
+            }
+        return mappedPatch;
+    }
+    AdaptiveRule(const Panel &a, const Panel &b, PairQuadratureSettings q, double frequency,
+                 AdaptiveQuadratureWorkspace &budget, std::stop_token token)
+        : test(a), trial(b), settings(q), k(frequency), stop(token), workspace(budget) {
+        account(sizeof(AdaptiveRule));
+        projection =
+            useProjection(test, trial, std::max(test.maximumEdgeLength, trial.maximumEdgeLength));
+        if (projection) {
+            const auto parts = projectionPartition(test, trial);
+            if (parts.size() > initialParts.size())
+                throw std::logic_error("Projected line partition exceeds its triangle bound.");
+            for (const auto &part : parts)
+                initialParts[initialCount++] = part;
+        } else
+            initialParts[initialCount++] = {};
+        requestInitial();
+    }
+    void requestInitial() {
+        requestedCount = 0;
+        while (nextInitial < initialCount && requestedCount < requestedLeaves.size()) {
+            requestedLeaves[requestedCount] = leaf(initialParts[nextInitial++], {}, 0, 8);
+            requestedPatches[requestedCount] = patch(requestedLeaves[requestedCount]);
+            ++requestedCount;
+        }
+    }
+    ~AdaptiveRule() {
+        workspace.release(charged);
+    }
+    std::size_t ownedBytes() const {
+        return sizeof(AdaptiveRule) + (pending.capacity() + atLimit.capacity()) * sizeof(Leaf) +
+               result.patches.capacity() * sizeof(PairQuadraturePatch);
+    }
+    void account(std::size_t value) {
+        if (value > settings.maximumWorkspaceBytes)
+            throw std::runtime_error("Pair quadrature workspace budget exceeded.");
+        result.peakWorkspaceBytes = std::max(result.peakWorkspaceBytes, value);
+    }
+    template <class T> void grow(std::vector<T> &values, std::size_t count) {
+        if (count <= values.capacity())
+            return;
+        const auto capacity = std::max(count, values.capacity() + values.capacity() / 2 + 1);
+        const auto current = ownedBytes(), oldBytes = values.capacity() * sizeof(T);
+        if (capacity >
+            (settings.maximumWorkspaceBytes - std::min(current, settings.maximumWorkspaceBytes)) /
+                sizeof(T))
+            throw std::runtime_error(
+                "Pair quadrature workspace budget exceeded before allocation.");
+        const auto added = capacity * sizeof(T);
+        account(current + added);
+        workspace.acquire(added);
+        charged += added;
+        try {
+            values.reserve(capacity);
+        } catch (...) {
+            workspace.release(added);
+            charged -= added;
+            throw;
+        }
+        workspace.release(oldBytes);
+        charged -= oldBytes;
+        // Standard vector implementations may reserve more than requested.
+        // Charge that excess immediately and reject it rather than hide it.
+        if (values.capacity() > capacity) {
+            const auto extra = (values.capacity() - capacity) * sizeof(T);
+            workspace.acquire(extra);
+            charged += extra;
+        }
+        account(ownedBytes());
+    }
     void cancelled() const {
         if (stop.stop_requested())
             throw std::runtime_error("Near-pair quadrature cancelled.");
     }
-    Leaf evaluate(const Subtriangle &tx, const Subtriangle &ty, unsigned depth, unsigned degree = 8,
-                  unsigned innerIntervals = 1) const {
-        cancelled();
-        const auto x = physical(test, tx, test.vertices[0]),
-                   y = physical(trial, ty, test.vertices[0]);
-        static const auto highCoarse = triangleRule(12), highFine = triangleRule(14);
-        const auto &outerCoarse = degree == 8 ? coarse : highCoarse;
-        const auto &outerFine = degree == 8 ? fine : highFine;
-        const auto low = projection ? projectionMoments(test, trial, tx, outerCoarse, 20,
-                                                        innerIntervals, k, scale, stop)
-                                    : moments(test, trial, tx, ty, outerCoarse, k, scale);
-        const auto high = projection ? projectionMoments(test, trial, tx, outerFine, 20,
-                                                         innerIntervals, k, scale, stop)
-                                     : moments(test, trial, tx, ty, outerFine, k, scale);
-        Moments difference{};
-        for (unsigned i = 0; i < high.size(); ++i)
-            difference[i] = high[i] - low[i];
-        const double outerError = maxNorm(difference);
-        double innerError{};
-        if (projection) {
-            const auto innerLow =
-                projectionMoments(test, trial, tx, outerFine, 14, innerIntervals, k, scale, stop);
-            for (unsigned i = 0; i < high.size(); ++i)
-                difference[i] = high[i] - innerLow[i];
-            innerError = maxNorm(difference);
+    Leaf leaf(const Subtriangle &a, const Subtriangle &b, unsigned depth, unsigned degree,
+              unsigned innerIntervals = 1) const {
+        return {a,
+                b,
+                {},
+                0,
+                diameter(physical(test, a, test.vertices[0])),
+                diameter(physical(trial, b, test.vertices[0])),
+                0,
+                0,
+                depth,
+                degree,
+                innerIntervals};
+    }
+    void include(Leaf value) {
+        absoluteError += value.error;
+        if (!std::isfinite(absoluteError))
+            throw std::runtime_error("Non-finite accumulated quadrature error.");
+        for (unsigned i = 0; i < integral.size(); ++i)
+            integral[i] += value.integral[i];
+        const bool outerAtLimit =
+            value.depth == settings.maximumSubdivisionDepth && value.degree == 14;
+        const unsigned nextInner = value.innerIntervals * 2;
+        const bool innerAtLimit =
+            nextInner > (1u << settings.maximumSubdivisionDepth) ||
+            std::uint64_t(192) * 400 * nextInner * nextInner > std::numeric_limits<unsigned>::max();
+        if ((!projection && outerAtLimit) ||
+            (projection && (value.innerError > value.outerError ? innerAtLimit : outerAtLimit))) {
+            grow(atLimit, atLimit.size() + 1);
+            atLimit.push_back(std::move(value));
+        } else {
+            grow(pending, pending.size() + 1);
+            pending.push_back(std::move(value));
+            std::push_heap(pending.begin(), pending.end(), LargestError{});
         }
-        (void)maxNorm(high);
-        return {tx,          ty,          high,          outerError + innerError,
-                diameter(x), diameter(y), innerError,    outerError,
-                depth,       degree,      innerIntervals};
     }
-    void append(const Leaf &leaf) {
-        result.maximumDepth = std::max(result.maximumDepth, leaf.depth);
-        PairQuadraturePatch patch{};
-        patch.degree = leaf.degree;
-        patch.projection = projection ? 1 : 0;
-        patch.projectionIntervals = leaf.innerIntervals;
-        patch.areaFraction = leaf.test.fraction * leaf.trial.fraction;
-        for (unsigned i = 0; i < 3; ++i)
-            for (unsigned j = 0; j < 3; ++j) {
-                patch.test[3 * i + j] = leaf.test.vertices[i][j];
-                patch.trial[3 * i + j] = leaf.trial.vertices[i][j];
-            }
-        result.patches.push_back(patch);
+    void append(const Leaf &value) {
+        result.maximumDepth = std::max(result.maximumDepth, value.depth);
+        grow(result.patches, result.patches.size() + 1);
+        result.patches.push_back(patch(value));
     }
-    void integrate() {
-        std::priority_queue<Leaf, std::vector<Leaf>, LargestError> pending;
-        std::vector<Leaf> atLimit;
-        auto include = [&](Leaf leaf) {
-            absoluteError += leaf.error;
-            for (unsigned i = 0; i < integral.size(); ++i)
-                integral[i] += leaf.integral[i];
-            const bool outerAtLimit =
-                leaf.depth == settings.maximumSubdivisionDepth && leaf.degree == 14;
-            const unsigned nextInner = leaf.innerIntervals * 2;
-            const bool innerAtLimit = nextInner > (1u << settings.maximumSubdivisionDepth) ||
-                                      std::uint64_t(192) * 400 * nextInner * nextInner >
-                                          std::numeric_limits<unsigned>::max();
-            // A local unresolved contribution can already fit inside the GLOBAL
-            // budget. Park it, retain its error, and refine other leaves before
-            // declaring failure. Never discard its integral or error estimate.
-            if ((!projection && outerAtLimit) ||
-                (projection && (leaf.innerError > leaf.outerError ? innerAtLimit : outerAtLimit)))
-                atLimit.push_back(std::move(leaf));
-            else
-                pending.push(std::move(leaf));
-        };
-        if (projection)
-            for (const auto &part : projectionPartition(test, trial))
-                include(evaluate(part, {}, 0));
-        else
-            include(evaluate({}, {}, 0));
-        // Bound the sum of local errors against the complete integral. Requiring
-        // every vanishing corner contribution to meet its own relative tolerance
-        // rejects converged near-touching pairs. Keep the existing safety factor.
-        while (absoluteError > settings.relativeTolerance * .2 * maxNorm(integral)) {
-            cancelled();
-            if (pending.empty())
-                throw std::runtime_error("Near-pair quadrature did not attain the requested error "
-                                         "tolerance before the subdivision limit.");
-            const auto leaf = pending.top();
-            pending.pop();
-            absoluteError = std::max(0.0, absoluteError - leaf.error);
-            for (unsigned i = 0; i < integral.size(); ++i)
-                integral[i] -= leaf.integral[i];
-            if (projection && leaf.innerError > leaf.outerError) {
-                const unsigned intervals = leaf.innerIntervals * 2;
-                include(evaluate(leaf.test, leaf.trial, leaf.depth, leaf.degree, intervals));
-                continue;
+    void advance() {
+        cancelled();
+        requestedCount = 0;
+        if (nextInitial < initialCount) {
+            requestInitial();
+            return;
+        }
+        if (absoluteError <= settings.relativeTolerance * .2 * maxNorm(integral)) {
+            for (const auto &value : atLimit)
+                append(value);
+            while (!pending.empty()) {
+                append(pending.front());
+                std::pop_heap(pending.begin(), pending.end(), LargestError{});
+                pending.pop_back();
             }
-            if (leaf.depth == settings.maximumSubdivisionDepth) {
-                // Increase polynomial accuracy before rejecting a spatially
-                // resolved leaf. This changes neither the error budget nor
-                // the physical panel subdivision and is also used on the GPU.
-                include(evaluate(leaf.test, leaf.trial, leaf.depth, 14, leaf.innerIntervals));
-                continue;
-            }
+            const auto reference = maxNorm(integral);
+            if (!(reference > 0))
+                throw std::runtime_error(
+                    "Near-pair quadrature has no finite nonzero reference scale.");
+            result.estimatedRelativeError = absoluteError / reference;
+            if (!std::isfinite(result.estimatedRelativeError) ||
+                result.estimatedRelativeError > settings.relativeTolerance)
+                throw std::runtime_error(
+                    "Near-pair quadrature global error estimate exceeds the requested tolerance.");
+            finished = true;
+            return;
+        }
+        if (pending.empty())
+            throw std::runtime_error("Near-pair quadrature did not attain the requested error "
+                                     "tolerance before the subdivision limit.");
+        const auto value = pending.front();
+        std::pop_heap(pending.begin(), pending.end(), LargestError{});
+        pending.pop_back();
+        absoluteError = std::max(0.0, absoluteError - value.error);
+        for (unsigned i = 0; i < integral.size(); ++i)
+            integral[i] -= value.integral[i];
+        if (projection && value.innerError > value.outerError) {
+            requestedLeaves[0] =
+                leaf(value.test, value.trial, value.depth, value.degree, value.innerIntervals * 2);
+            requestedCount = 1;
+        } else if (value.depth == settings.maximumSubdivisionDepth) {
+            requestedLeaves[0] =
+                leaf(value.test, value.trial, value.depth, 14, value.innerIntervals);
+            requestedCount = 1;
+        } else {
             if (pending.size() + atLimit.size() + 4 > 50000)
                 throw std::runtime_error(
                     "Near-pair quadrature exceeds the fifty-thousand-patch safety limit.");
-            if (projection || leaf.testDiameter >= leaf.trialDiameter)
-                for (const auto &child : subdivide(leaf.test))
-                    include(evaluate(child, leaf.trial, leaf.depth + 1, 8, leaf.innerIntervals));
+            if (projection || value.testDiameter >= value.trialDiameter)
+                for (const auto &child : subdivide(value.test))
+                    requestedLeaves[requestedCount++] =
+                        leaf(child, value.trial, value.depth + 1, 8, value.innerIntervals);
             else
-                for (const auto &child : subdivide(leaf.trial))
-                    include(evaluate(leaf.test, child, leaf.depth + 1));
+                for (const auto &child : subdivide(value.trial))
+                    requestedLeaves[requestedCount++] = leaf(value.test, child, value.depth + 1, 8);
         }
-        for (const auto &leaf : atLimit)
-            append(leaf);
-        while (!pending.empty()) {
-            append(pending.top());
-            pending.pop();
+        for (unsigned i = 0; i < requestedCount; ++i)
+            requestedPatches[i] = patch(requestedLeaves[i]);
+    }
+    void commit(std::span<const PairPatchEstimate> estimates) {
+        cancelled();
+        if (finished || estimates.size() != requestedCount)
+            throw std::invalid_argument("Adaptive patch commit count/state mismatch.");
+        for (const auto &estimate : estimates) {
+            if (!(estimate.absoluteError >= 0) || !std::isfinite(estimate.absoluteError) ||
+                !(estimate.innerError >= 0) || !std::isfinite(estimate.innerError) ||
+                !(estimate.outerError >= 0) || !std::isfinite(estimate.outerError))
+                throw std::runtime_error(
+                    "Near-pair quadrature produced a non-finite error estimate.");
+            (void)maxNorm(estimate.integral);
         }
+        for (unsigned i = 0; i < requestedCount; ++i) {
+            auto value = requestedLeaves[i];
+            value.integral = estimates[i].integral;
+            value.error = estimates[i].absoluteError;
+            value.innerError = estimates[i].innerError;
+            value.outerError = estimates[i].outerError;
+            include(std::move(value));
+        }
+        advance();
     }
 };
 } // namespace
+
+AdaptiveQuadratureWorkspace::AdaptiveQuadratureWorkspace(std::size_t maximumBytes)
+    : maximum_(maximumBytes) {}
+void AdaptiveQuadratureWorkspace::acquire(std::size_t bytes) {
+    if (bytes > maximum_ - std::min(live_, maximum_))
+        throw std::runtime_error(
+            "Adaptive pair batch workspace budget exceeded before allocation.");
+    live_ += bytes;
+    peak_ = std::max(peak_, live_);
+}
+void AdaptiveQuadratureWorkspace::release(std::size_t bytes) noexcept {
+    live_ -= bytes;
+}
+std::size_t AdaptiveQuadratureWorkspace::liveBytes() const noexcept {
+    return live_;
+}
+std::size_t AdaptiveQuadratureWorkspace::peakBytes() const noexcept {
+    return peak_;
+}
+struct AdaptivePairQuadratureState::Implementation {
+    AdaptiveRule rule;
+    Implementation(const Panel &test, const Panel &trial, const PairQuadratureSettings &settings,
+                   double k, AdaptiveQuadratureWorkspace &workspace, std::stop_token stop)
+        : rule(test, trial, settings, k, workspace, stop) {}
+};
+AdaptivePairQuadratureState::AdaptivePairQuadratureState(const Panel &test, const Panel &trial,
+                                                         const PairQuadratureSettings &settings,
+                                                         double k,
+                                                         AdaptiveQuadratureWorkspace &workspace,
+                                                         std::stop_token stop) {
+    if (!std::isfinite(k) || k < 0 || !std::isfinite(settings.relativeTolerance) ||
+        settings.relativeTolerance <= 0 || settings.maximumSubdivisionDepth > 16 ||
+        classifyPair(test, trial).topology != PairTopology::disjoint)
+        throw std::invalid_argument("Invalid adaptive pair settings or non-disjoint topology.");
+    if (sizeof(Implementation) > settings.maximumWorkspaceBytes)
+        throw std::runtime_error("Pair quadrature workspace budget exceeded before allocation.");
+    workspace.acquire(sizeof(Implementation));
+    try {
+        impl_ = std::make_unique<Implementation>(test, trial, settings, k, workspace, stop);
+    } catch (...) {
+        workspace.release(sizeof(Implementation));
+        throw;
+    }
+}
+AdaptivePairQuadratureState::~AdaptivePairQuadratureState() = default;
+std::span<const PairQuadraturePatch> AdaptivePairQuadratureState::requests() const noexcept {
+    return std::span(impl_->rule.requestedPatches).first(impl_->rule.requestedCount);
+}
+void AdaptivePairQuadratureState::commit(std::span<const PairPatchEstimate> estimates) {
+    impl_->rule.commit(estimates);
+}
+bool AdaptivePairQuadratureState::done() const noexcept {
+    return impl_->rule.finished;
+}
+const PairQuadratureRule &AdaptivePairQuadratureState::result() const {
+    if (!done())
+        throw std::logic_error("Adaptive quadrature result is not complete.");
+    return impl_->rule.result;
+}
+PairQuadratureRule AdaptivePairQuadratureState::takeResult() {
+    if (!done())
+        throw std::logic_error("Adaptive quadrature result is not complete.");
+    auto &rule = impl_->rule;
+    rule.workspace.release(rule.result.patches.capacity() * sizeof(PairQuadraturePatch));
+    rule.charged -= rule.result.patches.capacity() * sizeof(PairQuadraturePatch);
+    return std::move(rule.result);
+}
+PairPatchEstimate estimatePairPatchCpu(const Panel &test, const Panel &trial,
+                                       const PairQuadraturePatch &patch, double k,
+                                       std::stop_token stop) {
+    if ((patch.degree != 8 && patch.degree != 14) || !std::isfinite(k) || k < 0)
+        throw std::invalid_argument("Invalid CPU adaptive patch estimate.");
+    static const auto low6 = triangleRule(6), high8 = triangleRule(8), low12 = triangleRule(12),
+                      high14 = triangleRule(14);
+    Subtriangle a, b;
+    a.fraction = patch.areaFraction;
+    b.fraction = 1;
+    for (unsigned i = 0; i < 3; ++i)
+        for (unsigned j = 0; j < 3; ++j) {
+            a.vertices[i][j] = patch.test[3 * i + j];
+            b.vertices[i][j] = patch.trial[3 * i + j];
+        }
+    const auto scale = std::max(test.maximumEdgeLength, trial.maximumEdgeLength);
+    const auto &outerLow = patch.degree == 8 ? low6 : low12;
+    const auto &outerHigh = patch.degree == 8 ? high8 : high14;
+    const auto low = patch.projection ? projectionMoments(test, trial, a, outerLow, 20,
+                                                          patch.projectionIntervals, k, scale, stop)
+                                      : moments(test, trial, a, b, outerLow, k, scale);
+    const auto high = patch.projection
+                          ? projectionMoments(test, trial, a, outerHigh, 20,
+                                              patch.projectionIntervals, k, scale, stop)
+                          : moments(test, trial, a, b, outerHigh, k, scale);
+    Moments difference{};
+    for (unsigned i = 0; i < 36; ++i)
+        difference[i] = high[i] - low[i];
+    (void)maxNorm(high);
+    const double outerError = maxNorm(difference);
+    double innerError{};
+    if (patch.projection) {
+        const auto innerLow = projectionMoments(test, trial, a, outerHigh, 14,
+                                                patch.projectionIntervals, k, scale, stop);
+        for (unsigned i = 0; i < 36; ++i)
+            difference[i] = high[i] - innerLow[i];
+        innerError = maxNorm(difference);
+    }
+    return {high, outerError + innerError, innerError, outerError};
+}
 
 std::vector<GaussPoint> gaussLegendre01(unsigned order) {
     if (order < 2 || order > 20)
@@ -519,6 +724,10 @@ std::vector<TriangleQuadraturePoint> triangleRule(unsigned degree) {
                 {{1.0 / 6, 2.0 / 3, 1.0 / 6}, 1.0 / 6},
                 {{1.0 / 6, 1.0 / 6, 2.0 / 3}, 1.0 / 6}};
     std::vector<TriangleQuadraturePoint> result;
+    // Fixed rule payloads are budgeted before construction by the adaptive
+    // state; avoid implicit vector growth and its transient extra allocation.
+    if (degree == 4 || degree == 6 || degree == 8)
+        result.reserve(degree == 4 ? 6 : degree == 6 ? 12 : 16);
     auto three = [&](double repeated, double other, double weight) {
         for (unsigned i = 0; i < 3; ++i) {
             TriangleQuadraturePoint point{{repeated, repeated, repeated}, weight};
@@ -609,7 +818,7 @@ std::vector<PairQuadraturePoint> referencePairRule(PairTopology topology, unsign
 
 PairQuadratureRule makePairQuadrature(const Panel &test, const Panel &trial,
                                       const PairQuadratureSettings &settings, double wavenumber,
-                                      std::stop_token stop) {
+                                      std::stop_token stop, bool forceAdaptive) {
     if (stop.stop_requested())
         throw std::runtime_error("Near-pair quadrature cancelled.");
     if ((settings.regularOrder != 2 && settings.regularOrder != 4) || settings.singularOrder < 2 ||
@@ -622,30 +831,53 @@ PairQuadratureRule makePairQuadrature(const Panel &test, const Panel &trial,
     PairQuadratureRule result;
     result.topology = permutation.topology;
     if (permutation.topology != PairTopology::disjoint) {
+        const auto count = std::size_t(pairSectorCount(permutation.topology)) *
+                           settings.singularOrder * settings.singularOrder *
+                           settings.singularOrder * settings.singularOrder;
+        const auto expected =
+            count * sizeof(PairQuadraturePoint) + settings.singularOrder * sizeof(GaussPoint);
+        if (expected > settings.maximumWorkspaceBytes)
+            throw std::runtime_error(
+                "Pair quadrature workspace budget exceeded before allocation.");
         result.points = referencePairRule(permutation.topology, settings.singularOrder);
+        result.peakWorkspaceBytes = result.points.capacity() * sizeof(PairQuadraturePoint) +
+                                    settings.singularOrder * sizeof(GaussPoint);
+        if (result.peakWorkspaceBytes > settings.maximumWorkspaceBytes)
+            throw std::runtime_error("Pair quadrature actual workspace exceeds budget.");
         for (auto &point : result.points)
             point = permutePairPoint(point, permutation);
         return result;
     }
-    const double scale = std::max(test.maximumEdgeLength, trial.maximumEdgeLength);
-    if (!isNearPair(test, trial, settings.nearDistanceRatio)) {
+    if (!forceAdaptive && !isNearPair(test, trial, settings.nearDistanceRatio)) {
+        const auto count = settings.regularOrder == 2 ? 3u : 6u;
+        const auto expected = count * sizeof(TriangleQuadraturePoint) +
+                              std::size_t(count) * count * sizeof(PairQuadraturePoint);
+        if (expected > settings.maximumWorkspaceBytes)
+            throw std::runtime_error(
+                "Pair quadrature workspace budget exceeded before allocation.");
         const auto regular = triangleRule(settings.regularOrder);
+        result.points.reserve(std::size_t(count) * count);
+        result.peakWorkspaceBytes = regular.capacity() * sizeof(TriangleQuadraturePoint) +
+                                    result.points.capacity() * sizeof(PairQuadraturePoint);
+        if (result.peakWorkspaceBytes > settings.maximumWorkspaceBytes)
+            throw std::runtime_error("Pair quadrature actual workspace exceeds budget.");
         for (const auto &x : regular)
             for (const auto &y : regular)
                 result.points.push_back(mappedPoint(x, y, {}, {}));
         return result;
     }
-    AdaptiveRule adaptive{
-        test, trial, settings, wavenumber, scale, stop, useProjection(test, trial, scale)};
-    adaptive.integrate();
-    const double reference = maxNorm(adaptive.integral);
-    if (!(reference > 0))
-        throw std::runtime_error("Near-pair quadrature has no finite nonzero reference scale.");
-    adaptive.result.estimatedRelativeError = adaptive.absoluteError / reference;
-    if (!std::isfinite(adaptive.result.estimatedRelativeError) ||
-        adaptive.result.estimatedRelativeError > settings.relativeTolerance)
-        throw std::runtime_error(
-            "Near-pair quadrature global error estimate exceeds the requested tolerance.");
-    return std::move(adaptive.result);
+    AdaptiveQuadratureWorkspace workspace(settings.maximumWorkspaceBytes);
+    AdaptivePairQuadratureState state(test, trial, settings, wavenumber, workspace, stop);
+    while (!state.done()) {
+        std::array<PairPatchEstimate, 4> estimates;
+        const auto requests = state.requests();
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (stop.stop_requested())
+                throw std::runtime_error("Near-pair quadrature cancelled.");
+            estimates[i] = estimatePairPatchCpu(test, trial, requests[i], wavenumber, stop);
+        }
+        state.commit(std::span(estimates).first(requests.size()));
+    }
+    return state.takeResult();
 }
 } // namespace hornsculpt::galerkin

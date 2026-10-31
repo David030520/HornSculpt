@@ -230,6 +230,13 @@ FreeCadDock::FreeCadDock(QMainWindow *parent)
     connect(apply_, &QPushButton::clicked, this, [this] {
         const auto ids = selectedFaces();
         if (!ids.empty() && boundary_->currentIndex() >= 0) {
+            if (boundary_->currentIndex() == 1 &&
+                std::any_of(ids.begin(), ids.end(),
+                            [this](auto id) { return bemInterfaceFaces_.contains(id); })) {
+                if (onError)
+                    onError(tr("BEM-Interfaceflächen können nicht als Driven zugewiesen werden."));
+                return;
+            }
             if (onAssignmentEditStarted)
                 onAssignmentEditStarted();
             link_.setBoundaries(ids,
@@ -293,6 +300,10 @@ void FreeCadDock::ensureListening() {
     refresh();
     publishAvailability();
 }
+bool FreeCadDock::hasLiveLink() const {
+    return link_.isListening() || link_.isConnected();
+}
+
 bool FreeCadDock::isSourceAvailable() const {
     const auto snapshot = link_.snapshot();
     return (offlineSnapshot_ || link_.isConnected()) && !awaitingSnapshot_ &&
@@ -387,6 +398,8 @@ void FreeCadDock::refresh() {
                      : link_.isListening() ? tr("Wartet auf FreeCAD · Port %1").arg(link_.port())
                                            : tr("FreeCAD · getrennt"));
     const auto current = link_.snapshot();
+    if (current && current->sessionId == "gmsh-import-offline")
+        status_->setText(tr("Gmsh · importierte Polygonquelle · offline"));
     const auto selection = current && current->documentId == selectionDocumentId_
                                ? selectedFaces()
                                : std::vector<std::uint32_t>{};
@@ -425,7 +438,10 @@ void FreeCadDock::refresh() {
                 item->setSelected(true);
             }
         }
-        const auto source = current->geometry ? tr("CAD · BRep") : tr("CAD · Polygonquelle");
+        const auto source =
+            current->sessionId == "gmsh-import-offline"
+                ? tr("Gmsh · Polygonquelle")
+                : (current->geometry ? tr("CAD · BRep") : tr("CAD · Polygonquelle"));
         mapping_->setText(source + QStringLiteral(" · ") +
                           (reviewCount || !current->unresolvedPreviousFaces.empty()
                                ? tr("%1 zu prüfen · %2 entfallen")
@@ -447,6 +463,10 @@ void FreeCadDock::refresh() {
     setInterfaceFaces(interfaceFaces_, interfacesActive_);
     selectionChanged();
 }
+void FreeCadDock::setBemInterfaceFaces(std::set<std::uint32_t> faces) {
+    bemInterfaceFaces_ = std::move(faces);
+    setInterfaceFaces(interfaceFaces_, interfacesActive_);
+}
 void FreeCadDock::setInterfaceFaces(std::set<std::uint32_t> faces, bool active) {
     interfaceFaces_ = std::move(faces);
     interfacesActive_ = active;
@@ -462,19 +482,28 @@ void FreeCadDock::setInterfaceFaces(std::set<std::uint32_t> faces, bool active) 
         if (found == current->faces.end())
             continue;
         const bool interface = interfaceFaces_.contains(id);
+        const bool bemInterface = bemInterfaceFaces_.contains(id);
         item->setText(
-            1, interface ? (found->boundary == BoundaryCondition::wall
-                                ? (active ? tr("Interface ↔ LEM") : tr("Interface ↔ LEM · aus"))
-                                : tr("Interface · Tagkonflikt"))
+            1, bemInterface
+                   ? (found->boundary == BoundaryCondition::wall ? tr("Interface ↔ BEM")
+                                                                 : tr("Interface · Tagkonflikt"))
+               : interface ? (found->boundary == BoundaryCondition::wall
+                                  ? (active ? tr("Interface ↔ LEM") : tr("Interface ↔ LEM · aus"))
+                                  : tr("Interface · Tagkonflikt"))
                : found->boundary == BoundaryCondition::driven ? QStringLiteral("Driven")
                                                               : QStringLiteral("Wall"));
         item->setToolTip(
-            1, interface ? tr("Virtuelle Rechenfläche zwischen BEM-Frontluft und LEM-Innenvolumen. "
-                              "Das geometrische Basistag bleibt Wall; bei aktiver Kopplung ist "
-                              "dies keine schallharte Materialwand. Flächenauswahl im "
-                              "LEM-Anschluss hebt das Interface im 3D-Modell hervor.")
+            1,
+            bemInterface ? tr("Transparente Grenzfläche zwischen zwei BEM-Gebieten; Basistag Wall, "
+                              "keine Driven-Fläche.")
+            : interface  ? tr("Virtuelle Rechenfläche zwischen BEM-Frontluft und LEM-Innenvolumen. "
+                               "Das geometrische Basistag bleibt Wall; bei aktiver Kopplung ist "
+                               "dies keine schallharte Materialwand. Flächenauswahl im "
+                               "LEM-Anschluss hebt das Interface im 3D-Modell hervor.")
                          : QString{});
-        item->setForeground(1, interface ? QBrush(QColor(126, 65, 160)) : QBrush());
+        item->setForeground(1, bemInterface
+                                   ? QBrush(QColor(0, 128, 150))
+                                   : (interface ? QBrush(QColor(126, 65, 160)) : QBrush()));
     }
     faces_->resizeColumnToContents(1);
 }

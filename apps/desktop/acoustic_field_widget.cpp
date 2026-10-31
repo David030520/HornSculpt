@@ -1,9 +1,9 @@
 #include "acoustic_field_widget.hpp"
 #include "numeric_input.hpp"
 #include <QComboBox>
-#include <QDoubleSpinBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -41,21 +41,26 @@ FieldDisplaySettings cacheKey(FieldDisplaySettings s) {
 }
 // Only data used by field evaluation and its near-quadrature settings belong here.
 bool sameFieldRequest(const std::optional<BemRequest> &a, const std::optional<BemRequest> &b) {
-    if (a.has_value() != b.has_value()) return false;
-    if (!a) return true;
+    if (a.has_value() != b.has_value())
+        return false;
+    if (!a)
+        return true;
     if (a->medium.density != b->medium.density || a->medium.soundSpeed != b->medium.soundSpeed ||
         a->numerics.nearRelativeTolerance != b->numerics.nearRelativeTolerance ||
         a->numerics.nearMaximumDepth != b->numerics.nearMaximumDepth ||
         a->axisymmetric != b->axisymmetric || a->infiniteBaffle != b->infiniteBaffle ||
-        a->coupling.has_value() != b->coupling.has_value() ||
+        a->subdomains != b->subdomains || a->coupling.has_value() != b->coupling.has_value() ||
         (a->coupling && !lem::samePhysics(*a->coupling, *b->coupling)) ||
-        a->excitations.size() != b->excitations.size()) return false;
+        a->excitations.size() != b->excitations.size())
+        return false;
     for (std::size_t i = 0; i < a->excitations.size(); ++i) {
         const auto &x = a->excitations[i], &y = b->excitations[i];
-        if (x.name != y.name || x.faces.size() != y.faces.size()) return false;
+        if (x.name != y.name || x.faces.size() != y.faces.size())
+            return false;
         for (std::size_t j = 0; j < x.faces.size(); ++j)
             if (x.faces[j].faceId != y.faces[j].faceId ||
-                x.faces[j].normalVelocity != y.faces[j].normalVelocity) return false;
+                x.faces[j].normalVelocity != y.faces[j].normalVelocity)
+                return false;
     }
     return true;
 }
@@ -299,11 +304,11 @@ AcousticFieldWidget::AcousticFieldWidget(QWidget *parent) : QWidget(parent) {
         connect(w, &QSpinBox::valueChanged, this, [this] { controlsChanged(true); });
     connect(plane_, &QComboBox::currentIndexChanged, this, [this] { controlsChanged(true); });
     connect(quantity_, &QComboBox::currentIndexChanged, this, [this] { controlsChanged(false); });
-    connect(previousFrequency_, &QToolButton::clicked, this, [this] {
-        frequency_->setCurrentIndex(std::max(0, frequency_->currentIndex() - 1));
-    });
+    connect(previousFrequency_, &QToolButton::clicked, this,
+            [this] { frequency_->setCurrentIndex(std::max(0, frequency_->currentIndex() - 1)); });
     connect(nextFrequency_, &QToolButton::clicked, this, [this] {
-        frequency_->setCurrentIndex(std::min(frequency_->count() - 1, frequency_->currentIndex() + 1));
+        frequency_->setCurrentIndex(
+            std::min(frequency_->count() - 1, frequency_->currentIndex() + 1));
     });
     connect(frequencySlider_, &QSlider::valueChanged, frequency_, &QComboBox::setCurrentIndex);
     connect(frequency_, &QComboBox::currentIndexChanged, this, [this] {
@@ -316,7 +321,8 @@ AcousticFieldWidget::AcousticFieldWidget(QWidget *parent) : QWidget(parent) {
         }
         restoreCachedField();
         updateAvailability();
-        if (onChanged) onChanged();
+        if (onChanged)
+            onChanged();
     });
     connect(excitation_, &QComboBox::currentIndexChanged, this, [this] {
         cancel();
@@ -324,7 +330,8 @@ AcousticFieldWidget::AcousticFieldWidget(QWidget *parent) : QWidget(parent) {
         settings_.excitationIndex = excitation_->currentIndex();
         restoreCachedField();
         updateAvailability();
-        if (onChanged) onChanged();
+        if (onChanged)
+            onChanged();
     });
     setSettings({});
     updateAvailability();
@@ -342,9 +349,9 @@ AcousticFieldWidget::~AcousticFieldWidget() {
 }
 void AcousticFieldWidget::showEvent(QShowEvent *event) {
     QWidget::showEvent(event);
-    for (const auto *name : {"fieldPlane", "fieldFrequency", "fieldExcitation", "fieldQuantity",
-                             "evaluateField", "cancelField", "exportField", "focusField3D",
-                             "fieldDetailsToggle"}) {
+    for (const auto *name :
+         {"fieldPlane", "fieldFrequency", "fieldExcitation", "fieldQuantity", "evaluateField",
+          "cancelField", "exportField", "focusField3D", "fieldDetailsToggle"}) {
         auto *control = findChild<QWidget *>(QString::fromLatin1(name));
         control->ensurePolished();
         control->setMinimumHeight(control->minimumSizeHint().height());
@@ -481,7 +488,8 @@ void AcousticFieldWidget::setSnapshot(std::shared_ptr<const SurfaceMesh> mesh,
     frequency_->setCurrentIndex(found >= 0 ? found : frequency_->count() / 2);
     if (selectedExcitation >= 0 && selectedExcitation < excitation_->count())
         excitation_->setCurrentIndex(selectedExcitation);
-    settings_.frequencyHz = frequency_->currentIndex() >= 0 ? frequency_->currentData().toDouble() : 0;
+    settings_.frequencyHz =
+        frequency_->currentIndex() >= 0 ? frequency_->currentData().toDouble() : 0;
     settings_.excitationIndex = excitation_->currentIndex();
     {
         const QSignalBlocker blocker(frequencySlider_);
@@ -500,8 +508,18 @@ bool AcousticFieldWidget::canEvaluate() const noexcept {
             fi < result_->frequencies.size() && ei < result_->frequencies[fi].excitations.size();
         if (ready) {
             const auto &e = result_->frequencies[fi].excitations[ei];
-            ready = e.boundary() && e.boundary()->pressureTrace.size() == mesh_->vertices.size() &&
-                    e.boundary()->normalDerivative.size() == mesh_->triangles.size();
+            if (request_->subdomains) {
+                ready = e.subdomainTraces().size() == request_->subdomains->domains.size();
+                for (const auto &trace : e.subdomainTraces()) {
+                    ready = ready && trace.vertexIndices.size() == trace.pressureTrace.size() &&
+                            trace.triangleIndices.size() == trace.normalDerivative.size();
+                    for (const auto &flux : trace.interfaceFluxes)
+                        ready = ready && flux.vertexIndices.size() == flux.normalDerivative.size();
+                }
+            } else
+                ready = e.boundary() &&
+                        e.boundary()->pressureTrace.size() == mesh_->vertices.size() &&
+                        e.boundary()->normalDerivative.size() == mesh_->triangles.size();
         }
     }
     return ready;
@@ -520,8 +538,9 @@ std::shared_ptr<const PressureFieldPlane> AcousticFieldWidget::fieldPlane() cons
 }
 void AcousticFieldWidget::publishField() {
     if (onFieldChanged)
-        onFieldChanged(field_, {settings_.quantity, settings_.minimumDb, settings_.maximumDb,
-                                animationTimer_->isActive() ? animationPhase_ : settings_.phaseDegrees});
+        onFieldChanged(field_,
+                       {settings_.quantity, settings_.minimumDb, settings_.maximumDb,
+                        animationTimer_->isActive() ? animationPhase_ : settings_.phaseDegrees});
 }
 void AcousticFieldWidget::clearField() {
     animationTimer_->stop();
@@ -599,19 +618,22 @@ void AcousticFieldWidget::requestEvaluation() {
                              ei, id, revision, current, finished](std::stop_token stop) {
             struct CompletionFlag {
                 std::atomic_bool *finished;
-                ~CompletionFlag() { finished->store(true); }
+                ~CompletionFlag() {
+                    finished->store(true);
+                }
             } markFinished{finished.get()};
             try {
                 const auto &frequency = result->frequencies.at(fi);
                 const auto &solution = frequency.excitations.at(ei);
-                const auto lateral = settings.vertical ? verticalDirection(frame) : frame.horizontal;
+                const auto lateral =
+                    settings.vertical ? verticalDirection(frame) : frame.horizontal;
                 std::vector<Vec3> points;
                 points.reserve(std::size_t(settings.lateralCount) * settings.axialCount);
                 for (unsigned z = 0; z < settings.axialCount; ++z)
                     for (unsigned x = 0; x < settings.lateralCount; ++x) {
-                        const double ax =
-                            settings.minimumAxial + (settings.maximumAxial - settings.minimumAxial) *
-                                                        z / (settings.axialCount - 1);
+                        const double ax = settings.minimumAxial +
+                                          (settings.maximumAxial - settings.minimumAxial) * z /
+                                              (settings.axialCount - 1);
                         const double lat = settings.minimumLateral +
                                            (settings.maximumLateral - settings.minimumLateral) * x /
                                                (settings.lateralCount - 1);
@@ -657,28 +679,33 @@ void AcousticFieldWidget::requestEvaluation() {
                 }
                 validatePressureFieldPlane(*plane);
                 const double largestStep = std::max(
-                    (settings.maximumLateral - settings.minimumLateral) / (settings.lateralCount - 1),
+                    (settings.maximumLateral - settings.minimumLateral) /
+                        (settings.lateralCount - 1),
                     (settings.maximumAxial - settings.minimumAxial) / (settings.axialCount - 1));
-                const bool coarse = largestStep > request.medium.soundSpeed / frequency.frequency / 6;
+                const bool coarse =
+                    largestStep > request.medium.soundSpeed / frequency.frequency / 6;
                 QMetaObject::invokeMethod(
                     this,
-                    [this, id, key = cacheKey(settings), plane = std::move(plane), air, unresolved, coarse]() mutable {
+                    [this, id, key = cacheKey(settings), plane = std::move(plane), air, unresolved,
+                     coarse]() mutable {
                         if (id != jobId_)
                             return;
                         busy_ = false;
                         error_.clear();
                         field_ = std::move(plane);
                         publishField();
-                        status_->setText(tr("%1 Luftpunkte · %2 Punkte ohne Quadraturkonvergenz%3")
-                                             .arg(air)
-                                             .arg(unresolved)
-                                             .arg(coarse ? tr(" · Raster gröber als λ/6") : QString{}));
+                        status_->setText(
+                            tr("%1 Luftpunkte · %2 Punkte ohne Quadraturkonvergenz%3")
+                                .arg(air)
+                                .arg(unresolved)
+                                .arg(coarse ? tr(" · Raster gröber als λ/6") : QString{}));
                         try {
                             fieldCache_.push_front({key, field_, status_->text()});
                             while (fieldCache_.size() > 8)
                                 fieldCache_.pop_back();
                         } catch (const std::bad_alloc &) {
-                            status_->setText(status_->text() + tr(" · Feldspeicher nicht verfügbar"));
+                            status_->setText(status_->text() +
+                                             tr(" · Feldspeicher nicht verfügbar"));
                         }
                         updateAvailability();
                     },
@@ -704,9 +731,11 @@ void AcousticFieldWidget::requestEvaluation() {
         status_->setText(tr("Schallfeld wird berechnet …"));
     } catch (const std::exception &e) {
         ++jobId_;
-        for (auto &worker : workers_) worker.thread.request_stop();
+        for (auto &worker : workers_)
+            worker.thread.request_stop();
         busy_ = false;
-        error_ = tr("Feldberechnung konnte nicht gestartet werden: %1").arg(QString::fromUtf8(e.what()));
+        error_ =
+            tr("Feldberechnung konnte nicht gestartet werden: %1").arg(QString::fromUtf8(e.what()));
         updateAvailability();
         status_->setText(error_);
     }

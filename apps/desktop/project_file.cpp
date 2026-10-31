@@ -1,4 +1,5 @@
 #include "galerkin/exterior_domain.hpp"
+#include "gmsh_source.hpp"
 #include "project_json.hpp"
 #include <QFile>
 #include <QJsonDocument>
@@ -144,7 +145,8 @@ void validateFaceSizes(const Project &p) {
         for (const auto &[id, size] : *sizes)
             if (!id || !std::isfinite(size) || size < p.meshing.adaptive.minimumEdgeLength ||
                 size > (sizes == &p.cadFaceTargetEdgeLengths && p.assembly.includeCad
-                            ? p.assembly.cadTargetEdgeLength : p.meshing.targetEdgeLength))
+                            ? p.assembly.cadTargetEdgeLength
+                            : p.meshing.targetEdgeLength))
                 invalid(QStringLiteral("Lokale Zielkante außerhalb der Netzeinstellungen."));
     for (const auto &[id, size] : p.draftFaceTargetEdgeLengths) {
         (void)size;
@@ -163,7 +165,7 @@ void validateFaceSizes(const Project &p) {
 Project decode(const QJsonObject &root, bool allowComparisons = true) {
     if (text(root["format"]) != "HornSculpt" || text(root["units"]) != "SI")
         invalid(QStringLiteral("Unbekanntes Format oder Einheit."));
-    const auto version = integer(root["version"], 15);
+    const auto version = integer(root["version"], 16);
     auto structural = root;
     if (version >= 15) {
         if (!structural.contains("comparisonSnapshots"))
@@ -177,6 +179,7 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
             invalid(QStringLiteral("Spaltparameter fehlen."));
         structural.remove("slot");
     }
+    structural.remove("gmshMetadata");
     structural.remove("assembly");
     if (version >= 11 && !structural.contains("asymmetry"))
         invalid(QStringLiteral("Asymmetrische Draft-Parameter fehlen."));
@@ -324,12 +327,19 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
         project.preview = std::make_shared<SurfaceMesh>(decodeMesh(root["preview"], false));
     if (!root["mesh"].isNull()) {
         auto mesh = std::make_shared<MeshingResult>();
-        mesh->mesh = decodeMesh(root["mesh"], true);
+        mesh->mesh = decodeMesh(root["mesh"], !root.contains("gmshMetadata"));
         mesh->quality = inspectMesh(mesh->mesh);
         project.mesh = std::move(mesh);
     }
     if (!root["cad"].isNull())
         project.cad = std::make_shared<CadSnapshot>(decodeCad(root["cad"], version >= 7));
+    if (root.contains("gmshMetadata")) {
+        if (!project.cad || project.source != ProjectSource::freecad ||
+            project.cad->sessionId != "gmsh-import-offline")
+            invalid(QStringLiteral("Gmsh-Metadaten benötigen eine importierte Polygonquelle."));
+        project.gmsh = decodeGmshMetadata(object(root["gmshMetadata"]), project.cad->mesh);
+    } else if (project.cad && project.cad->sessionId == "gmsh-import-offline")
+        invalid(QStringLiteral("Gmsh-Metadaten fehlen."));
     if (isPlacedAssembly(project.assembly) && project.source != ProjectSource::draft)
         invalid(QStringLiteral("Eine Draft-Baugruppe benötigt den Draft-Arbeitsbereich."));
     if (project.assembly.includeCad && !project.cad)
@@ -344,20 +354,35 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
     if (bool(project.preview) != (project.geometryRevision != 0) ||
         bool(project.mesh) != (project.meshRevision != 0))
         invalid(QStringLiteral("Netz und Revision passen nicht zusammen."));
-    project.simulation = decodeSimulation(root["simulation"]);
+    project.simulation = decodeSimulation(root["simulation"], version);
+    if (project.gmsh && project.mesh && project.meshRevision == project.revision) {
+        const auto orientedSource =
+            applyFaceOrientation(project.cad->mesh, project.cadReversedFaceIds);
+        if (orientedSource != project.mesh->mesh)
+            invalid(QStringLiteral("Geprüftes Gmsh-Netz stimmt nicht mit dem Importnetz überein."));
+        MeshingOptions options;
+        options.targetEdgeLength = project.meshing.targetEdgeLength;
+        options.adaptive = project.meshing.adaptive;
+        options.quality = project.meshing.quality;
+        options.faceTargetEdgeLengths = project.cadFaceTargetEdgeLengths;
+        (void)validateGmshMesh(project.mesh->mesh, project.simulation.settings.acousticRegions,
+                               options);
+    }
     const auto &a = project.simulation;
     if (a.revision > project.revision)
         invalid(QStringLiteral("Simulationsrevision liegt in der Zukunft."));
     const bool reduced = a.request && a.request->axisymmetric;
     if (a.current &&
         (project.geometryRevision != project.revision || a.revision != project.revision ||
-         (!reduced && (!project.mesh || project.meshRevision != project.revision ||
-                       !sameMesh(project.mesh->mesh, *a.mesh)))))
+         (!reduced &&
+          (!project.mesh || project.meshRevision != project.revision ||
+           !sameMesh(project.mesh->mesh, *(a.request->subdomains ? a.sourceMesh : a.mesh))))))
         invalid(QStringLiteral("Aktuelles Ergebnis gehört nicht zum aktuellen Netz."));
     const auto &activeOrientations = project.source == ProjectSource::draft
                                          ? project.draftReversedFaceIds
                                          : project.cadReversedFaceIds;
     if (!activeOrientations.empty() &&
+        !(project.gmsh && !project.simulation.settings.acousticRegions.empty()) &&
         ((project.mesh && project.meshRevision == project.revision) || (a.current && reduced))) {
         if (!project.preview || project.geometryRevision != project.revision ||
             !inspectMesh(*project.preview).watertight())
@@ -400,12 +425,15 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
             keys(entry, {"name", "project"});
             const auto rawName = text(entry["name"]);
             const auto name = rawName.trimmed();
-            if (name.isEmpty() || name != rawName || name.size() > 128 || !names.insert(name).second)
+            if (name.isEmpty() || name != rawName || name.size() > 128 ||
+                !names.insert(name).second)
                 invalid(QStringLiteral("Vergleichsname ist leer, zu lang oder doppelt."));
             auto snapshot = decode(object(entry["project"]), false);
-            if (!snapshot.simulation.result || !snapshot.simulation.request || !snapshot.simulation.mesh)
+            if (!snapshot.simulation.result || !snapshot.simulation.request ||
+                !snapshot.simulation.mesh)
                 invalid(QStringLiteral("Vergleichsstand benötigt ein berechnetes Ergebnis."));
-            project.comparisonSnapshots.push_back({name, std::make_shared<const Project>(std::move(snapshot))});
+            project.comparisonSnapshots.push_back(
+                {name, std::make_shared<const Project>(std::move(snapshot))});
         }
     }
     return project;
@@ -414,7 +442,7 @@ Project decode(const QJsonObject &root, bool allowComparisons = true) {
 QJsonObject encode(const Project &p) {
     auto root = encodeDraft(p);
     root.insert("format", "HornSculpt");
-    root.insert("version", p.comparisonSnapshots.empty() ? 14 : 15);
+    root.insert("version", 16);
     root.insert("assembly", encodeAssembly(p.assembly));
     root.insert("units", "SI");
     switch (p.source) {
@@ -435,6 +463,8 @@ QJsonObject encode(const Project &p) {
     root.insert("mesh",
                 p.mesh ? QJsonValue(encodeMesh(p.mesh->mesh)) : QJsonValue(QJsonValue::Null));
     root.insert("cad", p.cad ? QJsonValue(encodeCad(*p.cad)) : QJsonValue(QJsonValue::Null));
+    if (p.gmsh)
+        root.insert("gmshMetadata", encodeGmshMetadata(*p.gmsh));
     const auto &a = p.meshing.adaptive;
     root.insert(
         "meshing",
@@ -460,14 +490,14 @@ QJsonObject encode(const Project &p) {
     std::set<QString> names;
     for (const auto &entry : p.comparisonSnapshots) {
         const auto name = entry.name.trimmed();
-        if (name.isEmpty() || name != entry.name || name.size() > 128 || !names.insert(name).second ||
-            !entry.project || !entry.project->comparisonSnapshots.empty() ||
-            !entry.project->simulation.result || !entry.project->simulation.request || !entry.project->simulation.mesh)
+        if (name.isEmpty() || name != entry.name || name.size() > 128 ||
+            !names.insert(name).second || !entry.project ||
+            !entry.project->comparisonSnapshots.empty() || !entry.project->simulation.result ||
+            !entry.project->simulation.request || !entry.project->simulation.mesh)
             invalid(QStringLiteral("Ungültiger, doppelter oder verschachtelter Vergleichsstand."));
         snapshots.append(QJsonObject{{"name", name}, {"project", encode(*entry.project)}});
     }
-    if (!p.comparisonSnapshots.empty())
-        root.insert("comparisonSnapshots", snapshots);
+    root.insert("comparisonSnapshots", snapshots);
     return root;
 }
 } // namespace
@@ -524,6 +554,31 @@ FaceColors retainedCadFaceColors(const FaceColors &colors, const CadSnapshot *pr
     return retained;
 }
 
+std::vector<AcousticRegionDefinition>
+reconciledCadAcousticRegions(std::vector<AcousticRegionDefinition> regions,
+                             const CadSnapshot *previous, const CadSnapshot *current) {
+    const bool sameDocument = previous && current && previous->documentId == current->documentId;
+    const bool sameGeometry = sameDocument && previous->sessionId == current->sessionId &&
+                              previous->revision == current->revision;
+    const auto needsReview = [&](std::uint32_t id) {
+        if (!sameDocument)
+            return true;
+        const auto find = [id](const auto &faces) {
+            return std::find_if(faces.begin(), faces.end(),
+                                [id](const auto &face) { return face.id == id; });
+        };
+        const auto before = find(previous->faces), after = find(current->faces);
+        return before == previous->faces.end() || after == current->faces.end() ||
+               before->objectId != after->objectId || after->state == CadFaceState::needsReview ||
+               (!sameGeometry && after->state == CadFaceState::newFace);
+    };
+    for (auto &region : regions)
+        region.needsAssignmentReview |=
+            std::any_of(region.faceIds.begin(), region.faceIds.end(), needsReview) ||
+            std::any_of(region.interfaceFaceIds.begin(), region.interfaceFaceIds.end(),
+                        needsReview);
+    return regions;
+}
 lem::Network reconciledCadBemAssignments(lem::Network network, const CadSnapshot *previous,
                                          const CadSnapshot *current) {
     const bool sameDocument = previous && current && previous->documentId == current->documentId;

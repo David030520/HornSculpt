@@ -1,12 +1,13 @@
 #include "../galerkin/exterior_domain.hpp"
 #include "../galerkin/interaction_plan.hpp"
+#include "../galerkin/regular_qualification.hpp"
 #include "../galerkin/space.hpp"
 #include "../lem_coupling.hpp"
 #include "../planning_frequencies.hpp"
 #include "baffled_solver.hpp"
-#include "fmm_operator.hpp"
-#include "fmm_solve.hpp"
-#include "panel_integrals.cuh"
+#include "galerkin_pair_moments.cuh"
+#include "subdomain_solver.hpp"
+#include "support_fmm_solve.hpp"
 #include "workspace_size.hpp"
 #include <algorithm>
 #include <chrono>
@@ -262,14 +263,16 @@ class SolveWorkspace {
     std::unique_ptr<DeviceArray<Complex>> lu;
 };
 
-template <unsigned ruleCount>
-__global__ void
-assembleRegular(const RegularPanel *__restrict__ panels, int fluxCount, int pressureCount,
-                const RegularQuadraturePoint *__restrict__ rule,
-                const double *__restrict__ rowScale, const Complex *__restrict__ flux,
-                int excitationCount, double k, const unsigned *__restrict__ nearOffsets,
-                const unsigned *__restrict__ nearTrials, Complex *__restrict__ matrix,
-                Complex *__restrict__ rhs, int *__restrict__ error, unsigned firstTrial) {
+__global__ void assembleRegular(const Panel *__restrict__ panels, int fluxCount, int pressureCount,
+                                const galerkin::TriangleQuadraturePoint *__restrict__ rules,
+                                const galerkin::RegularPanelBounds *__restrict__ bounds,
+                                const double *__restrict__ rowScale,
+                                const Complex *__restrict__ flux, int excitationCount, double k,
+                                const unsigned *__restrict__ nearOffsets,
+                                const unsigned *__restrict__ nearTrials,
+                                Complex *__restrict__ matrix, Complex *__restrict__ rhs,
+                                int *__restrict__ error, unsigned firstTrial, double tolerance,
+                                unsigned minimumDegree) {
     const unsigned testIndex = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned trialIndex = firstTrial + blockIdx.y;
     if (testIndex >= static_cast<unsigned>(fluxCount))
@@ -295,24 +298,22 @@ assembleRegular(const RegularPanel *__restrict__ panels, int fluxCount, int pres
     }
     if (begin < stop && nearTrials[begin] == trialIndex)
         return;
-    MixedMoments moments{};
-    const auto centerDelta = sub(test.origin, trial.origin);
-    const auto baseDelta =
-        make_float3(static_cast<float>(centerDelta.x), static_cast<float>(centerDelta.y),
-                    static_cast<float>(centerDelta.z));
-    const float waveNumber = static_cast<float>(k), inverseK = 1.f / waveNumber;
-#pragma unroll 1
-    for (unsigned x = 0; x < ruleCount; ++x)
-#pragma unroll
-        for (unsigned y = 0; y < ruleCount; ++y) {
-            const auto delta = make_float3(baseDelta.x + test.points[x].x - trial.points[y].x,
-                                           baseDelta.y + test.points[x].y - trial.points[y].y,
-                                           baseDelta.z + test.points[x].z - trial.points[y].z);
-            mixedSample(moments, delta, test, trial, rule[x].barycentric, rule[y].barycentric,
-                        test.weights[x] * trial.weights[y], waveNumber, inverseK, false, error);
-        }
-    scatterMixed(moments, test, trial, pressureCount, fluxCount, trialIndex, excitationCount,
-                 static_cast<float>(k), rowScale, flux, matrix, rhs, error);
+    const auto degree = galerkin::qualifiedRegularDegreeUnchecked(
+        bounds[testIndex], bounds[trialIndex], k, tolerance, minimumDegree);
+    if (!degree) {
+        atomicExch(error, 4);
+        return;
+    }
+    const unsigned offset = degree == 4   ? 0
+                            : degree == 6 ? 6
+                                          : 18,
+                   count = degree == 4   ? 6
+                           : degree == 6 ? 12
+                                         : 16;
+    const auto moments =
+        integrateRegularPairThread<true>(test, trial, rules + offset, count, k, error, 0, 1);
+    scatterPair(moments, test, trial, pressureCount, fluxCount, trialIndex, excitationCount, k,
+                rowScale, flux, matrix, rhs, error);
 }
 template <class Moments>
 __device__ void completeBlock(Moments value, Moments *partial, const Panel &test,
@@ -379,7 +380,7 @@ __global__ void assembleSingular(const Panel *panels, const PairJob *jobs,
             mixedSample(moments, mul(delta, r), test, trial, testBasis, trialBasis,
                         static_cast<float>(sample.weight * r * r * r * gauss[radial].weight) *
                             static_cast<float>(4 * test.area * trial.area),
-                        static_cast<float>(k), 1.f / static_cast<float>(k),
+                        k, 1.f / static_cast<float>(k),
                         job.permutation.topology == galerkin::PairTopology::coincident, error);
         }
     }
@@ -459,7 +460,7 @@ assembleNear(const Panel *panels, const NearJob *jobs, const galerkin::PairQuadr
                 mixedSample(moments, delta, test, trial, firstSample.basis, secondSample.basis,
                             static_cast<float>(weight) *
                                 static_cast<float>(4 * test.area * trial.area),
-                            static_cast<float>(k), 1.f / static_cast<float>(k), false, error);
+                            k, 1.f / static_cast<float>(k), false, error);
             else {
                 galerkin::PairQuadraturePoint sample{};
                 for (unsigned i = 0; i < 3; ++i) {
@@ -568,12 +569,10 @@ __device__ void storeFieldPartial(DoubleComplex value, DoubleComplex *partials) 
 
 __global__ void evaluateField(const Panel *panels, int panelCount, const Vec3 *observers,
                               int observerCount, const galerkin::TriangleQuadraturePoint *rule,
-                              int ruleCount, const RegularPanel *regularPanels,
-                              const RegularQuadraturePoint *regularRule, unsigned regularCount,
-                              double k, const AccurateComplex *pressure, int pressureCount,
-                              const Complex *flux, DoubleComplex *partials, int excitations,
-                              unsigned tileCount, double tolerance, unsigned maximumDepth,
-                              int *error) {
+                              int ruleCount, double k, const AccurateComplex *pressure,
+                              int pressureCount, const Complex *flux, DoubleComplex *partials,
+                              int excitations, unsigned tileCount, double tolerance,
+                              unsigned maximumDepth, int *error) {
     const unsigned index = blockIdx.x / tileCount, tile = blockIdx.x % tileCount;
     if (index >= static_cast<unsigned>(observerCount * excitations))
         return;
@@ -585,8 +584,8 @@ __global__ void evaluateField(const Panel *panels, int panelCount, const Vec3 *o
         const auto *nodal = pressure + static_cast<std::size_t>(excitation) * pressureCount;
         const auto q = flux[static_cast<std::size_t>(excitation) * panelCount + panel];
         if (dot(offset, offset) > 4 * panels[panel].edge * panels[panel].edge)
-            value = plus(value, regularField(observers[observer], regularPanels[panel], regularRule,
-                                             regularCount, nodal, q, k, error));
+            value = plus(value, regularField(observers[observer], panels[panel], rule,
+                                             static_cast<unsigned>(ruleCount), nodal, q, k, error));
         else
             value =
                 plus(value, integrateNearField(observers[observer], panels[panel], rule, ruleCount,
@@ -672,6 +671,8 @@ void checkIntegrationError(const DeviceArray<int> &error, cudaStream_t stream) {
         throw std::runtime_error("BEM calculation overflows complex FP32 storage.");
     if (code == 3)
         throw std::runtime_error("BEM field integration did not reach its near-field tolerance.");
+    if (code == 4)
+        throw std::runtime_error("BEM dense regular pair escaped its qualified adaptive plan.");
 }
 std::vector<Panel> pack(const galerkin::Space &space) {
     std::vector<Panel> panels;
@@ -701,11 +702,14 @@ std::complex<double> hostComplex(AccurateComplex value) {
 
 class CudaBemSolver::Implementation {
   public:
-    explicit Implementation(SurfaceMesh value, CudaStorageOptions storageOptions)
-        : storage(storageOptions), origin{}, mesh(centered(std::move(value), origin)),
-          space(validatedSpace(mesh)), baffledPlanCache(mesh), panels(pack(space)), stream(),
-          blas(stream), solver(stream), devicePanels(panels.size()),
-          deviceMass(space.lumpedMass.size()), deviceRowScale(space.lumpedMass.size()) {
+    explicit Implementation(SurfaceMesh value, CudaStorageOptions storageOptions,
+                            std::optional<BemSubdomainModel> model = {})
+        : storage(storageOptions), domainModel(std::move(model)), origin{},
+          mesh(centered(std::move(value), origin)),
+          space(domainModel ? galerkin::buildSpace(mesh) : validatedSpace(mesh)),
+          baffledPlanCache(mesh), panels(pack(space)), stream(), blas(stream), solver(stream),
+          devicePanels(panels.size()), deviceMass(space.lumpedMass.size()),
+          deviceRowScale(space.lumpedMass.size()) {
         if (storage.quadraturePatches != CudaCacheResidency::automatic &&
             storage.quadraturePatches != CudaCacheResidency::device &&
             storage.quadraturePatches != CudaCacheResidency::mappedHost)
@@ -753,12 +757,14 @@ class CudaBemSolver::Implementation {
     void prepareQuadrature(const BemNumerics &options, double maximumK, std::stop_token stop,
                            std::size_t workspaceBytes) {
         cancelled(stop);
-        const bool samePlan = planValid && cached.quadratureOrder == options.quadratureOrder &&
+        const bool dense = options.acceleration == BemAcceleration::dense;
+        const bool samePlan = planValid && cachedAcceleration == options.acceleration &&
+                              cached.quadratureOrder == options.quadratureOrder &&
                               cached.singularOrder == options.singularOrder &&
                               cached.nearDistanceRatio == options.nearDistanceRatio &&
                               cached.nearRelativeTolerance == options.nearRelativeTolerance &&
                               cached.nearMaximumDepth == options.nearMaximumDepth &&
-                              (options.nearDistanceRatio == 0.0 || cachedMaximumK == maximumK);
+                              cachedMaximumK == maximumK;
         if (samePlan && cacheValid && cachedAcceleration == options.acceleration) {
             std::size_t free{}, total{};
             cudaCheck(cudaMemGetInfo(&free, &total), "CUDA cached workspace memory query");
@@ -771,13 +777,11 @@ class CudaBemSolver::Implementation {
         // FMM owns its construction jobs; retaining the dense copies wastes GPU
         // memory even after the FMM operator has released its temporary patches.
         releaseDenseQuadrature();
-        const bool rebuildField = fieldQuadratureOrder != options.quadratureOrder ||
-                                  !deviceRegular || !deviceRegularPanels || !deviceHigh;
-        if (rebuildField) {
+        const bool rebuildRegular = dense && (!deviceRegular || !deviceRegularBounds ||
+                                              cached.quadratureOrder != options.quadratureOrder);
+        if (rebuildRegular || !dense) {
             deviceRegular.reset();
-            deviceRegularPanels.reset();
-            deviceHigh.reset();
-            fieldQuadratureOrder = 0;
+            deviceRegularBounds.reset();
         }
         if (!samePlan) {
             planValid = false;
@@ -787,19 +791,20 @@ class CudaBemSolver::Implementation {
             settings.nearDistanceRatio = options.nearDistanceRatio;
             settings.relativeTolerance = options.nearRelativeTolerance;
             settings.maximumSubdivisionDepth = options.nearMaximumDepth;
-            auto plan = galerkin::makeInteractionPlan(space, settings, maximumK, stop);
-            interactionPlan = std::move(plan);
+            if (dense)
+                interactionPlan = galerkin::makeInteractionPlan(space, settings, maximumK, stop);
+            else
+                interactionPlan = {};
             cached = options;
             cachedMaximumK = maximumK;
             planValid = true;
         }
         const auto &plan = interactionPlan;
-        const bool dense = options.acceleration == BemAcceleration::dense;
         std::vector<PairJob> singular;
         std::vector<NearJob> near;
         std::vector<galerkin::TriangleQuadraturePoint> high, nearRules;
         std::vector<galerkin::GaussPoint> gauss;
-        if (dense || rebuildField)
+        if (dense)
             high = galerkin::triangleRule(8);
         if (dense) {
             singular.reserve(plan.touching.size());
@@ -814,37 +819,16 @@ class CudaBemSolver::Implementation {
             nearRules.insert(nearRules.end(), promotedNearRule.begin(), promotedNearRule.end());
             gauss = galerkin::gaussLegendre01(options.singularOrder);
         }
-        std::vector<RegularQuadraturePoint> regularRule;
-        std::vector<RegularPanel> regularPanels;
-        if (rebuildField) {
-            // Finite-distance observations use regular panels as well as the
-            // high-order adaptive rule, independently of the solve algorithm.
-            const auto regular = galerkin::triangleRule(options.quadratureOrder);
-            for (const auto &sample : regular)
-                regularRule.push_back({{static_cast<float>(sample.barycentric[0]),
-                                        static_cast<float>(sample.barycentric[1]),
-                                        static_cast<float>(sample.barycentric[2])}});
-            const auto packedVector = [](Vec3 value) {
-                return make_float3(static_cast<float>(value.x), static_cast<float>(value.y),
-                                   static_cast<float>(value.z));
-            };
-            regularPanels.reserve(panels.size());
-            for (const auto &panel : panels) {
-                RegularPanel packed{};
-                packed.origin = panel.vertices[0];
-                packed.normal = packedVector(panel.normal);
-                for (unsigned i = 0; i < 3; ++i) {
-                    packed.nodes[i] = panel.nodes[i];
-                    packed.curls[i] = packedVector(panel.curls[i]);
-                }
-                for (std::size_t i = 0; i < regular.size(); ++i) {
-                    packed.points[i] = packedVector(add(
-                        mul(sub(panel.vertices[1], panel.vertices[0]), regular[i].barycentric[1]),
-                        mul(sub(panel.vertices[2], panel.vertices[0]), regular[i].barycentric[2])));
-                    packed.weights[i] = static_cast<float>(2 * panel.area * regular[i].weight);
-                }
-                regularPanels.push_back(packed);
+        std::vector<galerkin::TriangleQuadraturePoint> regularRule;
+        std::vector<galerkin::RegularPanelBounds> regularBounds;
+        if (rebuildRegular) {
+            for (const unsigned degree : {4u, 6u, 8u}) {
+                const auto rule = galerkin::triangleRule(degree);
+                regularRule.insert(regularRule.end(), rule.begin(), rule.end());
             }
+            regularBounds.reserve(space.panels.size());
+            for (const auto &panel : space.panels)
+                regularBounds.push_back(galerkin::makeRegularPanelBounds(panel));
         }
         std::size_t bytes{};
         const auto addBytes = [&bytes](std::size_t count, std::size_t width) {
@@ -859,10 +843,9 @@ class CudaBemSolver::Implementation {
             addBytes(nearRules.size(), sizeof(galerkin::TriangleQuadraturePoint));
             addBytes(gauss.size(), sizeof(galerkin::GaussPoint));
         }
-        if (rebuildField) {
-            addBytes(regularPanels.size(), sizeof(RegularPanel));
-            addBytes(regularRule.size(), sizeof(RegularQuadraturePoint));
-            addBytes(high.size(), sizeof(galerkin::TriangleQuadraturePoint));
+        if (rebuildRegular) {
+            addBytes(regularRule.size(), sizeof(galerkin::TriangleQuadraturePoint));
+            addBytes(regularBounds.size(), sizeof(galerkin::RegularPanelBounds));
         }
         std::size_t free{}, total{};
         cudaCheck(cudaMemGetInfo(&free, &total), "CUDA quadrature memory query");
@@ -895,19 +878,16 @@ class CudaBemSolver::Implementation {
             deviceGauss = std::make_unique<DeviceArray<galerkin::GaussPoint>>(gauss.size());
             deviceGauss->upload(gauss, stream);
         }
-        if (rebuildField) {
-            deviceRegular =
-                std::make_unique<DeviceArray<RegularQuadraturePoint>>(regularRule.size());
+        if (rebuildRegular) {
+            deviceRegular = std::make_unique<DeviceArray<galerkin::TriangleQuadraturePoint>>(
+                regularRule.size());
             deviceRegular->upload(regularRule, stream);
-            deviceRegularPanels = std::make_unique<DeviceArray<RegularPanel>>(regularPanels.size());
-            deviceRegularPanels->upload(regularPanels, stream);
-            deviceHigh =
-                std::make_unique<DeviceArray<galerkin::TriangleQuadraturePoint>>(high.size());
-            deviceHigh->upload(high, stream);
+            deviceRegularBounds =
+                std::make_unique<DeviceArray<galerkin::RegularPanelBounds>>(regularBounds.size());
+            deviceRegularBounds->upload(regularBounds, stream);
         }
         stream.synchronize();
         cancelled(stop);
-        fieldQuadratureOrder = options.quadratureOrder;
         cachedAcceleration = options.acceleration;
         cacheValid = true;
     }
@@ -916,10 +896,10 @@ class CudaBemSolver::Implementation {
         return devicePanels.bytes() + deviceMass.bytes() + deviceRowScale.bytes() +
                bytes(deviceSingular) + bytes(deviceNear) + bytes(deviceNearOffsets) +
                bytes(deviceNearTrials) + bytes(devicePatches) + bytes(deviceRegular) +
-               bytes(deviceRegularPanels) + bytes(deviceHigh) + bytes(deviceNearRules) +
-               bytes(deviceGauss);
+               bytes(deviceRegularBounds) + bytes(deviceNearRules) + bytes(deviceGauss);
     }
     CudaStorageOptions storage;
+    std::optional<BemSubdomainModel> domainModel;
     // Declared before the registration so reverse destruction unregisters first.
     galerkin::InteractionPlan interactionPlan;
     Vec3 origin;
@@ -936,13 +916,15 @@ class CudaBemSolver::Implementation {
     std::unique_ptr<DeviceArray<NearJob>> deviceNear;
     std::unique_ptr<DeviceArray<unsigned>> deviceNearOffsets, deviceNearTrials;
     std::unique_ptr<QuadraturePatchArray> devicePatches;
-    std::unique_ptr<DeviceArray<RegularQuadraturePoint>> deviceRegular;
-    std::unique_ptr<DeviceArray<galerkin::TriangleQuadraturePoint>> deviceHigh, deviceNearRules;
-    std::unique_ptr<DeviceArray<RegularPanel>> deviceRegularPanels;
+    std::unique_ptr<DeviceArray<galerkin::TriangleQuadraturePoint>> deviceRegular;
+    std::unique_ptr<DeviceArray<galerkin::RegularPanelBounds>> deviceRegularBounds;
+    std::unique_ptr<DeviceArray<galerkin::TriangleQuadraturePoint>> deviceNearRules;
     std::unique_ptr<DeviceArray<galerkin::GaussPoint>> deviceGauss;
     BemNumerics cached;
+    std::shared_ptr<const wideband::SupportTree> supportTree;
+    std::shared_ptr<const wideband::SupportNearPlan> supportNearPlan;
+    wideband::SupportTreeSettings supportTreeSettings;
     double cachedMaximumK{};
-    unsigned fieldQuadratureOrder{};
     BemAcceleration cachedAcceleration{BemAcceleration::dense};
     bool planValid{}, cacheValid{};
     std::unique_ptr<SolveWorkspace> workspace;
@@ -952,9 +934,13 @@ class CudaBemSolver::Implementation {
     std::mutex mutex;
 };
 
-CudaBemSolver::CudaBemSolver(SurfaceMesh mesh) : CudaBemSolver(std::move(mesh), {}) {}
+CudaBemSolver::CudaBemSolver(SurfaceMesh mesh)
+    : CudaBemSolver(std::move(mesh), CudaStorageOptions{}) {}
 CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, CudaStorageOptions storage)
     : implementation_(std::make_unique<Implementation>(std::move(mesh), storage)) {}
+CudaBemSolver::CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, CudaStorageOptions storage)
+    : implementation_(
+          std::make_unique<Implementation>(std::move(mesh), storage, std::move(model))) {}
 CudaBemSolver::~CudaBemSolver() = default;
 std::string CudaBemSolver::deviceDescription() {
     int count{};
@@ -972,6 +958,15 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     auto &state = *implementation_;
     std::unique_lock lock(state.mutex);
     cancelled(stop);
+    if (request.subdomains != state.domainModel)
+        throw std::invalid_argument("BEM request and solver subdomain snapshots differ.");
+    if (request.subdomains) {
+        auto result = cuda_detail::solveSubdomains(state.mesh, state.origin, request, stop,
+                                                   std::move(progress));
+        result.peakDeviceBytes +=
+            state.cacheBytes() + (state.workspace ? state.workspace->bytes() : 0);
+        return result;
+    }
     if (request.infiniteBaffle) {
         auto result = cuda_detail::solveBaffledCavity(state.mesh, state.origin, request,
                                                       state.baffledPlanCache, stop, progress);
@@ -987,10 +982,14 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     const auto &fmm = options.fastMultipole;
     if ((options.acceleration != BemAcceleration::dense && !fastMultipole) ||
         (fastMultipole &&
-         (fmm.interpolationOrder < 3 || fmm.interpolationOrder > 8 || fmm.leafPanelCapacity < 4 ||
-          fmm.leafPanelCapacity > 256 || !std::isfinite(fmm.separationRatio) ||
-          fmm.separationRatio < 1.5 || fmm.separationRatio > 10 || fmm.maximumIterations < 1 ||
-          fmm.maximumIterations > 10000 || fmm.restartLength < 2 || fmm.restartLength > 300)))
+         (fmm.leafSupportCapacity < 4 || fmm.leafSupportCapacity > 256 ||
+          !std::isfinite(fmm.separationRatio) || fmm.separationRatio < 1.5 ||
+          fmm.separationRatio > 10 || fmm.maximumIterations < 1 || fmm.maximumIterations > 10000 ||
+          fmm.restartLength < 2 || fmm.restartLength > 300 ||
+          (fmm.preconditionerBlockWidth != 32 && fmm.preconditionerBlockWidth != 64 &&
+           fmm.preconditionerBlockWidth != 128 && fmm.preconditionerBlockWidth != 256 &&
+           fmm.preconditionerBlockWidth != 512 && fmm.preconditionerBlockWidth != 1024 &&
+           fmm.preconditionerBlockWidth != 2048))))
         throw std::invalid_argument("Invalid Fast Multipole or GMRES settings.");
     if (!std::isfinite(request.medium.density) || request.medium.density <= 0 ||
         !std::isfinite(request.medium.soundSpeed) || request.medium.soundSpeed <= 0 ||
@@ -1096,9 +1095,9 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
             throw std::invalid_argument("Conflicting boundary conditions on one face.");
     }
     std::vector<std::vector<std::complex<double>>> velocities;
+    std::map<std::uint32_t, std::size_t> activeFaceColumns;
     for (const auto &excitation : excitations) {
         std::map<std::uint32_t, std::complex<double>> values;
-        bool nonzero = false;
         for (const auto &face : excitation.faces) {
             if (!conditions.contains(face.faceId) ||
                 conditions.at(face.faceId) != BoundaryCondition::driven ||
@@ -1107,10 +1106,11 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
                 !values.emplace(face.faceId, face.normalVelocity).second)
                 throw std::invalid_argument(
                     "Excitation must assign each known Driven face at most once.");
-            nonzero = nonzero || std::abs(face.normalVelocity) > 0;
+            // Preserve all requested ports, including a currently zero flow.
+            activeFaceColumns.emplace(face.faceId, 0);
         }
-        if (!nonzero)
-            throw std::invalid_argument("Each excitation needs a nonzero Driven velocity.");
+        if (values.empty())
+            throw std::invalid_argument("Each excitation needs at least one assigned Driven face.");
         auto &perPanel = velocities.emplace_back();
         perPanel.reserve(panelCount);
         for (const auto &triangle : state.mesh.triangles) {
@@ -1121,6 +1121,61 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     if (state.workspace && needsWorkspace) {
         state.stream.synchronize();
         state.workspace.reset();
+    }
+    std::vector<std::uint32_t> activeFaceIds;
+    for (auto &[faceId, column] : activeFaceColumns) {
+        column = activeFaceIds.size();
+        activeFaceIds.push_back(faceId);
+    }
+    std::vector<std::vector<std::complex<double>>> faceVelocities(
+        excitationCount, std::vector<std::complex<double>>(activeFaceIds.size()));
+    for (std::size_t e = 0; e < excitationCount; ++e)
+        for (const auto &face : excitations[e].faces)
+            faceVelocities[e][activeFaceColumns.at(face.faceId)] = face.normalVelocity;
+    const bool hasNonzeroExcitation =
+        std::any_of(faceVelocities.begin(), faceVelocities.end(), [](const auto &values) {
+            return std::any_of(values.begin(), values.end(), [](auto v) { return v != 0.; });
+        });
+    bool hasActiveFar = false;
+    if (fastMultipole) {
+        if (!state.supportTree ||
+            state.supportTreeSettings.leafCapacity != fmm.leafSupportCapacity ||
+            state.supportTreeSettings.separationRatio != fmm.separationRatio ||
+            state.supportTreeSettings.nearDistanceRatio != options.nearDistanceRatio) {
+            wideband::SupportTreeSettings settings;
+            settings.leafCapacity = fmm.leafSupportCapacity;
+            settings.separationRatio = fmm.separationRatio;
+            settings.nearDistanceRatio = options.nearDistanceRatio;
+            state.supportTree = std::make_shared<wideband::SupportTree>(
+                wideband::makeSupportTree(state.space, settings, stop));
+            state.supportTreeSettings = settings;
+            state.supportNearPlan.reset();
+        }
+        if (!state.supportNearPlan || state.supportNearPlan->activeFaceIds != activeFaceIds) {
+            // Explicitly bound host CSR indices and construction scratch; the
+            // complete support tree is independent of frequency and RHS values.
+            constexpr std::size_t maximumNearHostBytes = std::size_t{2} * 1024 * 1024 * 1024;
+            state.supportNearPlan =
+                std::make_shared<wideband::SupportNearPlan>(wideband::makeSupportNearPlan(
+                    state.space, *state.supportTree, activeFaceIds, maximumNearHostBytes, stop));
+        }
+        hasActiveFar = !state.supportTree->pressurePressure.farInteractions.empty();
+        if (!hasActiveFar) {
+            std::vector<std::size_t> activePrefix(panelCount + 1);
+            for (std::size_t i = 0; i < panelCount; ++i)
+                activePrefix[i + 1] =
+                    activePrefix[i] +
+                    (state.supportNearPlan
+                         ->panelToActiveFaceColumn[state.supportTree->fluxOrder[i]] != UINT32_MAX);
+            for (const auto pair : state.supportTree->pressureFlux.farInteractions) {
+                const auto &node = state.supportTree->nodes[pair.source];
+                hasActiveFar |=
+                    activePrefix[node.firstFlux + node.fluxCount] > activePrefix[node.firstFlux];
+            }
+        }
+    } else {
+        state.supportNearPlan.reset();
+        state.supportTree.reset();
     }
     state.prepareQuadrature(options, maximumK, stop,
                             needsWorkspace ? workspaceSize.minimumBytes : 0);
@@ -1150,15 +1205,27 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
     auto &pivots = buffers.pivots;
     auto &info = buffers.info;
     auto &integrationError = buffers.integrationError;
+    DeviceArray<AccurateComplex> faceFlux(fastMultipole ? activeFaceIds.size() * excitationCount
+                                                        : 0);
+    std::vector<AccurateComplex> faceSource(faceFlux.size());
     observers.upload(localObservers, state.stream);
     BemResult result;
     result.acceleration = options.acceleration;
     result.device = deviceDescription();
     result.triangleCount = panelCount;
     result.pressureDofCount = pressureCount;
-    result.peakDeviceBytes = state.cacheBytes() + buffers.bytes();
+    result.peakDeviceBytes = state.cacheBytes() + buffers.bytes() + faceFlux.bytes();
     for (const auto frequency : request.frequencies) {
         cancelled(stop);
+        BemProgress frequencyProgress{result.frequencies.size(), request.frequencies.size(),
+                                      frequency};
+        frequencyProgress.rightHandSideCount = excitationCount + (couplingBasis ? 1 : 0);
+        const auto report = [&](BemSolvePhase phase) {
+            frequencyProgress.phase = phase;
+            if (progress)
+                progress(frequencyProgress);
+        };
+        report(BemSolvePhase::preparing);
         BemFrequencyResult frame;
         frame.frequency = frequency;
         const double omega = 2 * std::numbers::pi * frequency,
@@ -1175,22 +1242,95 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
                     make_cuFloatComplex(static_cast<float>(q.real()), static_cast<float>(q.imag()));
             }
         const auto assemblyStart = Clock::now();
-        std::unique_ptr<FastMultipoleOperator> fastOperator;
-        std::unique_ptr<FastMultipoleLinearSolver> fastSolver;
+        double maximumKh{};
+        for (const auto &panel : state.space.panels)
+            maximumKh = std::max(maximumKh, k * panel.maximumEdgeLength);
+        const unsigned endpointDegree =
+            fastMultipole
+                ? (hasActiveFar && hasNonzeroExcitation
+                       ? galerkin::minimumEndpointDegree(maximumKh, options.quadratureOrder)
+                       : 4)
+                : options.quadratureOrder;
+        std::unique_ptr<wideband::SupportFmmOperator> fastOperator;
+        std::unique_ptr<wideband::SupportFmmLinearSolver> fastSolver;
         flux.upload(source, state.stream);
         matrix.clear(state.stream);
         rhs.clear(state.stream);
         integrationError.clear(state.stream);
         if (fastMultipole) {
-            fastOperator = std::make_unique<FastMultipoleOperator>(
-                state.space, state.interactionPlan, options, k, state.stream, stop);
-            fastSolver = std::make_unique<FastMultipoleLinearSolver>(*fastOperator, pressureCount,
-                                                                     options, state.stream, stop);
+            for (std::size_t e = 0; e < excitationCount; ++e)
+                for (std::size_t face = 0; face < activeFaceIds.size(); ++face) {
+                    const auto q = std::complex<double>(0, -request.medium.density * omega) *
+                                   faceVelocities[e][face];
+                    faceSource[e * activeFaceIds.size() + face] =
+                        make_cuDoubleComplex(q.real(), q.imag());
+                }
+            faceFlux.upload(faceSource, state.stream);
+            wideband::SupportNearOperatorSettings nearSettings;
+            nearSettings.quadrature.regularOrder = options.quadratureOrder;
+            nearSettings.quadrature.singularOrder = options.singularOrder;
+            nearSettings.quadrature.nearDistanceRatio = options.nearDistanceRatio;
+            nearSettings.quadrature.relativeTolerance = options.nearRelativeTolerance;
+            nearSettings.quadrature.maximumSubdivisionDepth = options.nearMaximumDepth;
+            const auto persistent = state.cacheBytes() + buffers.bytes() + faceFlux.bytes();
+            report(BemSolvePhase::nearConstruction);
+            auto near = std::make_shared<wideband::SupportNearOperator>(
+                state.space, *state.supportTree, *state.supportNearPlan, k, nearSettings, stop,
+                state.stream);
+            result.peakDeviceBytes =
+                std::max(result.peakDeviceBytes, persistent + near->peakDeviceBytes());
+            auto pc = std::make_shared<wideband::SupportBlockJacobi>(
+                near->pressureMatrix(), state.supportTree->pressureOrder,
+                fmm.preconditionerBlockWidth, stop, state.stream);
+            result.peakDeviceBytes = std::max(
+                result.peakDeviceBytes, persistent + near->deviceBytes() + pc->peakDeviceBytes());
+            wideband::SupportFmmOperatorSettings settings;
+            settings.role = wideband::SupportFmmOperatorRole::distancePrimary;
+            settings.accuracySeed = .1 * options.relativeResidualTolerance;
+            settings.panelRule = galerkin::triangleRule(endpointDegree);
+            report(BemSolvePhase::farPreparation);
+            fastOperator = std::make_unique<wideband::SupportFmmOperator>(
+                state.space, state.supportTree, state.supportNearPlan, near, pc, k,
+                std::move(settings), stop);
+            result.peakDeviceBytes =
+                std::max(result.peakDeviceBytes, persistent + fastOperator->peakDeviceBytes());
+            wideband::SupportDirectAuditPolicy directPolicy;
+            if (panelCount <= wideband::maximumDirectAuditPanels) {
+                int deviceId{};
+                cudaCheck(cudaGetDevice(&deviceId), "Direct audit cost device");
+                int throughputRatio{};
+                cudaCheck(cudaDeviceGetAttribute(&throughputRatio,
+                                                 cudaDevAttrSingleToDoublePrecisionPerfRatio,
+                                                 deviceId),
+                          "Direct audit cost throughput");
+                const auto ratio = static_cast<unsigned>(std::max(1, throughputRatio));
+                directPolicy.preferDirect = [tree = state.supportTree, ratio](auto levels,
+                                                                              unsigned degree) {
+                    const auto points =
+                        static_cast<unsigned>(galerkin::triangleRule(degree).size());
+                    return wideband::preferSupportDirectAudit(*tree, levels, points, ratio);
+                };
+                directPolicy.makeDirect = [&state, near, k, stop](unsigned order) {
+                    return std::make_unique<wideband::SupportDirectAudit>(
+                        state.space, *state.supportTree, *state.supportNearPlan, near, k, order,
+                        stop);
+                };
+            }
+            fastSolver = std::make_unique<wideband::SupportFmmLinearSolver>(
+                *fastOperator, pressureCount, options, stop, std::move(directPolicy),
+                [&](BemSolvePhase phase, unsigned count, std::size_t pressureCount,
+                    std::size_t fluxCount) {
+                    frequencyProgress.iterations = count;
+                    frequencyProgress.pressureOperatorApplications = pressureCount;
+                    frequencyProgress.faceFluxOperatorApplications = fluxCount;
+                    report(phase);
+                },
+                endpointDegree);
             frame.fastMultipole = fastOperator->statistics();
             result.peakDeviceBytes =
-                std::max(result.peakDeviceBytes, state.cacheBytes() + buffers.bytes() +
-                                                     fastOperator->deviceBytes() +
-                                                     fastSolver->deviceBytes());
+                std::max(result.peakDeviceBytes,
+                         state.cacheBytes() + buffers.bytes() + faceFlux.bytes() +
+                             fastOperator->deviceBytes() + fastSolver->deviceBytes());
         } else {
             constexpr std::size_t batchPairs = 4194304, batchJobs = 4096;
             const auto batchTrials =
@@ -1199,18 +1339,13 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
                 const auto count = std::min(batchTrials, panelCount - first);
                 const dim3 grid(static_cast<unsigned>((panelCount + 127) / 128),
                                 static_cast<unsigned>(count));
-                const auto launch = [&]<unsigned points>() {
-                    assembleRegular<points><<<grid, 128, 0, state.stream>>>(
-                        state.deviceRegularPanels->data(), nt, np, state.deviceRegular->data(),
-                        state.deviceRowScale.data(), flux.data(), nrhs, k,
-                        state.deviceNearOffsets->data(), state.deviceNearTrials->data(),
-                        matrix.data(), rhs.data(), integrationError.data(),
-                        static_cast<unsigned>(first));
-                };
-                if (options.quadratureOrder == 2)
-                    launch.template operator()<3>();
-                else
-                    launch.template operator()<6>();
+                assembleRegular<<<grid, 128, 0, state.stream>>>(
+                    state.devicePanels.data(), nt, np, state.deviceRegular->data(),
+                    state.deviceRegularBounds->data(), state.deviceRowScale.data(), flux.data(),
+                    nrhs, k, state.deviceNearOffsets->data(), state.deviceNearTrials->data(),
+                    matrix.data(), rhs.data(), integrationError.data(),
+                    static_cast<unsigned>(first), options.nearRelativeTolerance,
+                    options.quadratureOrder);
                 cudaCheck(cudaGetLastError(), "CUDA regular Galerkin assembly");
                 state.stream.synchronize();
                 cancelled(stop);
@@ -1234,7 +1369,7 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
             }
             for (std::size_t first = 0; first < state.deviceNear->size(); first += batchJobs) {
                 const auto count = std::min(batchJobs, state.deviceNear->size() - first);
-                const auto baseCount = state.deviceHigh->size();
+                const auto baseCount = galerkin::triangleRule(8).size();
                 const auto promotedCount = state.deviceNearRules->size() - baseCount;
                 const auto launch = [&]<bool mixed>() {
                     assembleNear<mixed><<<static_cast<unsigned>(count), 128,
@@ -1267,8 +1402,8 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
                     std::hypot(rhsNorm[e], std::abs(hostComplex(rhsHost[e * pressureCount + row])) *
                                                state.space.lumpedMass[row]);
         for (const auto value : rhsNorm)
-            if (!fastMultipole && (!(value > 0) || !std::isfinite(value)))
-                throw std::runtime_error("Galerkin right-hand side is zero or invalid.");
+            if (!std::isfinite(value))
+                throw std::runtime_error("Galerkin right-hand side is not finite.");
         frame.assemblyMilliseconds = milliseconds(assemblyStart);
         const auto solveStart = Clock::now();
         auto triangularStart = Clock::now();
@@ -1302,20 +1437,24 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
             frame.triangularSolveMilliseconds = milliseconds(triangularStart);
         }
         std::vector<double> relative(excitationCount);
+        std::vector<wideband::SupportFmmSolution> fastEvidence(excitationCount);
         std::vector<unsigned> iterations(excitationCount), refinementCounts(excitationCount);
         unsigned refinement = 0;
         bool fastInitialGuess = false;
         const auto refine = [&](int activeCount) {
             if (fastMultipole) {
                 for (int e = 0; e < activeCount; ++e) {
-                    const auto solved = fastSolver->solve(
-                        flux.data() + static_cast<std::size_t>(e) * panelCount,
+                    frequencyProgress.rightHandSideIndex =
+                        fastInitialGuess ? excitationCount : static_cast<std::size_t>(e);
+                    auto solved = fastSolver->solve(
+                        faceFlux.data() + static_cast<std::size_t>(e) * activeFaceIds.size(),
                         pressure.data() + static_cast<std::size_t>(e) * pressureCount,
                         fastInitialGuess);
                     relative[e] = solved.boundaryResidual;
                     iterations[e] += solved.iterations;
                     refinementCounts[e] += solved.refinementSteps;
                     frame.residualCheckMilliseconds += solved.residualCheckMilliseconds;
+                    fastEvidence[e] = std::move(solved);
                 }
                 return;
             }
@@ -1433,6 +1572,14 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
             rhs.upload(actualRhs, state.stream);
             flux.upload(source, state.stream);
             if (fastMultipole) {
+                std::fill(faceSource.begin(), faceSource.end(), make_cuDoubleComplex(0, 0));
+                for (const auto &face : actualExcitations.front().faces) {
+                    const auto q = std::complex<double>(0, -request.medium.density * omega) *
+                                   face.normalVelocity;
+                    faceSource[activeFaceColumns.at(face.faceId)] =
+                        make_cuDoubleComplex(q.real(), q.imag());
+                }
+                faceFlux.upload(faceSource, state.stream);
                 // The single coupled output represents every unit-port solve.
                 // Count all basis work and subsequent actual-field corrections.
                 for (std::size_t e = 1; e < excitationCount; ++e) {
@@ -1445,6 +1592,18 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
         }
         state.stream.synchronize();
         frame.solveMilliseconds = milliseconds(solveStart);
+        if (fastMultipole) {
+            frame.fastMultipole.graphExecution = fastSolver->graphExecutionEvidence();
+            const auto persistent =
+                state.cacheBytes() + buffers.bytes() + faceFlux.bytes() + fastSolver->deviceBytes();
+            result.liveDeviceBytes = std::max(
+                result.liveDeviceBytes, persistent + fastSolver->stationaryOperatorDeviceBytes());
+            result.peakDeviceBytes = std::max(result.peakDeviceBytes,
+                                              persistent + fastSolver->peakOperatorDeviceBytes());
+        } else {
+            result.liveDeviceBytes =
+                std::max(result.liveDeviceBytes, state.cacheBytes() + buffers.bytes());
+        }
         const auto outputCount = actualExcitations.size();
         const int fieldRhs = static_cast<int>(outputCount);
         for (std::size_t e = 0; e < outputCount; ++e) {
@@ -1453,45 +1612,117 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
             output.refinementSteps = fastMultipole ? refinementCounts[e] : refinement;
             output.iterations = iterations[e];
             output.boundaryResidual = relative[e];
+            if (fastMultipole) {
+                const auto &evidence = fastEvidence[e];
+                output.residualEvaluation = evidence.residualEvaluation;
+                output.fastMultipoleKrylovResidual = evidence.krylovResidual;
+                output.fastMultipoleKrylovTarget = evidence.krylovTarget;
+                output.fastMultipoleOperatorDiscrepancy = evidence.operatorDiscrepancy;
+                output.fastMultipoleAccuracySeed = evidence.accuracySeed;
+                output.fastMultipoleComparisonAccuracySeed = evidence.comparisonAccuracySeed;
+                output.fastMultipoleVerificationAccuracySeed = evidence.verificationAccuracySeed;
+                output.fastMultipoleAccuracyRefinements = evidence.accuracyRefinements;
+                output.fastMultipoleComparisonLevels = evidence.comparisonLevels;
+                output.fastMultipoleVerificationLevels = evidence.verificationLevels;
+                output.farQuadratureComparisonDegree = evidence.farQuadratureComparisonDegree;
+                output.farQuadratureVerificationDegree = evidence.farQuadratureVerificationDegree;
+                output.farQuadratureRefinements = evidence.farQuadratureRefinements;
+                output.farQuadratureDiscrepancy = evidence.farQuadratureDiscrepancy;
+                output.farQuadraturePreparationMilliseconds =
+                    evidence.farQuadraturePreparationMilliseconds;
+                output.farQuadraturePressureMilliseconds =
+                    evidence.farQuadraturePressureMilliseconds;
+                output.farQuadratureFluxMilliseconds = evidence.farQuadratureFluxMilliseconds;
+            }
             output.solvedVelocities = actualExcitations[e].faces;
             if (lemSolution)
                 output.lemSolution = std::move(lemSolution);
             frame.excitations.push_back(std::move(output));
         }
+        report(BemSolvePhase::fieldEvaluation);
         const auto fieldStart = Clock::now();
-        if (!request.observers.empty()) {
-            if (request.farField)
-                evaluateFarField<<<static_cast<unsigned>(outputCount * request.observers.size() *
-                                                         buffers.tileCount),
-                                   128, 0, state.stream>>>(
-                    state.devicePanels.data(), nt, observers.data(),
-                    static_cast<int>(request.observers.size()), farOrigin,
-                    request.farField->referenceDistance, state.deviceHigh->data(),
-                    static_cast<int>(state.deviceHigh->size()), k, pressure.data(), np, flux.data(),
-                    buffers.fieldPartials.data(), fieldRhs, buffers.tileCount,
-                    integrationError.data());
-            else
-                evaluateField<<<static_cast<unsigned>(outputCount * request.observers.size() *
-                                                      buffers.tileCount),
-                                128, 0, state.stream>>>(
-                    state.devicePanels.data(), nt, observers.data(),
-                    static_cast<int>(request.observers.size()), state.deviceHigh->data(),
-                    static_cast<int>(state.deviceHigh->size()), state.deviceRegularPanels->data(),
-                    state.deviceRegular->data(), static_cast<unsigned>(state.deviceRegular->size()),
-                    k, pressure.data(), np, flux.data(), buffers.fieldPartials.data(), fieldRhs,
-                    buffers.tileCount, options.nearRelativeTolerance, options.nearMaximumDepth,
-                    integrationError.data());
-            cudaCheck(cudaGetLastError(), "CUDA P1 field evaluation");
-            finishField<<<static_cast<unsigned>((outputCount * request.observers.size() + 127) /
-                                                128),
-                          128, 0, state.stream>>>(buffers.fieldPartials.data(), fields.data(),
-                                                  outputCount * request.observers.size(),
-                                                  buffers.tileCount, integrationError.data());
-            cudaCheck(cudaGetLastError(), "CUDA P1 field tile reduction");
-            checkIntegrationError(integrationError, state.stream);
+        std::vector<Complex> observed;
+        if (!request.observers.empty() && !hasNonzeroExcitation) {
+            observed.resize(outputCount * request.observers.size());
+        } else if (!request.observers.empty()) {
+            const auto evaluate = [&](unsigned degree) {
+                cancelled(stop);
+                const auto rule = galerkin::triangleRule(degree);
+                DeviceArray<galerkin::TriangleQuadraturePoint> deviceRule(rule.size());
+                deviceRule.upload(rule, state.stream);
+                result.peakDeviceBytes = std::max(
+                    result.peakDeviceBytes, state.cacheBytes() + buffers.bytes() +
+                                                faceFlux.bytes() + deviceRule.bytes() +
+                                                (fastOperator ? fastOperator->deviceBytes() : 0) +
+                                                (fastSolver ? fastSolver->deviceBytes() : 0));
+                if (request.farField)
+                    evaluateFarField<<<static_cast<unsigned>(outputCount *
+                                                             request.observers.size() *
+                                                             buffers.tileCount),
+                                       128, 0, state.stream>>>(
+                        state.devicePanels.data(), nt, observers.data(),
+                        static_cast<int>(request.observers.size()), farOrigin,
+                        request.farField->referenceDistance, deviceRule.data(),
+                        static_cast<int>(rule.size()), k, pressure.data(), np, flux.data(),
+                        buffers.fieldPartials.data(), fieldRhs, buffers.tileCount,
+                        integrationError.data());
+                else
+                    evaluateField<<<static_cast<unsigned>(outputCount * request.observers.size() *
+                                                          buffers.tileCount),
+                                    128, 0, state.stream>>>(
+                        state.devicePanels.data(), nt, observers.data(),
+                        static_cast<int>(request.observers.size()), deviceRule.data(),
+                        static_cast<int>(rule.size()), k, pressure.data(), np, flux.data(),
+                        buffers.fieldPartials.data(), fieldRhs, buffers.tileCount,
+                        std::min(options.nearRelativeTolerance,
+                                 .025 * options.relativeResidualTolerance),
+                        options.nearMaximumDepth, integrationError.data());
+                cudaCheck(cudaGetLastError(), "CUDA P1 field evaluation");
+                finishField<<<static_cast<unsigned>((outputCount * request.observers.size() + 127) /
+                                                    128),
+                              128, 0, state.stream>>>(buffers.fieldPartials.data(), fields.data(),
+                                                      outputCount * request.observers.size(),
+                                                      buffers.tileCount, integrationError.data());
+                cudaCheck(cudaGetLastError(), "CUDA P1 field tile reduction");
+                checkIntegrationError(integrationError, state.stream);
+                return fields.download(state.stream);
+            };
+            unsigned degree = galerkin::minimumEndpointDegree(maximumKh, options.quadratureOrder);
+            observed = evaluate(degree);
+            for (;;) {
+                const auto next = galerkin::refinedEndpointDegree(degree);
+                auto refined = evaluate(next);
+                bool passed = true;
+                for (std::size_t e = 0; e < outputCount; ++e) {
+                    double differenceSquared{}, normSquared{};
+                    for (std::size_t point = 0; point < request.observers.size(); ++point) {
+                        const auto index = e * request.observers.size() + point;
+                        const auto higher = hostComplex(refined[index]);
+                        differenceSquared += std::norm(higher - hostComplex(observed[index]));
+                        normSquared += std::norm(higher);
+                    }
+                    const double indicator =
+                        normSquared > 0          ? std::sqrt(differenceSquared / normSquared)
+                        : differenceSquared == 0 ? 0
+                                                 : std::numeric_limits<double>::infinity();
+                    auto &output = frame.excitations[e];
+                    output.fieldQuadratureComparisonDegree = degree;
+                    output.fieldQuadratureVerificationDegree = next;
+                    output.fieldQuadratureDiscrepancy = indicator;
+                    passed &= indicator <= .025 * options.relativeResidualTolerance;
+                }
+                observed = std::move(refined);
+                if (passed)
+                    break;
+                if (degree == 12)
+                    throw std::runtime_error(
+                        "BEM complex observer-field quadrature 12/14 did not converge within "
+                        "0.025*residualTolerance; refine the mesh or observer separation. "
+                        "Equation residuals do not bound field quadrature.");
+                degree = next;
+            }
         }
         const auto nodal = pressure.download(state.stream);
-        const auto observed = fields.download(state.stream);
         frame.fieldMilliseconds = milliseconds(fieldStart);
         for (std::size_t e = 0; e < outputCount; ++e) {
             auto &output = frame.excitations[e];
@@ -1540,8 +1771,8 @@ BemResult CudaBemSolver::solve(const BemRequest &request, std::stop_token stop,
         }
         cancelled(stop);
         result.frequencies.push_back(std::move(frame));
-        if (progress)
-            progress({result.frequencies.size(), request.frequencies.size(), frequency});
+        frequencyProgress.completedFrequencies = result.frequencies.size();
+        report(BemSolvePhase::frequencyComplete);
     }
     return result;
 }

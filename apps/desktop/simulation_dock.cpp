@@ -1,12 +1,13 @@
 #include "simulation_dock.hpp"
 #include "acoustic_field_widget.hpp"
 #include "acoustic_frame_dialog.hpp"
+#include "acoustic_regions_dialog.hpp"
 #include "angular_response_widget.hpp"
 #include "baffle_dialog.hpp"
 #include "frequency_schedule.hpp"
 #include "galerkin/exterior_domain.hpp"
-#include "live_trace.hpp"
 #include "latest_publication.hpp"
+#include "live_trace.hpp"
 #include "numeric_input.hpp"
 #include "phase_response_widget.hpp"
 #include "planning_frequencies.hpp"
@@ -33,11 +34,11 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSpinBox>
-#include <QTabWidget>
-#include <QTabBar>
-#include <QToolButton>
 #include <QStyle>
+#include <QTabBar>
+#include <QTabWidget>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <chrono>
@@ -70,6 +71,114 @@ namespace hornsculpt {
 namespace {
 constexpr std::size_t angularCount = 73;
 constexpr double pressureReference = 20e-6;
+QString fmmEvidenceSummary(const BemResult &result) {
+    bool automatic = false, historical = false;
+    unsigned minOrder = UINT32_MAX, maxOrder = 0, historicalOrder = 0;
+    double seed = 1, verification = 1;
+    unsigned refinements = 0;
+    std::set<unsigned> levels;
+    for (const auto &frequency : result.frequencies)
+        for (const auto &e : frequency.excitations) {
+            if (e.historicalChebyshevEvidence) {
+                historical = true;
+                historicalOrder =
+                    std::max(historicalOrder, e.historicalChebyshevEvidence->auditOrder);
+            }
+            if (e.fastMultipoleAccuracySeed > 0) {
+                automatic = true;
+                seed = std::min(seed, e.fastMultipoleAccuracySeed);
+                if (e.fastMultipoleVerificationAccuracySeed > 0)
+                    verification = std::min(verification, e.fastMultipoleVerificationAccuracySeed);
+                refinements = std::max(refinements, e.fastMultipoleAccuracyRefinements);
+                for (const auto &level : e.fastMultipoleVerificationLevels) {
+                    levels.insert(level.level);
+                    minOrder = std::min(minOrder, level.momentBandlimit);
+                    maxOrder = std::max(maxOrder, level.momentBandlimit);
+                }
+            }
+        }
+    if (automatic && !levels.empty())
+        return QObject::tr("Automatisch · %1 aktive Level · Momentgrade %2–%3 · Verifikationsseed "
+                           "%4 · %5 Anpassungen")
+            .arg(levels.size())
+            .arg(minOrder)
+            .arg(maxOrder)
+            .arg(verification, 0, 'g', 3)
+            .arg(refinements);
+    if (automatic)
+        return QObject::tr("Automatisch · Basis-Seed %1 · direkte Galerkin-Prüfung")
+            .arg(seed, 0, 'g', 3);
+    if (historical)
+        return historicalOrder
+                   ? QObject::tr("Historischer Chebyshev-Operator · Auditordnung %1")
+                         .arg(historicalOrder)
+                   : QObject::tr("Historischer Chebyshev-Operator · direkte Galerkin-Prüfung");
+    return QObject::tr("Direkter Galerkin-Operator");
+}
+QString krylovTargetSummary(const BemResult &result) {
+    double minimum = 1, maximum = 0;
+    for (const auto &f : result.frequencies)
+        for (const auto &e : f.excitations)
+            if (e.fastMultipoleKrylovTarget > 0) {
+                minimum = std::min(minimum, e.fastMultipoleKrylovTarget);
+                maximum = std::max(maximum, e.fastMultipoleKrylovTarget);
+            }
+    if (maximum == 0)
+        return QObject::tr("Inneres Krylovziel: nicht gespeichert");
+    return QObject::tr("Konfiguriertes relatives Krylovziel (links präconditioniert): %1–%2\n"
+                       "Kein gemessener Galerkin-Rest.")
+        .arg(minimum, 0, 'g', 4)
+        .arg(maximum, 0, 'g', 4);
+}
+QString quadratureEvidenceSummary(const BemResult &result) {
+    std::set<std::pair<unsigned, unsigned>> farPairs, fieldPairs;
+    double farDiscrepancy = 0, fieldDiscrepancy = 0;
+    for (const auto &frequency : result.frequencies)
+        for (const auto &e : frequency.excitations) {
+            if (e.farQuadratureVerificationDegree) {
+                farPairs.emplace(e.farQuadratureComparisonDegree,
+                                 e.farQuadratureVerificationDegree);
+                farDiscrepancy = std::max(farDiscrepancy, e.farQuadratureDiscrepancy);
+            }
+            if (e.fieldQuadratureVerificationDegree) {
+                fieldPairs.emplace(e.fieldQuadratureComparisonDegree,
+                                   e.fieldQuadratureVerificationDegree);
+                fieldDiscrepancy = std::max(fieldDiscrepancy, e.fieldQuadratureDiscrepancy);
+            }
+        }
+    if (farPairs.empty() && fieldPairs.empty())
+        return QObject::tr("Quadraturvergleich: nicht ausgeführt");
+    const auto pairs = [](const auto &values) {
+        QStringList text;
+        for (const auto [a, b] : values)
+            text.append(QString::number(a) + "/" + QString::number(b));
+        return text.join(", ");
+    };
+    return (farPairs.empty() ? QObject::tr("Fernregel: nicht ausgeführt")
+                             : QObject::tr("Fernregel %1 · Indikator %2")
+                                   .arg(pairs(farPairs))
+                                   .arg(farDiscrepancy, 0, 'g', 3)) +
+           "\n" +
+           (fieldPairs.empty() ? QObject::tr("Feldregel: nicht ausgeführt")
+                               : QObject::tr("Feldregel %1 · Indikator %2")
+                                     .arg(pairs(fieldPairs))
+                                     .arg(fieldDiscrepancy, 0, 'g', 3)) +
+           "\n" + QObject::tr("Separat von FMM- und Netzfehler; kein Netzkonvergenznachweis.");
+}
+QString gpuMemorySummary(const BemResult &result) {
+    const auto stationary =
+        result.liveDeviceBytes
+            ? QObject::tr("%1 MiB").arg(double(result.liveDeviceBytes) / (1024 * 1024), 0, 'f', 1)
+            : QObject::tr("nicht gespeichert");
+    const auto peak =
+        result.peakDeviceBytes
+            ? QObject::tr("%1 MiB").arg(double(result.peakDeviceBytes) / (1024 * 1024), 0, 'f', 1)
+            : QObject::tr("nicht gespeichert");
+    return QObject::
+        tr("Gemessene stationäre GPU-Puffer während der Lösung: %1\nGemessener GPU-Spitzenbedarf: "
+           "%2\nGespeicherte Messwerte, kein aktuell belegter Speicher nach Auftragsende.")
+            .arg(stationary, peak);
+}
 std::optional<std::uint64_t> availablePhysicalMemory() {
 #ifdef _WIN32
     MEMORYSTATUSEX status{};
@@ -85,15 +194,15 @@ std::optional<std::uint64_t> availablePhysicalMemory() {
 }
 void requireResultMemory(std::size_t panels, std::size_t vertices, std::size_t exteriorPanels,
                          std::size_t faces, std::size_t frequencies, std::size_t excitations,
-                         bool realtime) {
+                         bool realtime, std::size_t domains = 0) {
     // The common estimator counts shared boundary arrays once and independent
     // snapshot data by simultaneous owners. Plot points are GUI-only overhead.
     const std::size_t snapshots = realtime ? 4 : 2;
-    const long double estimate = estimateResultBytes(
-        {panels, vertices, exteriorPanels, 1 + 2 * angularCount, faces, frequencies,
-         excitations, snapshots}) +
-        static_cast<long double>(frequencies) * snapshots *
-            (3 + 2 * angularCount) * sizeof(QPointF);
+    const long double estimate =
+        estimateResultBytes({panels, vertices, exteriorPanels, 1 + 2 * angularCount, faces,
+                             frequencies, excitations, snapshots, domains}) +
+        static_cast<long double>(frequencies) * snapshots * (3 + 2 * angularCount) *
+            sizeof(QPointF);
     const auto available = availablePhysicalMemory();
     if (frequencies > std::vector<double>{}.max_size() ||
         estimate > static_cast<long double>(std::numeric_limits<std::size_t>::max()) ||
@@ -176,7 +285,7 @@ std::vector<AngularLevel> displayedCut(const std::vector<double> &levelsDb, doub
     return levels;
 }
 bool sameDisplayDirections(const BemRequest &a, const BemRequest &b) {
-    if (a.infiniteBaffle != b.infiniteBaffle)
+    if (a.infiniteBaffle != b.infiniteBaffle || a.subdomains != b.subdomains)
         return false;
     if (a.observers.size() != b.observers.size() ||
         a.farField.has_value() != b.farField.has_value())
@@ -259,6 +368,8 @@ struct SimulationDock::SolveJob {
     std::shared_ptr<const SurfaceMesh> mesh;
     std::vector<FaceVelocity> boundaryDefinitions;
     BemRequest request;
+    std::vector<AcousticRegionDefinition> acousticRegions;
+    MeshingOptions partitionOptions;
     std::shared_ptr<const GeometrySource> source;
     std::optional<AxisymmetricSamplingSettings> axisymmetricSampling;
     std::uint64_t revision{};
@@ -359,21 +470,44 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
     fastMultipole_->setToolTip(
         tr("Bündelt entfernte Wechselwirkungen durch eine hierarchische Approximation "
            "und löst Burton–Miller iterativ. Nah- und Singularintegrale bleiben direkt. "
-           "Der ursprüngliche Gleichungsrest wird unabhängig geprüft. "
+           "Die Ordnungen werden automatisch je Hierarchieebene gewählt. Strengere "
+           "Genauigkeitsstufen prüfen den Näherungsrest und den Operatorunterschied. "
+           "Ohne Fernanteil ist der Rest direkt. "
            "Ausgeschaltet: dichte Matrix mit direkter Lösung. Bei kleinen Netzen kann diese "
            "schneller sein."));
-    multipoleOrder_ = new IntegerInput;
-    multipoleOrder_->setObjectName("fastMultipoleOrder");
-    multipoleOrder_->setRange(3, 8);
-    multipoleOrder_->setValue(static_cast<int>(fastMultipoleSettings_.interpolationOrder));
-    multipoleOrder_->setEnabled(false);
-    multipoleOrder_->setToolTip(
-        tr("Anzahl der Interpolationspunkte je Raumrichtung. Höhere Ordnung verbessert die "
-           "Fernwechselwirkungen und benötigt mehr Rechenzeit und Speicher. Dimensionslos; "
-           "Konvergenz durch Vergleich mehrerer Ordnungen prüfen."));
+    multipoleLeafCapacity_ = new IntegerInput;
+    multipoleLeafCapacity_->setObjectName("fastMultipoleLeafCapacity");
+    multipoleLeafCapacity_->setRange(4, 256);
+    multipoleLeafCapacity_->setValue(static_cast<int>(fastMultipoleSettings_.leafSupportCapacity));
+    multipoleLeafCapacity_->setEnabled(false);
+    multipoleLeafCapacity_->setToolTip(
+        tr("Maximale Blattgröße je Quellkanal: vollständige P1-Druckstützen und DP0-Dreiecke "
+           "müssen jeweils unter diese Anzahl fallen, sofern die maximale Baumtiefe nicht "
+           "erreicht ist. Die Summenzahl beider Kanäle ist nicht das Stoppkriterium. "
+           "Dimensionslos; beeinflusst Nahaufbau, Fernarbeit und Speicher."));
+    multipoleLeafCapacity_->setWhatsThis(multipoleLeafCapacity_->toolTip());
+    multipoleJacobiBlock_ = new QComboBox;
+    multipoleJacobiBlock_->setObjectName("fastMultipoleJacobiBlock");
+    for (const unsigned width : {32u, 64u, 128u, 256u, 512u, 1024u, 2048u})
+        multipoleJacobiBlock_->addItem(QString::number(width), width);
+    multipoleJacobiBlock_->setCurrentIndex(
+        multipoleJacobiBlock_->findData(fastMultipoleSettings_.preconditionerBlockWidth));
+    multipoleJacobiBlock_->setEnabled(false);
+    multipoleJacobiBlock_->setToolTip(
+        tr("Anzahl der P1-Druckfreiheitsgrade je räumlich gruppiertem Block der "
+           "Jacobi-Vorkonditionierung. Größere Blöcke benötigen mehr Speicher und "
+           "Aufbauzeit, können aber die Anzahl der Krylovschritte verringern. "
+           "Die Blöcke enthalten ausschließlich vorhandene Nahkopplungen. "
+           "Dimensionslos; verändert weder Netz noch Genauigkeitsziel."));
+    multipoleJacobiBlock_->setWhatsThis(multipoleJacobiBlock_->toolTip());
     solverControls->addWidget(fastMultipole_);
-    solverControls->addWidget(new QLabel(tr("Ordnung")));
-    solverControls->addWidget(multipoleOrder_);
+    solverControls->addWidget(new QLabel(tr("Ordnung: automatisch")));
+    solverControls->addWidget(new QLabel(tr("Blattgröße")));
+    solverControls->addWidget(multipoleLeafCapacity_);
+    auto *jacobiLabel = new QLabel(tr("Jacobi-Block"));
+    jacobiLabel->setBuddy(multipoleJacobiBlock_);
+    solverControls->addWidget(jacobiLabel);
+    solverControls->addWidget(multipoleJacobiBlock_);
     baffle_ = new QPushButton(tr("Schallwand …"));
     baffle_->setObjectName("infiniteBaffle");
     baffle_->setToolTip(tr("Freifeld oder unendliche Schallwand mit Luftkavität und Apertur. "
@@ -384,6 +518,28 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
         BaffleDialog dialog(infiniteBaffle_, this);
         if (dialog.exec() == QDialog::Accepted)
             setInfiniteBaffle(dialog.infiniteBaffle());
+    });
+    auto *regions = new QPushButton(tr("Teilgebiete …"));
+    regions->setObjectName("acousticRegions");
+    regions->setToolTip(
+        tr("Innenräume und transparente Interfaces zuordnen. Interface-Normalen zeigen ins erste "
+           "Gebiet; bei expliziten Interfaces müssen alle Öffnungen zugeordnet sein."));
+    regions->setWhatsThis(regions->toolTip());
+    solverControls->addWidget(regions);
+    connect(regions, &QPushButton::clicked, this, [this] {
+        std::map<std::uint32_t, QString> labels;
+        if (geometrySourceCurrent_ && geometrySource_ && geometrySource_->cad)
+            for (const auto &face : geometrySource_->cad->faces)
+                labels.emplace(face.id, face.label);
+        else if (meshCurrent_ && mesh_)
+            for (const auto &triangle : mesh_->triangles)
+                labels.emplace(triangle.faceId, QString::number(triangle.faceId));
+        AcousticRegionsDialog dialog(acousticRegions_, std::move(labels), this);
+        if (dialog.exec() != QDialog::Accepted || dialog.regions() == acousticRegions_)
+            return;
+        setAcousticRegions(dialog.regions());
+        if (onAcousticRegionsChanged)
+            onAcousticRegionsChanged();
     });
     solverControls->addStretch();
     layout->addLayout(solverControls);
@@ -466,6 +622,21 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
     nearLabel->setBuddy(nearMaximumDepth_);
     nearControls->addWidget(nearLabel);
     nearControls->addWidget(nearMaximumDepth_);
+    singularOrder_ = new IntegerInput;
+    singularOrder_->setObjectName("singularQuadratureOrder");
+    singularOrder_->setRange(2, 20);
+    singularOrder_->setValue(4);
+    singularOrder_->setToolTip(
+        tr("Quadraturordnung für Dreieckspaare mit gemeinsamem Punkt, gemeinsamer Kante "
+           "oder identischer Fläche. Gilt für dichte Lösung und Fast Multipole. Höhere "
+           "Ordnungen erhöhen Aufwand und können Integrationsfehler verringern. Die "
+           "Konvergenz muss am jeweiligen Netz geprüft werden; der Wert ist kein "
+           "Genauigkeitszertifikat."));
+    singularOrder_->setWhatsThis(singularOrder_->toolTip());
+    auto *singularLabel = new QLabel(tr("Singularordnung"));
+    singularLabel->setBuddy(singularOrder_);
+    nearControls->addWidget(singularLabel);
+    nearControls->addWidget(singularOrder_);
     nearControls->addStretch();
     layout->addLayout(nearControls);
     auto *mediumGroup = new QGroupBox(tr("Medium / Antrieb"));
@@ -713,17 +884,22 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
     connect(ctaExcitation_, &QComboBox::currentIndexChanged, this, [this](int index) {
         ctaSelection_ = index;
         updateCta2034(hasCurrentResult());
-        if (onChanged) onChanged();
+        if (onChanged)
+            onChanged();
     });
     connect(ctaExport, &QPushButton::clicked, this, [this] {
-        if (ctaExcitation_->currentIndex() < 0 || !angularSampleCount(resultRequest_)) return;
+        if (ctaExcitation_->currentIndex() < 0 || !angularSampleCount(resultRequest_))
+            return;
         const auto path = QFileDialog::getSaveFileName(this, tr("CTA-2034 exportieren"),
-                                                        "HornSculpt-CTA2034.csv", tr("CSV (*.csv)"));
-        if (path.isEmpty()) return;
+                                                       "HornSculpt-CTA2034.csv", tr("CSV (*.csv)"));
+        if (path.isEmpty())
+            return;
         try {
-            const auto bytes = ctaCsv(archive(), static_cast<std::size_t>(ctaExcitation_->currentIndex()));
+            const auto bytes =
+                ctaCsv(archive(), static_cast<std::size_t>(ctaExcitation_->currentIndex()));
             QSaveFile file(path);
-            if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+            if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() ||
+                !file.commit())
                 throw std::runtime_error(file.errorString().toStdString());
         } catch (const std::exception &e) {
             QMessageBox::warning(this, tr("CTA-CSV"), QString::fromUtf8(e.what()));
@@ -898,8 +1074,8 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
     quality_->setText(tr("Qualität"));
     navigationLayout->addWidget(quality_);
     connect(quality_, &QToolButton::clicked, this, [this] {
-        QMessageBox dialog(QMessageBox::Information, tr("Ergebnisqualität"),
-                           quality_->toolTip(), QMessageBox::Close, this);
+        QMessageBox dialog(QMessageBox::Information, tr("Ergebnisqualität"), quality_->toolTip(),
+                           QMessageBox::Close, this);
         auto *convergence = dialog.addButton(tr("Netzkonvergenz …"), QMessageBox::ActionRole);
         dialog.exec();
         if (dialog.clickedButton() == convergence && onRequestConvergence)
@@ -916,7 +1092,9 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
             page->isAncestorOf(cta))
             return 0;
         return page == phase || page->isAncestorOf(phase) || page == field ||
-                       page->isAncestorOf(field) ? 2 : 1;
+                       page->isAncestorOf(field)
+                   ? 2
+                   : 1;
     };
     const auto populateViews = [tabs, family, view, familyForPage](int selected) {
         const QSignalBlocker blocker(view);
@@ -980,16 +1158,21 @@ SimulationDock::SimulationDock(QMainWindow *parent) : QDockWidget(tr("Akustik"),
         maximumFrequency_->setEnabled(count > 1);
         controlsChanged();
     });
-    connect(fastMultipole_, &QCheckBox::toggled, this, [this](bool enabled) {
-        multipoleOrder_->setEnabled(enabled && !infiniteBaffle_);
+    connect(fastMultipole_, &QCheckBox::toggled, this, [this](bool) {
         updateDomainControls();
         controlsChanged();
     });
-    connect(multipoleOrder_, &QSpinBox::valueChanged, this, [this](int order) {
-        fastMultipoleSettings_.interpolationOrder = static_cast<unsigned>(order);
+    connect(multipoleLeafCapacity_, &QSpinBox::valueChanged, this, [this](int capacity) {
+        fastMultipoleSettings_.leafSupportCapacity = static_cast<unsigned>(capacity);
+        controlsChanged();
+    });
+    connect(multipoleJacobiBlock_, &QComboBox::currentIndexChanged, this, [this] {
+        fastMultipoleSettings_.preconditionerBlockWidth =
+            multipoleJacobiBlock_->currentData().toUInt();
         controlsChanged();
     });
     connect(nearMaximumDepth_, &QSpinBox::valueChanged, this, [this] { controlsChanged(); });
+    connect(singularOrder_, &QSpinBox::valueChanged, this, [this] { controlsChanged(); });
     connect(solve_, &QPushButton::clicked, this, &SimulationDock::requestSolve);
     realtimeTimer_ = new QTimer(this);
     realtimeTimer_->setSingleShot(true);
@@ -1064,7 +1247,8 @@ void SimulationDock::updateResultControls() {
     updateResultQuality();
     const auto *page = resultTabs_->currentWidget();
     const bool polarPage = page && page->isAncestorOf(polarH_);
-    const bool isobarPage = page && (page->isAncestorOf(isobarH_) || page->isAncestorOf(radialIsobarH_));
+    const bool isobarPage =
+        page && (page->isAncestorOf(isobarH_) || page->isAncestorOf(radialIsobarH_));
     const bool responsePage = page && page->isAncestorOf(impedance_);
     const bool fieldPage = page && page->isAncestorOf(acousticField_);
     const bool empty = !result_ && measurements_.empty();
@@ -1088,8 +1272,8 @@ void SimulationDock::updateResultControls() {
     const auto *navigation = resultPage_->findChild<QWidget *>("resultNavigation");
     const int fieldMinimum = acousticField_->minimumSizeHint().height() +
                              workspaceTabs_->tabBar()->sizeHint().height() +
-                             (navigation ? navigation->minimumSizeHint().height() : 0) + margins.top() +
-                             margins.bottom() + resultPage_->layout()->spacing() +
+                             (navigation ? navigation->minimumSizeHint().height() : 0) +
+                             margins.top() + margins.bottom() + resultPage_->layout()->spacing() +
                              4 * style()->pixelMetric(QStyle::PM_DefaultFrameWidth);
     workspaceTabs_->setMinimumHeight(showingField ? fieldMinimum : 100);
     setMinimumHeight(0);
@@ -1114,7 +1298,8 @@ void SimulationDock::updateResultQuality() {
                          resultGeneration_ == generation_;
     const QString freshness = current ? tr("aktuell") : tr("veraltet");
     const QString completeness = !resultCompletenessKnown_ ? tr("Vollständigkeit unbekannt")
-                                 : resultComplete_ ? tr("vollständig") : tr("Teilraster");
+                                 : resultComplete_         ? tr("vollständig")
+                                                           : tr("Teilraster");
     double maximumResidual = 0;
     bool haveResidual = false;
     for (const auto &frequency : result_->frequencies)
@@ -1123,15 +1308,18 @@ void SimulationDock::updateResultQuality() {
                 maximumResidual = std::max(maximumResidual, excitation.boundaryResidual);
                 haveResidual = true;
             }
-    quality_->setText(!current ? tr("Qualität: veraltet")
+    quality_->setText(!current                                       ? tr("Qualität: veraltet")
                       : resultCompletenessKnown_ && !resultComplete_ ? tr("Qualität: Teil")
-                      : tr("Qualität: aktuell"));
-    quality_->setToolTip(tr("Ergebnis Rev. %1 · %2 · %3\n%4\nNetz-/Quadraturkonvergenz "
-                            "dieses Ergebnisses nicht geprüft. CTA-Schallleistung ist eine "
-                            "70-Richtungs-Näherung, keine Zertifizierung.")
-                             .arg(resultRevision_).arg(freshness, completeness)
-                             .arg(haveResidual ? tr("Max. relatives Randresiduum: %1").arg(maximumResidual, 0, 'g', 4)
-                                               : tr("Randresiduum nicht verfügbar")));
+                                                                     : tr("Qualität: aktuell"));
+    quality_->setToolTip(
+        tr("Ergebnis Rev. %1 · %2 · %3\n%4\nNetz-/Quadraturkonvergenz "
+           "dieses Ergebnisses nicht geprüft. CTA-Schallleistung ist eine "
+           "70-Richtungs-Näherung, keine Zertifizierung.")
+            .arg(resultRevision_)
+            .arg(freshness, completeness)
+            .arg(haveResidual
+                     ? tr("Max. relatives Randresiduum: %1").arg(maximumResidual, 0, 'g', 4)
+                     : tr("Randresiduum nicht verfügbar")));
 }
 
 void SimulationDock::invalidate(std::uint64_t revision) {
@@ -1144,7 +1332,8 @@ void SimulationDock::invalidate(std::uint64_t revision) {
     solve_->setEnabled(false);
     if (result_) {
         const auto completeness = !resultCompletenessKnown_ ? tr(" · Vollständigkeit unbekannt")
-                                  : !resultComplete_ ? tr(" · Teilraster") : QString{};
+                                  : !resultComplete_        ? tr(" · Teilraster")
+                                                            : QString{};
         setWindowTitle(tr("Akustik · Rev. %1 · veraltet%2").arg(resultRevision_).arg(completeness));
         setStatus(tr("Geometrie geändert · Ergebnisse veraltet"));
     } else
@@ -1269,6 +1458,17 @@ void SimulationDock::setCoupling(lem::Network network, bool enabled) {
     }
 }
 
+void SimulationDock::setPartitionMeshingOptions(MeshingOptions options) {
+    partitionOptions_ = std::move(options);
+}
+
+void SimulationDock::setAcousticRegions(std::vector<AcousticRegionDefinition> regions) {
+    if (acousticRegions_ == regions)
+        return;
+    acousticRegions_ = std::move(regions);
+    controlsChanged();
+}
+
 void SimulationDock::setInfiniteBaffle(std::optional<InfiniteBaffle> baffle) {
     if (baffle)
         validateInfiniteBaffleSettings(*baffle);
@@ -1285,7 +1485,9 @@ void SimulationDock::cancelSolve() {
     setStatus(tr("Berechnung wird abgebrochen …"));
 }
 
-bool SimulationDock::hasConfiguredExcitation() const { return hasExcitation(); }
+bool SimulationDock::hasConfiguredExcitation() const {
+    return hasExcitation();
+}
 
 bool SimulationDock::hasExcitation() const {
     return couplingEnabled_ || !velocities_.empty();
@@ -1311,7 +1513,8 @@ void SimulationDock::updateDomainControls() {
     phase_->setEnabled(knownDrive);
     // A checked unsupported mode stays visible and can be explicitly switched off.
     fastMultipole_->setEnabled((!infiniteBaffle_ && !reduced) || fastMultipole_->isChecked());
-    multipoleOrder_->setEnabled(!infiniteBaffle_ && !reduced && fastMultipole_->isChecked());
+    multipoleLeafCapacity_->setEnabled(!infiniteBaffle_ && !reduced && fastMultipole_->isChecked());
+    multipoleJacobiBlock_->setEnabled(multipoleLeafCapacity_->isEnabled());
     baffle_->setText(infiniteBaffle_ ? tr("Schallwand · unendlich …") : tr("Schallwand …"));
     const auto orientation =
         infiniteBaffle_
@@ -1484,7 +1687,9 @@ SimulationArchive SimulationDock::archive() const {
                                     : BemGeometryMode::threeDimensional,
          {meridianLength_->value() * .001, meridianTolerance_->value() * .001,
           rotationalTolerance_->value() * 1e-6, static_cast<unsigned>(angularSectors_->value())},
-         ctaSelection_},
+         ctaSelection_,
+         static_cast<unsigned>(singularOrder_->value()),
+         acousticRegions_},
         resultMesh_,
         resultRequest_,
         result_,
@@ -1492,7 +1697,9 @@ SimulationArchive SimulationDock::archive() const {
         hasCurrentResult(),
         measurements_,
         resultAxisymmetricSampling_,
-        result_ && resultCompletenessKnown_ ? std::optional{resultComplete_} : std::nullopt};
+        result_ && resultCompletenessKnown_ ? std::optional{resultComplete_} : std::nullopt,
+        resultSourceMesh_,
+        resultRegions_};
 }
 
 void SimulationDock::cancelPendingJobs() {
@@ -1527,6 +1734,8 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
     if (s.nearMaximumDepth > 10)
         throw std::invalid_argument(
             "Die maximale Nahquadraturtiefe muss zwischen 0 und 10 liegen.");
+    if (s.singularOrder < 2 || s.singularOrder > 20)
+        throw std::invalid_argument("Die Singularordnung muss zwischen 2 und 20 liegen.");
     if (s.observationFrame)
         normalizedAcousticFrame(*s.observationFrame);
     if (s.infiniteBaffle)
@@ -1534,8 +1743,11 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
     const auto &multipole = s.fastMultipole;
     if ((s.acceleration != BemAcceleration::dense &&
          s.acceleration != BemAcceleration::fastMultipole) ||
-        multipole.interpolationOrder < 3 || multipole.interpolationOrder > 8 ||
-        multipole.leafPanelCapacity < 4 || multipole.leafPanelCapacity > 256 ||
+        multipole.leafSupportCapacity < 4 || multipole.leafSupportCapacity > 256 ||
+        (multipole.preconditionerBlockWidth != 32 && multipole.preconditionerBlockWidth != 64 &&
+         multipole.preconditionerBlockWidth != 128 && multipole.preconditionerBlockWidth != 256 &&
+         multipole.preconditionerBlockWidth != 512 && multipole.preconditionerBlockWidth != 1024 &&
+         multipole.preconditionerBlockWidth != 2048) ||
         !std::isfinite(multipole.separationRatio) || multipole.separationRatio < 1.5 ||
         multipole.separationRatio > 10 || multipole.maximumIterations < 1 ||
         multipole.maximumIterations > 10000 || multipole.restartLength < 2 ||
@@ -1576,6 +1788,14 @@ void SimulationDock::validateArchive(const SimulationArchive &saved) const {
         bem_detail::planningWavenumber(saved.request->frequencies,
                                        saved.request->interactionPlanFrequencies,
                                        saved.request->medium.soundSpeed);
+        if (saved.request->subdomains) {
+            if (!saved.sourceMesh || saved.resultRegions.empty() ||
+                (saved.current && saved.resultRegions != s.acousticRegions))
+                throw std::invalid_argument(
+                    "Teilgebietsergebnis besitzt keinen passenden Quellsnapshot.");
+            validateAcousticPartition(*saved.mesh, *saved.request->subdomains);
+        } else if (saved.sourceMesh || !saved.resultRegions.empty())
+            throw std::invalid_argument("Teilgebiets-Quellsnapshot ohne Teilgebietsmodell.");
         const bool reduced = saved.request->axisymmetric.has_value();
         if (saved.axisymmetricSampling.has_value() != reduced ||
             (saved.result->geometryMode == BemGeometryMode::axisymmetric) != reduced ||
@@ -1630,8 +1850,9 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
         d(density_), e(soundSpeed_), f(velocity_), g(phase_), h(normalization_),
         i(beamwidthTarget_), j(targetH_), k(targetV_), l(targetTolerance_), m(normalizationAngle_),
         n(directivityMinimum_), o(directivityMaximum_), p(directivityStep_), q(fieldMode_),
-        r(observationDistance_), multipoleBlock(fastMultipole_), orderBlock(multipoleOrder_),
-        nearDepthBlock(nearMaximumDepth_);
+        r(observationDistance_), multipoleBlock(fastMultipole_), orderBlock(multipoleLeafCapacity_),
+        jacobiBlock(multipoleJacobiBlock_), nearDepthBlock(nearMaximumDepth_),
+        singularBlock(singularOrder_);
     minimumFrequency_->setValue(s.minimumFrequency);
     maximumFrequency_->setValue(s.maximumFrequency);
     frequencyCount_->setValue(static_cast<int>(s.frequencyCount));
@@ -1644,12 +1865,17 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
     observationDistance_->setValue(s.observationDistance);
     fastMultipoleSettings_ = s.fastMultipole;
     fastMultipole_->setChecked(s.acceleration == BemAcceleration::fastMultipole);
-    multipoleOrder_->setValue(static_cast<int>(s.fastMultipole.interpolationOrder));
-    multipoleOrder_->setEnabled(fastMultipole_->isChecked());
+    multipoleLeafCapacity_->setValue(static_cast<int>(s.fastMultipole.leafSupportCapacity));
+    multipoleLeafCapacity_->setEnabled(fastMultipole_->isChecked());
+    multipoleJacobiBlock_->setCurrentIndex(
+        multipoleJacobiBlock_->findData(s.fastMultipole.preconditionerBlockWidth));
+    multipoleJacobiBlock_->setEnabled(fastMultipole_->isChecked());
     nearMaximumDepth_->setValue(static_cast<int>(s.nearMaximumDepth));
+    singularOrder_->setValue(static_cast<int>(s.singularOrder));
     couplingNetwork_ = s.couplingNetwork;
     couplingEnabled_ = s.couplingEnabled;
     infiniteBaffle_ = s.infiniteBaffle;
+    acousticRegions_ = s.acousticRegions;
     angularResponses_->setSettings(s.angularResponses);
     acousticField_->setSettings(s.fieldDisplay);
     phaseResponses_->setSettings(s.phaseDisplay);
@@ -1670,6 +1896,8 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
     displayFrequencies_.clear();
     displayBaseline_.clear();
     resultMesh_ = saved.mesh;
+    resultSourceMesh_ = saved.sourceMesh;
+    resultRegions_ = saved.resultRegions;
     resultRequest_ = saved.request;
     resultAxisymmetricSampling_ = saved.axisymmetricSampling;
     resultRevision_ = saved.revision;
@@ -1679,7 +1907,13 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
                    resultRevision_ == currentRevision_;
     if (current) {
         try {
-            current = sameRequest(*resultRequest_, makeRequest());
+            auto solvedRequest = *resultRequest_;
+            const bool partitioned = solvedRequest.subdomains.has_value();
+            if (partitioned)
+                current = resultSourceMesh_ && mesh_ && *resultSourceMesh_ == *mesh_ &&
+                          resultRegions_ == acousticRegions_;
+            solvedRequest.subdomains.reset();
+            current = current && sameRequest(solvedRequest, makeRequest());
         } catch (const std::exception &) {
             current = false;
         }
@@ -1693,6 +1927,21 @@ void SimulationDock::restoreArchive(const SimulationArchive &saved) {
         result_
             ? (current ? tr("Gespeicherte Ergebnisse") : tr("Gespeicherte Ergebnisse · veraltet"))
             : (hasCurrentGeometry() ? tr("Bereit") : tr("Geometrie / Netz erforderlich")));
+    if (result_)
+        status_->setToolTip(fmmEvidenceSummary(*result_) + "\n" +
+                            quadratureEvidenceSummary(*result_) + "\n" +
+                            krylovTargetSummary(*result_) + "\n" + gpuMemorySummary(*result_));
+    if (result_)
+        for (const auto &frequency : result_->frequencies)
+            for (const auto &excitation : frequency.excitations)
+                if (excitation.residualEvaluation ==
+                    BemResidualEvaluation::higherOrderFastMultipole) {
+                    setStatus(status_->text() + tr(" · FMM-Audit (Näherung)"));
+                    status_->setToolTip(status_->toolTip() +
+                                        tr("\nHöherordentlicher FMM-Audit: kein exakt berechneter "
+                                           "Originalrest und keine zertifizierte Fehlergrenze."));
+                    return;
+                }
 }
 
 void SimulationDock::updateDisplayEstimate() {
@@ -1817,7 +2066,8 @@ void SimulationDock::presentResult(bool current) {
         return;
     }
     const auto completeness = !resultCompletenessKnown_ ? tr(" · Vollständigkeit unbekannt")
-                              : !resultComplete_ ? tr(" · Teilraster") : QString{};
+                              : !resultComplete_        ? tr(" · Teilraster")
+                                                        : QString{};
     setWindowTitle(tr("Akustik · Rev. %1%2%3")
                        .arg(resultRevision_)
                        .arg(current ? QString{} : tr(" · veraltet"))
@@ -1857,19 +2107,21 @@ void SimulationDock::updateCta2034(bool current) {
             for (const auto &e : result_->frequencies.front().excitations)
                 ctaExcitation_->addItem(QString::fromStdString(e.name));
         if (ctaExcitation_->count()) {
-            const int selected = ctaSelection_ >= 0 && ctaSelection_ < ctaExcitation_->count()
-                                     ? ctaSelection_ : 0;
+            const int selected =
+                ctaSelection_ >= 0 && ctaSelection_ < ctaExcitation_->count() ? ctaSelection_ : 0;
             ctaExcitation_->setCurrentIndex(selected);
             ctaSelection_ = selected;
         }
     }
     if (result_ && count && resultRequest_ && resultRequest_->farField &&
         ctaExcitation_->currentIndex() >= 0) {
-        for (const auto &row : ctaResults(*resultRequest_, *result_, static_cast<std::size_t>(ctaExcitation_->currentIndex()))) {
+        for (const auto &row :
+             ctaResults(*resultRequest_, *result_,
+                        static_cast<std::size_t>(ctaExcitation_->currentIndex()))) {
             const auto &curves = row.curves;
             const auto append = [&](PlotSeries &series, std::optional<double> value) {
-                series.points.emplace_back(row.frequency,
-                    value.value_or(std::numeric_limits<double>::quiet_NaN()));
+                series.points.emplace_back(
+                    row.frequency, value.value_or(std::numeric_limits<double>::quiet_NaN()));
             };
             append(axis, curves.onAxisDb);
             append(listening, curves.listeningWindowDb);
@@ -1883,16 +2135,22 @@ void SimulationDock::updateCta2034(bool current) {
     ctaLevels_->setSeries({std::move(axis), std::move(listening), std::move(reflections),
                            std::move(power), std::move(predicted)});
     ctaDi_->setSeries({std::move(di), std::move(powerDi)});
-    ctaStatus_->setText(result_ && resultRequest_ && resultRequest_->farField && count
-        ? tr("Anregung: %5 · Simulation · Fernfeld %1 m · Rev. %2%3%4. CTA-Schallleistung ist eine "
-             "70-Richtungs-Näherung; die Raumkurve ist eine Schätzung. Fehlende Winkel ergeben Lücken.")
-              .arg(resultRequest_->farField->referenceDistance).arg(resultRevision_)
-              .arg(current ? QString{} : tr(" · veraltet"))
-              .arg(!resultCompletenessKnown_ ? tr(" · Vollständigkeit unbekannt")
-                                            : resultComplete_ ? QString{} : tr(" · Teilraster"))
-              .arg(ctaExcitation_->currentText())
-        : tr("CTA-Auswertung benötigt ein Fernfeldergebnis mit H/V-Winkelstützstellen. "
-             "Für Schallleistung und Raumprognose sind vollständige 360°-Schnitte erforderlich."));
+    ctaStatus_->setText(
+        result_ && resultRequest_ && resultRequest_->farField && count
+            ? tr("Anregung: %5 · Simulation · Fernfeld %1 m · Rev. %2%3%4. CTA-Schallleistung ist "
+                 "eine "
+                 "70-Richtungs-Näherung; die Raumkurve ist eine Schätzung. Fehlende Winkel ergeben "
+                 "Lücken.")
+                  .arg(resultRequest_->farField->referenceDistance)
+                  .arg(resultRevision_)
+                  .arg(current ? QString{} : tr(" · veraltet"))
+                  .arg(!resultCompletenessKnown_ ? tr(" · Vollständigkeit unbekannt")
+                       : resultComplete_         ? QString{}
+                                                 : tr(" · Teilraster"))
+                  .arg(ctaExcitation_->currentText())
+            : tr("CTA-Auswertung benötigt ein Fernfeldergebnis mit H/V-Winkelstützstellen. "
+                 "Für Schallleistung und Raumprognose sind vollständige 360°-Schnitte "
+                 "erforderlich."));
 }
 void SimulationDock::updateFieldAndPhase(bool current) {
     const auto count = angularSampleCount(resultRequest_);
@@ -1985,12 +2243,13 @@ BemRequest SimulationDock::makeRequest() const {
     const int count = frequencyCount_->value();
     if (count > 1 && maximum <= minimum)
         throw std::invalid_argument("Obere Frequenz muss über der unteren Frequenz liegen.");
-    requireResultMemory(!usesAxisymmetricGeometry() && mesh_ ? mesh_->triangles.size() : 0,
-                        !usesAxisymmetricGeometry() && mesh_ ? mesh_->vertices.size() : 0,
-                        infiniteBaffle_ ? infiniteBaffle_->exteriorDrivenMesh.triangles.size() : 0,
-                        velocities_.size(), static_cast<std::size_t>(count),
-                        couplingEnabled_ && infiniteBaffle_ && !velocities_.empty() ? 2 : 1,
-                        realtimeEnabled_);
+    requireResultMemory(
+        !usesAxisymmetricGeometry() && mesh_ ? mesh_->triangles.size() : 0,
+        !usesAxisymmetricGeometry() && mesh_ ? mesh_->vertices.size() : 0,
+        infiniteBaffle_ ? infiniteBaffle_->exteriorDrivenMesh.triangles.size() : 0,
+        velocities_.size(), static_cast<std::size_t>(count),
+        couplingEnabled_ ? std::max<std::size_t>(1, lem::bemPorts(couplingNetwork_).size()) : 1,
+        realtimeEnabled_, acousticRegions_.empty() ? 0 : acousticRegions_.size() + 1);
     const auto settings = archive().settings;
     auto built = makeSimulationRequest(settings, velocities_, origin_, axis_);
     if (usesAxisymmetricGeometry() && resultRequest_ && resultRequest_->axisymmetric &&
@@ -2019,6 +2278,8 @@ void SimulationDock::requestSolve() {
         std::sort(job->boundaryDefinitions.begin(), job->boundaryDefinitions.end(),
                   [](const FaceVelocity &a, const FaceVelocity &b) { return a.faceId < b.faceId; });
         job->request = std::move(request);
+        job->acousticRegions = acousticRegions_;
+        job->partitionOptions = partitionOptions_;
         if (usesAxisymmetricGeometry()) {
             job->source = geometrySource_;
             job->axisymmetricSampling = archive().settings.axisymmetricSampling;
@@ -2144,17 +2405,33 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 }
                 actualMesh = reducedMesh;
                 actualRequest.axisymmetric = reducedLayout;
-                requireResultMemory(actualMesh->triangles.size(), actualMesh->vertices.size(),
-                                    actualRequest.infiniteBaffle
-                                        ? actualRequest.infiniteBaffle->exteriorDrivenMesh.triangles.size()
-                                        : 0,
-                                    job->boundaryDefinitions.size(),
-                                    actualRequest.frequencies.size(),
-                                    actualRequest.excitations.size() + (actualRequest.coupling ? 1 : 0),
-                                    job->realtime);
+                requireResultMemory(
+                    actualMesh->triangles.size(), actualMesh->vertices.size(),
+                    actualRequest.infiniteBaffle
+                        ? actualRequest.infiniteBaffle->exteriorDrivenMesh.triangles.size()
+                        : 0,
+                    job->boundaryDefinitions.size(), actualRequest.frequencies.size(),
+                    actualRequest.excitations.size() + (actualRequest.coupling ? 1 : 0),
+                    job->realtime);
+            }
+            if (!job->acousticRegions.empty()) {
+                if (!actualMesh)
+                    throw std::invalid_argument(
+                        "Teilgebiete benötigen ein aktuelles Qualitätsnetz.");
+                auto partition = partitionAcousticSurface(*actualMesh, job->acousticRegions,
+                                                          job->partitionOptions, stop);
+                actualMesh = std::make_shared<SurfaceMesh>(std::move(partition.mesh));
+                actualRequest.subdomains = std::move(partition.model);
+                requireResultMemory(
+                    actualMesh->triangles.size(), actualMesh->vertices.size(), 0,
+                    job->boundaryDefinitions.size(), actualRequest.frequencies.size(),
+                    actualRequest.coupling
+                        ? std::max<std::size_t>(1, lem::bemPorts(*actualRequest.coupling).size())
+                        : actualRequest.excitations.size(),
+                    job->realtime, actualRequest.subdomains->domains.size());
             }
             reusedGeometry =
-                solver && cachedMesh == actualMesh &&
+                solver && !actualRequest.subdomains && cachedMesh == actualMesh &&
                 std::equal(cachedDefinitions.begin(), cachedDefinitions.end(),
                            job->boundaryDefinitions.begin(), job->boundaryDefinitions.end(),
                            [](const FaceVelocity &a, const FaceVelocity &b) {
@@ -2165,7 +2442,10 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 cachedMesh = actualMesh;
                 cachedDefinitions = job->boundaryDefinitions;
                 if (!stop.stop_requested())
-                    solver = std::make_unique<CudaBemSolver>(*cachedMesh);
+                    solver = actualRequest.subdomains
+                                 ? std::make_unique<CudaBemSolver>(*cachedMesh,
+                                                                   *actualRequest.subdomains)
+                                 : std::make_unique<CudaBemSolver>(*cachedMesh);
             }
             if (stop.stop_requested())
                 throw std::runtime_error("Berechnung abgebrochen");
@@ -2187,6 +2467,8 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                     accumulated.pressureDofCount = single.pressureDofCount;
                     accumulated.peakDeviceBytes =
                         std::max(accumulated.peakDeviceBytes, single.peakDeviceBytes);
+                    accumulated.liveDeviceBytes =
+                        std::max(accumulated.liveDeviceBytes, single.liveDeviceBytes);
                     const auto position = std::lower_bound(
                         accumulated.frequencies.begin(), accumulated.frequencies.end(), frequency,
                         [](const auto &entry, double f) { return entry.frequency < f; });
@@ -2198,16 +2480,21 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                     partialRequest.frequencies.clear();
                     for (const auto &computed : accumulated.frequencies)
                         partialRequest.frequencies.push_back(computed.frequency);
-                    if (job->partial.offer({std::move(partial), std::move(partialRequest), frequency})) {
+                    if (job->partial.offer(
+                            {std::move(partial), std::move(partialRequest), frequency})) {
                         const bool queued = QMetaObject::invokeMethod(
                             this,
                             [this, job, actualMesh] {
                                 auto latest = job->partial.take();
-                                if (!latest || job->id != activeJob_ || job->generation != generation_ ||
+                                if (!latest || job->id != activeJob_ ||
+                                    job->generation != generation_ ||
                                     job->revision != currentRevision_ || job->stop.stop_requested())
                                     return;
                                 result_ = std::move(latest->result);
                                 resultMesh_ = actualMesh;
+                                resultSourceMesh_ =
+                                    job->acousticRegions.empty() ? nullptr : job->mesh;
+                                resultRegions_ = job->acousticRegions;
                                 resultRequest_ = std::move(latest->request);
                                 resultAxisymmetricSampling_ = job->axisymmetricSampling;
                                 resultRevision_ = job->revision;
@@ -2215,11 +2502,11 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                                 resultComplete_ = false;
                                 resultCompletenessKnown_ = true;
                                 presentResult(true);
-                                setWindowTitle(
-                                    tr("Akustik · Rev. %1 · Teilraster %2/%3 · Zwischenwerte geschätzt")
-                                        .arg(resultRevision_)
-                                        .arg(result_->frequencies.size())
-                                        .arg(job->request.frequencies.size()));
+                                setWindowTitle(tr("Akustik · Rev. %1 · Teilraster %2/%3 · "
+                                                  "Zwischenwerte geschätzt")
+                                                   .arg(resultRevision_)
+                                                   .arg(result_->frequencies.size())
+                                                   .arg(job->request.frequencies.size()));
                                 progress_->setValue(static_cast<int>(result_->frequencies.size()));
                                 setStatus(tr("CUDA · %1 / %2 Frequenzen · zuletzt %3 Hz")
                                               .arg(result_->frequencies.size())
@@ -2231,30 +2518,35 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                             Qt::QueuedConnection);
                         if (!queued) {
                             (void)job->partial.take();
-                            throw std::runtime_error("Teilstand konnte nicht an die Oberfläche übergeben werden.");
+                            throw std::runtime_error(
+                                "Teilstand konnte nicht an die Oberfläche übergeben werden.");
                         }
                     }
                 }
                 result = std::make_shared<BemResult>(std::move(accumulated));
             } else {
-                result = std::make_shared<BemResult>(solver->solve(
-                    actualRequest, stop, [this, job](const BemProgress &progress) {
-                        if (!job->progress.offer(progress)) return;
+                result = std::make_shared<BemResult>(
+                    solver->solve(actualRequest, stop, [this, job](const BemProgress &progress) {
+                        if (!job->progress.offer(progress))
+                            return;
                         const bool queued = QMetaObject::invokeMethod(
                             this,
                             [this, job] {
                                 auto latest = job->progress.take();
-                                if (!latest || job->generation != generation_ || job->id != activeJob_)
+                                if (!latest || job->generation != generation_ ||
+                                    job->id != activeJob_)
                                     return;
                                 progress_->setValue(static_cast<int>(latest->completedFrequencies));
                                 setStatus(tr("CUDA · %1 / %2 · %3 Hz")
                                               .arg(latest->completedFrequencies)
                                               .arg(latest->totalFrequencies)
                                               .arg(frequencyLabel(latest->frequency)));
-                            }, Qt::QueuedConnection);
+                            },
+                            Qt::QueuedConnection);
                         if (!queued) {
                             (void)job->progress.take();
-                            throw std::runtime_error("Fortschritt konnte nicht an die Oberfläche übergeben werden.");
+                            throw std::runtime_error(
+                                "Fortschritt konnte nicht an die Oberfläche übergeben werden.");
                         }
                     }));
             }
@@ -2293,6 +2585,8 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 }
                 result_ = result;
                 resultMesh_ = actualMesh;
+                resultSourceMesh_ = job->acousticRegions.empty() ? nullptr : job->mesh;
+                resultRegions_ = job->acousticRegions;
                 resultRequest_ = actualRequest;
                 resultAxisymmetricSampling_ = job->axisymmetricSampling;
                 resultRevision_ = revision;
@@ -2307,6 +2601,8 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                 double residual = 0, stageMilliseconds = 0, auditMilliseconds = 0,
                        planMilliseconds = 0;
                 unsigned maximumIterations = 0, planHits = 0;
+                bool approximateAudit = false;
+                double operatorDiscrepancy = 0;
                 for (const auto &f : result_->frequencies) {
                     stageMilliseconds +=
                         f.assemblyMilliseconds + f.solveMilliseconds + f.fieldMilliseconds;
@@ -2316,31 +2612,44 @@ void SimulationDock::runWorker(std::stop_token shutdown) {
                     for (const auto &e : f.excitations) {
                         residual = std::max(residual, e.boundaryResidual);
                         maximumIterations = std::max(maximumIterations, e.iterations);
+                        approximateAudit |=
+                            e.residualEvaluation == BemResidualEvaluation::higherOrderFastMultipole;
+                        operatorDiscrepancy =
+                            std::max(operatorDiscrepancy, e.fastMultipoleOperatorDiscrepancy);
                     }
                 }
                 const QString method =
                     result_->geometryMode == BemGeometryMode::axisymmetric ? tr("2D-Rotation (m=0)")
                     : result_->acceleration == BemAcceleration::fastMultipole ? tr("Fast Multipole")
                                                                               : tr("Dicht");
-                setStatus(tr("%1 · %2 Frequenzen · %3 s · Residuum %4")
+                setStatus(tr("%1 · %2 Frequenzen · %3 s · %4 %5")
                               .arg(method)
                               .arg(result_->frequencies.size())
                               .arg(elapsedMilliseconds * .001, 0, 'f', 2)
+                              .arg(approximateAudit ? tr("Auditrest (Näherung)") : tr("Residuum"))
                               .arg(residual, 0, 'g', 3));
                 status_->setToolTip(
                     tr("Gesamtzeit: %1 ms\nNumerische Phasen: %2 ms\nGeometriedaten: %3\n"
-                       "GPU: %4\nDirekte Residuumprüfung: %5 ms\nMaximale Iterationen: %6\n"
-                       "CPU-Interaktionsplanung: %7 ms\nHost-Plan-Cache: %8 Treffer")
+                       "GPU: %4\n%5: %6 ms\nMaximale Iterationen: %7\n"
+                       "Ordnungsnachweis: %8\nOperatordifferenz-Indikator: %9\n"
+                       "CPU-Interaktionsplanung: %10 ms\nHost-Plan-Cache: %11 Treffer")
                         .arg(elapsedMilliseconds, 0, 'f', 1)
                         .arg(stageMilliseconds, 0, 'f', 1)
                         .arg(reusedGeometry ? tr("wiederverwendet") : tr("neu vorbereitet"))
                         .arg(QString::fromStdString(result_->device))
+                        .arg(approximateAudit
+                                 ? tr("Höherordentlicher FMM-Audit (kein Originalrest)")
+                                 : tr("Direkte Residuumprüfung"))
                         .arg(auditMilliseconds, 0, 'f', 1)
                         .arg(maximumIterations)
+                        .arg(fmmEvidenceSummary(*result_))
+                        .arg(operatorDiscrepancy, 0, 'g', 3)
                         .arg(planMilliseconds, 0, 'f', 1)
                         .arg(planHits) +
+                    "\n" + quadratureEvidenceSummary(*result_) + "\n" +
+                    krylovTargetSummary(*result_) + "\n" + gpuMemorySummary(*result_) +
                     (result_->geometryMode == BemGeometryMode::axisymmetric
-                         ? tr("\nResiduum des reduzierten m=0-Burton–Miller-Systems.")
+                         ? tr("\nResiduum des reduzierten m=0-Burton\u2013Miller-Systems.")
                          : QString{}));
                 std::fprintf(stdout, "CUDA job completed: elapsed_ms=%.3f geometry_cache=%s\n",
                              elapsedMilliseconds, reusedGeometry ? "reused" : "new");

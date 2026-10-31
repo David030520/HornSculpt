@@ -20,7 +20,8 @@ struct PressureFieldSettings {
 };
 
 // Finite-distance Helmholtz representation from actual P1 pressure and DP0
-// outward normal derivative traces. exp(+i wt), outgoing exp(-ikr). Exterior:
+// outward normal derivative traces. Subdomain interfaces use their stored P1
+// derivatives and domain-specific outward air normals. exp(+i wt), outgoing exp(-ikr). Exterior:
 // Dp-Sq; interior air cavity: Sq-Dp. Baffled exterior: -2 S_aperture q.
 // Solid regions and the non-radiating half-space outside the cavity are masked;
 // no extrapolation from observer/far-field samples is performed. A stop request

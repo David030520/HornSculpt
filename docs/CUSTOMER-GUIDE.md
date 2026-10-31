@@ -198,3 +198,22 @@ Konvergenznachweis. Lineares BEM weist weder Hochpegeleignung noch thermische
 Belastbarkeit eines Treibers nach. Bekannte konkrete Einschränkungen
 und Prüfnachweise stehen im kurzen Lieferstand und
 ausführlich in STATUS.md.
+
+## Teilgebiete und `.msh`
+
+**Datei → Gmsh-Netz importieren …** liest ASCII MSH 2.2/4.1 mit linearen
+Dreiecken und ebenen konvexen Vierecken. Dateieinheit ausdrücklich wählen;
+Entity-IDs und Physical Names bleiben im Projekt erhalten. In der
+Flächentabelle die tatsächlichen Antriebsflächen auf **Driven** setzen.
+**Importnetz prüfen** prüft bei dieser Quelle das Originalnetz; es wird nicht
+unbemerkt neu vernetzt. Eine aktive FreeCAD-Verbindung vor dem Import trennen.
+
+Unter **Akustik → Berechnung → Teilgebiete …** benannte Innenräume anlegen
+und physische Flächen sowie vorhandene Interfaceflächen getrennt zuordnen.
+Eine Interfacefläche verbindet zwei Gebiete, sie ist keine Wall- oder
+Driven-Fläche. Ohne vorgegebene Interfaceflächen lassen sich aus einer bereits
+geschlossenen physischen Quelle ebene Öffnungsabschlüsse erzeugen.
+**3D** und den **dichten GPU-Solver** verwenden; pro LEM-Port nur physische
+Antriebsflächen desselben Gebiets wählen. **Interfaces** zeigt die wirklichen
+Schnittflächen im Modell. Details, Normalenregeln und Grenzen stehen unter
+[Akustische Teilgebiete](SUBDOMAINS.md).

@@ -7,9 +7,10 @@ Quellen, ihre Zugänglichkeit und der tatsächlich geprüfte Umfang stehen im
 
 - [Hornprofile, Leitkurven, Richtwirkung und Moden](horns.md)
 - [BEM, Quadratur, Beschleunigung und Kopplung](bem.md)
+- [Akustische Teilgebiete, Interfaces und Gmsh-Import](../SUBDOMAINS.md)
 - [Simulation, Vergleich und Verifikation](validation.md)
 - Entscheidungsweg und durchgerechnete Beispiele
-- AKABAK als externe Bedien- und Funktionsreferenz
+- [AKABAK als externe Bedien- und Funktionsreferenz](akabak-reference.md)
 - [Quellen und Lesestatus](sources.md)
 
 **Grundsatz:** Ein glattes geometrisches Profil ist keine Vorhersage der

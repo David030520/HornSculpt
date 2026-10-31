@@ -2,21 +2,25 @@
 
 #include <complex>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <hornsculpt/acoustic_domains.hpp>
 #include <hornsculpt/lem.hpp>
 #include <hornsculpt/mesh.hpp>
 #include <memory>
 #include <optional>
 #include <stop_token>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 namespace hornsculpt {
 
 // Independent pressure-feedback consistency budget, not a residual-derived
 // error estimate. Shared by the solver and persisted-result validation.
 inline constexpr double relativePortPressureClosureTolerance = 1e-3;
+// Separate interpolation-convergence budget; not a certified remainder bound.
+inline constexpr double fastMultipoleOrderComparisonBudgetFraction = .25;
 
 struct AcousticMedium {
     double density{1.21};
@@ -36,20 +40,72 @@ struct BemExcitation {
 
 enum class BemAcceleration { dense, fastMultipole };
 
+enum class BemResidualEvaluation { directGalerkin, higherOrderFastMultipole };
+
+enum class BemFastMultipoleRepresentation { regularSpherical, planeWave };
+struct BemFastMultipoleLevelEvidence {
+    unsigned level{};
+    BemFastMultipoleRepresentation representation{BemFastMultipoleRepresentation::regularSpherical};
+    unsigned momentBandlimit{}, translationOrder{}, quadratureOrder{};
+    bool operator==(const BemFastMultipoleLevelEvidence &) const = default;
+};
+// Historical result provenance only. These tensor-Chebyshev orders must never
+// be interpreted as spherical/plane-wave settings of an automatic wideband solve.
+struct BemHistoricalChebyshevEvidence {
+    unsigned comparisonOrder{}, auditOrder{};
+    bool operator==(const BemHistoricalChebyshevEvidence &) const = default;
+};
+
 struct FastMultipoleSettings {
-    // Tensor Chebyshev order, not an error tolerance. Frequency-aware separation
-    // and direct original-operator residual checks guard the approximation.
-    unsigned interpolationOrder{3};
-    unsigned leafPanelCapacity{16};
+    // Automatic spherical/plane-wave orders derive from the requested residual
+    // accuracy. A leaf stops when each channel separately fits this capacity:
+    // complete P1 pressure supports and DP0 source panels, not their sum.
+    unsigned leafSupportCapacity{16};
     double separationRatio{1.5};
     unsigned maximumIterations{300};
     unsigned restartLength{40};
+    // Spatial P1 Near-CSR block-Jacobi width; powers of two from 32 to 2048 DOFs.
+    unsigned preconditionerBlockWidth{32};
     bool operator==(const FastMultipoleSettings &) const = default;
 };
 
+struct BemHistoricalChebyshevStatistics {
+    std::size_t directPanelPairCount{}, representedFarPanelPairs{};
+    bool operator==(const BemHistoricalChebyshevStatistics &) const = default;
+};
+// Recorded once per frequency across every RHS, seed and quadrature attempt.
+// Absence means not recorded, including older archives and Dense results.
+// Metadata bytes describe owned host payload only; CUDA graph-driver storage
+// is opaque. Free-device memory is an observation, not graph-owned memory.
+struct BemFastMultipoleGraphEvidence {
+    std::uint64_t captureAttempts{};
+    std::uint64_t instantiations{};
+    std::uint64_t launches{};
+    std::uint64_t reuses{};
+    std::uint64_t executedBatches{};
+    std::uint64_t canonicalChunks{};
+    std::uint64_t canonicalBatches{};
+    std::uint64_t invalidatedExecutables{};
+    std::uint64_t budgetBypasses{};
+    std::uint64_t admissionClosures{};
+    std::uint64_t maximumCachedExecutables{};
+    std::uint64_t maximumCachedNodes{};
+    std::uint64_t peakOwnedHostMetadataBytes{};
+    double captureMilliseconds{}, instantiationMilliseconds{};
+    bool memoryObservationAvailable{};
+    std::uint64_t minimumObservedFreeDeviceBytes{};
+    std::uint64_t totalDeviceBytes{};
+    std::uint64_t requiredFreeReserveBytes{};
+    bool operator==(const BemFastMultipoleGraphEvidence &) const = default;
+};
 struct FastMultipoleStatistics {
     std::size_t nodeCount{}, leafCount{}, farInteractionCount{};
-    std::size_t directPanelPairCount{}, representedFarPanelPairs{};
+    // Complete, disjoint ordered DOF pairs: near+far=Np*Np and Np*Nt.
+    // These are not triangle-pair counts and must not be validated against Nt^2.
+    std::uint64_t pressurePressureNearPairs{}, pressurePressureFarPairs{};
+    std::uint64_t pressureFluxNearPairs{}, pressureFluxFarPairs{};
+    std::optional<BemHistoricalChebyshevStatistics> historicalChebyshevStatistics;
+    std::optional<BemFastMultipoleGraphEvidence> graphExecution;
 };
 
 struct BemNumerics {
@@ -104,6 +160,7 @@ enum class BemGeometryMode { threeDimensional, axisymmetric };
 
 struct BemRequest {
     AcousticMedium medium;
+    std::optional<BemSubdomainModel> subdomains;
     std::vector<double> frequencies;
     std::vector<BemExcitation> excitations;
     std::vector<Vec3> observers;
@@ -149,14 +206,61 @@ struct BemBoundaryData {
     std::vector<std::complex<double>> exteriorSurfacePressure;
 };
 
+// Domain-local traces use explicit mesh indices. Flux follows the domain's
+// outward air normal. Interface pressure and flux remain spatially resolved.
+struct BemSubdomainTrace {
+    std::uint32_t domainId{};
+    std::vector<std::uint32_t> vertexIndices;
+    std::vector<std::complex<double>> pressureTrace;
+    std::vector<std::uint32_t> triangleIndices;
+    std::vector<std::complex<double>> normalDerivative;
+    struct InterfaceFlux {
+        std::uint32_t interfaceId{};
+        std::vector<std::uint32_t> vertexIndices;
+        std::vector<std::complex<double>> normalDerivative;
+    };
+    std::vector<InterfaceFlux> interfaceFluxes;
+};
 struct BemExcitationResult {
     std::string name;
     std::vector<std::complex<double>> observerPressure;
     std::vector<FaceImpedance> impedances;
     unsigned refinementSteps{};
-    // True relative L2 residual of the original, unscaled Galerkin equation in
-    // the selected space (full 3D or the explicit m=0 reduced space).
+    // Relative L2 residual of the unscaled equation identified below. A
+    // higher-order FMM residual is not the exact original Galerkin residual.
     double boundaryResidual{};
+    BemResidualEvaluation residualEvaluation{BemResidualEvaluation::directGalerkin};
+    // Last inner correction solve's unpreconditioned relative residual; zero
+    // when no inner solve was necessary (e.g. a zero coupled excitation).
+    double fastMultipoleKrylovResidual{};
+    // Configured relative target of the left-preconditioned inner Krylov
+    // equation. Not a measured original residual; zero means not recorded.
+    double fastMultipoleKrylovTarget{};
+    // (||(A_audit-A_comparison)p|| + ||(B_audit-B_comparison)q||) / ||B_audit q||.
+    // This is an order-comparison indicator, not a bound on the original
+    // operator, mesh discretization, quadrature or pressure error.
+    double fastMultipoleOperatorDiscrepancy{};
+    // Actual automatic wideband seed and independent final comparison/verification
+    // seeds. A seed selects initial level orders; it is not an operator-error bound.
+    // Dense solves have zero seeds. Direct audits retain the solve seed, while
+    // comparison/verification seeds and their level lists are zero/empty.
+    double fastMultipoleAccuracySeed{};
+    double fastMultipoleComparisonAccuracySeed{};
+    double fastMultipoleVerificationAccuracySeed{};
+    unsigned fastMultipoleAccuracyRefinements{};
+    std::vector<BemFastMultipoleLevelEvidence> fastMultipoleComparisonLevels;
+    std::vector<BemFastMultipoleLevelEvidence> fastMultipoleVerificationLevels;
+    std::optional<BemHistoricalChebyshevEvidence> historicalChebyshevEvidence;
+    // Independent integration-rule checks at a fixed final accuracy seed.
+    // Zero degree pairs mean not evaluated, not demonstrated convergence.
+    unsigned farQuadratureComparisonDegree{}, farQuadratureVerificationDegree{};
+    unsigned farQuadratureRefinements{};
+    // (||Delta Ap|| + ||Delta Bq||) / ||Bq||; separate from FMM seed error.
+    double farQuadratureDiscrepancy{};
+    double farQuadraturePreparationMilliseconds{}, farQuadraturePressureMilliseconds{},
+        farQuadratureFluxMilliseconds{};
+    unsigned fieldQuadratureComparisonDegree{}, fieldQuadratureVerificationDegree{};
+    double fieldQuadratureDiscrepancy{};
     // Actual physical RMS velocities, including zero-flow coupled faces.
     std::vector<FaceVelocity> solvedVelocities;
     std::optional<lem::Solution> lemSolution;
@@ -170,11 +274,21 @@ struct BemExcitationResult {
     void setBoundary(BemBoundaryData value) {
         boundary_ = std::make_shared<const BemBoundaryData>(std::move(value));
     }
-    const std::shared_ptr<const BemBoundaryData> &boundary() const noexcept { return boundary_; }
+    const std::shared_ptr<const BemBoundaryData> &boundary() const noexcept {
+        return boundary_;
+    }
+    // Copies share published traces without retaining a mutable owner.
+    void setSubdomainTraces(std::vector<BemSubdomainTrace> value) {
+        subdomainTraces_ = std::make_shared<const std::vector<BemSubdomainTrace>>(std::move(value));
+    }
+    const std::vector<BemSubdomainTrace> &subdomainTraces() const noexcept {
+        static const std::vector<BemSubdomainTrace> empty;
+        return subdomainTraces_ ? *subdomainTraces_ : empty;
+    }
 
   private:
     std::shared_ptr<const BemBoundaryData> boundary_;
-
+    std::shared_ptr<const std::vector<BemSubdomainTrace>> subdomainTraces_;
 };
 
 struct BemFrequencyResult {
@@ -201,17 +315,39 @@ struct BemResult {
     std::vector<BemFrequencyResult> frequencies;
     BemAcceleration acceleration{BemAcceleration::dense};
     BemGeometryMode geometryMode{BemGeometryMode::threeDimensional};
+    // Archived measurement: maximum owned stationary buffers held during
+    // operator applications (including solver/FFT/RCR/preconditioner workspaces),
+    // after temporary construction buffers are released. Not currently live
+    // memory after the job ends. Zero means unavailable for historical data.
+    std::size_t liveDeviceBytes{};
 };
 
+enum class BemSolvePhase {
+    preparing,
+    nearConstruction,
+    farPreparation,
+    krylovSolve,
+    residualAudit,
+    fieldEvaluation,
+    frequencyComplete
+};
 struct BemProgress {
     std::size_t completedFrequencies{};
     std::size_t totalFrequencies{};
     double frequency{};
+    BemSolvePhase phase{BemSolvePhase::preparing};
+    // Completed Krylov steps and actual A*p / B*q applications, cumulative
+    // within the current frequency across excitations, corrections and audits.
+    unsigned iterations{};
+    std::size_t pressureOperatorApplications{}, faceFluxOperatorApplications{};
+    // Zero-based linear RHS index, including coupled-port basis solves when
+    // present; count is explicit rather than inferred from the fixture file.
+    std::size_t rightHandSideIndex{}, rightHandSideCount{};
 };
 
 // Positive-time RMS convention: exp(+i omega t), outgoing exp(-ikr), q=-i rho omega v.
 // Continuous P1 pressure / DP0 flux Burton-Miller Galerkin: pivoted CUDA LU or
-// hierarchical CUDA Fast Multipole with restarted GMRES and direct residual audit.
+// hierarchical CUDA Fast Multipole with restarted GMRES and cost-selected audit.
 // The closed mesh and GPU geometry data are retained across frequency sweeps.
 enum class CudaCacheResidency { automatic, device, mappedHost };
 struct CudaStorageOptions {
@@ -223,6 +359,7 @@ class CudaBemSolver {
   public:
     explicit CudaBemSolver(SurfaceMesh mesh);
     CudaBemSolver(SurfaceMesh mesh, CudaStorageOptions storage);
+    CudaBemSolver(SurfaceMesh mesh, BemSubdomainModel model, CudaStorageOptions storage = {});
     ~CudaBemSolver();
     CudaBemSolver(const CudaBemSolver &) = delete;
     CudaBemSolver &operator=(const CudaBemSolver &) = delete;

@@ -16,6 +16,7 @@
 #include <hornsculpt/mesh_viewport.hpp>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -245,6 +246,55 @@ void checkFrontView(hornsculpt::MeshViewport &viewport) {
     if (*mesh != original)
         throw std::runtime_error("Vorderansicht verändert das physische Netz.");
 }
+void checkInterfaceOverlay(hornsculpt::MeshViewport &viewport, const QString &screenshot = {}) {
+    auto source = box({2, 2, 2});
+    viewport.setMesh(source);
+    viewport.setHiddenFaces({});
+    viewport.setWireframe(false);
+    viewport.fitView();
+    viewport.viewFront({0, 0, 1});
+    const QPointF center(viewport.width() * .5, viewport.height() * .5);
+    const auto picked = viewport.pickFace(center);
+    if (!picked)
+        throw std::runtime_error("Interface-Test: physische Fläche nicht auswählbar.");
+    auto interfaceMesh = std::make_shared<hornsculpt::SurfaceMesh>();
+    interfaceMesh->vertices = {{-.5, -.5, 1.01}, {.5, -.5, 1.01}, {0, .5, 1.01}};
+    interfaceMesh->triangles = {{{0, 1, 2}, 999, hornsculpt::BoundaryCondition::wall}};
+    viewport.setInterfaceMesh(interfaceMesh);
+    viewport.setInterfaceVisible(true);
+    viewport.repaint();
+    if (viewport.pickFace(center) != picked)
+        throw std::runtime_error("Interface-Overlay verändert die Flächenauswahl.");
+    const auto visible = viewport.grabFramebuffer();
+    if (!screenshot.isEmpty() && !visible.save(screenshot))
+        throw std::runtime_error("Interface-Screenshot konnte nicht gespeichert werden.");
+    std::size_t cyan = 0;
+    const int top = static_cast<int>(60 * viewport.devicePixelRatioF());
+    for (int y = top; y < visible.height(); ++y)
+        for (int x = 0; x < visible.width(); ++x) {
+            const auto c = visible.pixelColor(x, y);
+            if (c.red() < 70 && c.green() > 110 && c.blue() > 120 && c.blue() > c.red() + 70)
+                ++cyan;
+        }
+    if (cyan == 0)
+        throw std::runtime_error("Interface-Drahtnetz fehlt im OpenGL-Bild.");
+    viewport.setInterfaceVisible(false);
+    viewport.repaint();
+    if (viewport.pickFace(center) != picked)
+        throw std::runtime_error("Interface-Sichtbarkeit verändert die Flächenauswahl.");
+    const auto hidden = viewport.grabFramebuffer();
+    std::size_t hiddenCyan = 0;
+    for (int y = top; y < hidden.height(); ++y)
+        for (int x = 0; x < hidden.width(); ++x) {
+            const auto c = hidden.pixelColor(x, y);
+            if (c.red() < 70 && c.green() > 110 && c.blue() > 120 && c.blue() > c.red() + 70)
+                ++hiddenCyan;
+        }
+    if (hiddenCyan >= cyan)
+        throw std::runtime_error("Interface-Drahtnetz bleibt sichtbar.");
+    viewport.setInterfaceMesh({});
+    viewport.setInterfaceVisible(true);
+}
 void checkPressureField(hornsculpt::MeshViewport &viewport) {
     using namespace hornsculpt;
     auto mesh = std::make_shared<SurfaceMesh>();
@@ -355,6 +405,7 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QCommandLineParser parser;
     parser.addHelpOption();
+    parser.addOption({"interface-only", "Nur Interface-Overlay mit kleinem Modell prüfen."});
     parser.addOption({"output", "JSON-Ausgabe.", "path"});
     parser.addOption({"screenshot", "Viewport-Bild.", "path"});
     parser.addOption({"frames", "Gemessene Frames nach 30 Aufwärmframes.", "count", "240"});
@@ -362,11 +413,42 @@ int main(int argc, char **argv) {
     hornsculpt::MeshViewport viewport;
     viewport.resize(1000, 700);
     viewport.setWindowTitle("HornSculpt · Renderbenchmark");
-    const hornsculpt::DraftGeometry geometry;
-    viewport.setMesh(std::make_shared<hornsculpt::SurfaceMesh>(geometry.previewMesh()));
+    std::optional<hornsculpt::DraftGeometry> geometry;
+    if (parser.isSet("interface-only"))
+        viewport.setMesh(box({2, 2, 2}));
+    else {
+        geometry.emplace();
+        viewport.setMesh(std::make_shared<hornsculpt::SurfaceMesh>(geometry->previewMesh()));
+    }
     viewport.show();
     QTimer::singleShot(500, &viewport, [&] {
         try {
+            if (parser.isSet("interface-only")) {
+                checkInterfaceOverlay(viewport, parser.value("screenshot"));
+                {
+                    hornsculpt::MeshViewport recreated;
+                    recreated.resize(640, 480);
+                    recreated.setMesh(box({2, 2, 2}));
+                    recreated.show();
+                    QApplication::processEvents();
+                    checkInterfaceOverlay(recreated);
+                }
+                const QJsonObject report{{"interfaceOverlayPassed", true},
+                                         {"pickingPassed", true},
+                                         {"independentContextCleanupPassed", true},
+                                         {"sourceTriangles", 12},
+                                         {"interfaceTriangles", 1}};
+                const auto bytes = QJsonDocument(report).toJson(QJsonDocument::Indented);
+                if (!parser.value("output").isEmpty()) {
+                    QFile file(parser.value("output"));
+                    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size())
+                        throw std::runtime_error(
+                            "Interface-Testbericht konnte nicht gespeichert werden.");
+                }
+                std::fwrite(bytes.constData(), 1, static_cast<std::size_t>(bytes.size()), stdout);
+                app.exit(0);
+                return;
+            }
             bool ok = false;
             const auto frames = parser.value("frames").toULongLong(&ok);
             if (!ok)
@@ -376,7 +458,7 @@ int main(int argc, char **argv) {
             preview["case"] = "default-preview";
             measurements.append(preview);
             viewport.setMesh(
-                std::make_shared<hornsculpt::SurfaceMesh>(geometry.previewMesh(.0001)));
+                std::make_shared<hornsculpt::SurfaceMesh>(geometry->previewMesh(.0001)));
             viewport.repaint();
             auto fine = measure(viewport, static_cast<std::size_t>(frames));
             fine["case"] = "fine-surface-tessellation";
@@ -434,7 +516,7 @@ int main(int argc, char **argv) {
             if (viewport.selectedFaces() != std::vector<std::uint32_t>{55})
                 throw std::runtime_error("Kameraziehen verändert die Auswahl.");
             viewport.setMesh(
-                std::make_shared<hornsculpt::SurfaceMesh>(geometry.previewMesh(.0001)));
+                std::make_shared<hornsculpt::SurfaceMesh>(geometry->previewMesh(.0001)));
             viewport.repaint();
             if (!viewport.selectedFaces().empty())
                 throw std::runtime_error("Ein Modellwechsel übernimmt fremde Flächen-IDs.");
@@ -474,6 +556,7 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("Normalenfarben folgen nicht der Dreiecksorientierung.");
             checkPerspectiveFit(viewport);
             checkFrontView(viewport);
+            checkInterfaceOverlay(viewport);
             checkPressureField(viewport);
             if (!parser.value("screenshot").isEmpty() && !image.save(parser.value("screenshot")))
                 throw std::runtime_error("Screenshot konnte nicht gespeichert werden.");

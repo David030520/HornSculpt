@@ -44,6 +44,9 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     explicit MeshViewport(QWidget *parent = nullptr);
     ~MeshViewport() override;
     void setMesh(std::shared_ptr<const SurfaceMesh> mesh);
+    // Presentation-only interface edges; face picking continues to use setMesh.
+    void setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh);
+    void setInterfaceVisible(bool visible);
     void setWireframe(bool enabled);
     void setBackgroundGrid(bool enabled);
     void setColorMode(MeshColorMode mode);
@@ -91,6 +94,7 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     void releaseResources();
     void uploadMesh();
     void uploadSelection();
+    void uploadInterfaces();
     void updateFit();
     void updateSceneBounds();
     void uploadField();
@@ -98,6 +102,12 @@ class MeshViewport final : public QOpenGLWidget, protected QOpenGLFunctions_3_3_
     QMatrix4x4 projectionMatrix() const;
     void paintOverlay();
     std::shared_ptr<const SurfaceMesh> mesh_;
+    std::shared_ptr<const SurfaceMesh> interfaceMesh_;
+    QOpenGLVertexArrayObject interfaceVao_;
+    QOpenGLBuffer interfaceBuffer_{QOpenGLBuffer::VertexBuffer};
+    int interfaceVertexCount_{};
+    bool interfaceVisible_{true};
+    bool interfaceUploadPending_{};
     std::optional<AcousticFrame> observationFrame_;
     std::unique_ptr<QOpenGLShaderProgram> program_;
     std::unique_ptr<QOpenGLShaderProgram> fieldProgram_;

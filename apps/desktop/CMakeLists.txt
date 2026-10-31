@@ -1,13 +1,13 @@
-add_library(hs_desktop_controls STATIC numeric_input.cpp lem_editor.cpp draft_assembly_dialog.cpp draft_wizard.cpp)
+add_library(hs_desktop_controls STATIC acoustic_regions_dialog.cpp mesh_import_dialog.cpp numeric_input.cpp lem_editor.cpp draft_assembly_dialog.cpp draft_wizard.cpp)
 target_include_directories(hs_desktop_controls PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(hs_desktop_controls PUBLIC Qt6::Widgets hs_lem hs_geometry PRIVATE hs_options)
+target_link_libraries(hs_desktop_controls PUBLIC Qt6::Widgets hs_lem hs_geometry hs_meshing PRIVATE hs_options)
 
 add_library(hs_desktop_export STATIC step_export_dialog.cpp)
 target_include_directories(hs_desktop_export PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(hs_desktop_export PUBLIC hs_geometry Qt6::Widgets
     PRIVATE hs_cad hs_desktop_controls hs_options)
 
-add_library(hs_project STATIC project_file.cpp project_json.cpp project_cad_json.cpp step_import.cpp
+add_library(hs_project STATIC gmsh_source.cpp project_file.cpp project_json.cpp project_cad_json.cpp step_import.cpp
     project_simulation_json.cpp project_lem_json.cpp simulation_request.cpp measured_response.cpp result_export.cpp
     angular_response_settings.cpp project_assembly.cpp)
 target_include_directories(hs_project PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -65,6 +65,38 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(acoustic_regions_dialog_tests "${PROJECT_SOURCE_DIR}/tests/acoustic_regions_dialog_tests.cpp")
+  target_link_libraries(acoustic_regions_dialog_tests PRIVATE hs_desktop_controls hs_options)
+  set_target_properties(acoustic_regions_dialog_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME acoustic_regions_dialog COMMAND acoustic_regions_dialog_tests)
+  set_tests_properties(acoustic_regions_dialog PROPERTIES LABELS "desktop" TIMEOUT 30
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
+  if(WIN32)
+    add_custom_command(TARGET acoustic_regions_dialog_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E
+      copy_if_different $<TARGET_RUNTIME_DLLS:acoustic_regions_dialog_tests> "$<TARGET_FILE_DIR:acoustic_regions_dialog_tests>"
+      COMMAND_EXPAND_LISTS VERBATIM)
+  endif()
+  add_executable(gmsh_source_tests "${PROJECT_SOURCE_DIR}/tests/gmsh_source_tests.cpp")
+  target_link_libraries(gmsh_source_tests PRIVATE hs_project hs_options)
+  set_target_properties(gmsh_source_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME gmsh_source COMMAND gmsh_source_tests)
+  set_tests_properties(gmsh_source PROPERTIES LABELS "desktop" TIMEOUT 30)
+  if(WIN32)
+    add_custom_command(TARGET gmsh_source_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E
+      copy_if_different $<TARGET_RUNTIME_DLLS:gmsh_source_tests> "$<TARGET_FILE_DIR:gmsh_source_tests>"
+      COMMAND_EXPAND_LISTS VERBATIM)
+  endif()
+  add_executable(mesh_import_dialog_tests "${PROJECT_SOURCE_DIR}/tests/mesh_import_dialog_tests.cpp")
+  target_link_libraries(mesh_import_dialog_tests PRIVATE hs_desktop_controls hs_meshing hs_options)
+  set_target_properties(mesh_import_dialog_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME mesh_import_dialog COMMAND mesh_import_dialog_tests)
+  set_tests_properties(mesh_import_dialog PROPERTIES LABELS "desktop" TIMEOUT 30
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
+  if(WIN32)
+    add_custom_command(TARGET mesh_import_dialog_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E
+      copy_if_different $<TARGET_RUNTIME_DLLS:mesh_import_dialog_tests> "$<TARGET_FILE_DIR:mesh_import_dialog_tests>"
+      COMMAND_EXPAND_LISTS VERBATIM)
+  endif()
   add_executable(qt_localization_tests "${PROJECT_SOURCE_DIR}/tests/qt_localization_tests.cpp"
     qt_localization.cpp qt_localization.qrc)
   set_target_properties(qt_localization_tests PROPERTIES AUTORCC ON

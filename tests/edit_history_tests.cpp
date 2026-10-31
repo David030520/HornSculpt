@@ -122,6 +122,17 @@ int main() {
         changed.cadReversedFaceIds = {1};
         require(!sameEditState(original, changed), "CAD orientation must enter history.");
         changed = original;
+        changed.acousticRegions = {{7, "Innen", {1}, {2}, false}};
+        require(!sameEditState(original, changed), "Adding an acoustic region must enter history.");
+        auto regionEdit = changed;
+        regionEdit.acousticRegions.front().interfaceFaceIds = {3};
+        require(!sameEditState(changed, regionEdit),
+                "Changing an interface assignment must enter history.");
+        regionEdit = changed;
+        regionEdit.acousticRegions.front().needsAssignmentReview = true;
+        require(!sameEditState(changed, regionEdit),
+                "Changing region review state must enter history.");
+        changed = original;
         changed.cad->faces[0].boundary = BoundaryCondition::driven;
         changed.cad->faces[0].normalVelocity = {.2, -.3};
         changed.cad->faces[0].state = CadFaceState::confirmed;
@@ -129,6 +140,7 @@ int main() {
         changed.meshing.quality = {false, 10, 100};
         changed.draftReversedFaceIds = {5};
         changed.cadReversedFaceIds = {1};
+        changed.acousticRegions = {{7, "Innen", {1}, {2}, true}};
         changed.parameters.asymmetricEnabled = true;
         changed.parameters.leftAngle = .3;
         changed.parameters.bottomProfile.k = .8;

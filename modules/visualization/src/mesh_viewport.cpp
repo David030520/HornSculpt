@@ -174,6 +174,8 @@ MeshViewport::~MeshViewport() {
 }
 
 void MeshViewport::releaseResources() {
+    interfaceBuffer_.destroy();
+    interfaceVao_.destroy();
     fieldVao_.destroy();
     fieldBuffer_.destroy();
     fieldIndexBuffer_.destroy();
@@ -263,6 +265,14 @@ void MeshViewport::initializeGL() {
                  {{t, -.62f, -1}, {t, -.62f, 1}, {-1, -.62f, t}, {1, -.62f, t}}})
             grid.push_back({{p[0], p[1], p[2]}, {0, 1, 0}, {.82f, .85f, .87f}});
     }
+    interfaceVao_.create();
+    interfaceBuffer_.create();
+    interfaceVao_.bind();
+    interfaceBuffer_.bind();
+    attributes();
+    glDisableVertexAttribArray(3);
+    interfaceVao_.release();
+    interfaceBuffer_.release();
     gridVao_.bind();
     gridBuffer_.bind();
     gridBuffer_.allocate(grid.data(), static_cast<int>(grid.size() * sizeof(RenderVertex)));
@@ -275,6 +285,7 @@ void MeshViewport::initializeGL() {
     initialized_ = true;
     uploadPending_ = true;
     fieldUploadPending_ = true;
+    interfaceUploadPending_ = true;
     rendererError_.clear();
 }
 
@@ -300,6 +311,31 @@ void MeshViewport::setMesh(std::shared_ptr<const SurfaceMesh> mesh) {
         updateFit();
     uploadPending_ = true;
     fieldUploadPending_ = true;
+    update();
+}
+void MeshViewport::setInterfaceMesh(std::shared_ptr<const SurfaceMesh> mesh) {
+    if (interfaceMesh_ == mesh)
+        return;
+    if (mesh) {
+        for (const auto &p : mesh->vertices)
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+                throw std::invalid_argument("Viewer: nicht endliche Interface-Koordinate.");
+        for (const auto &triangle : mesh->triangles)
+            for (const auto id : triangle.vertices)
+                if (id >= mesh->vertices.size())
+                    throw std::invalid_argument("Viewer: ungültiger Interface-Dreiecksindex.");
+        if (mesh->triangles.size() >
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) / (6 * sizeof(RenderVertex)))
+            throw std::invalid_argument("Viewer: Interface-Puffer zu groß.");
+    }
+    interfaceMesh_ = std::move(mesh);
+    interfaceUploadPending_ = true;
+    update();
+}
+void MeshViewport::setInterfaceVisible(bool visible) {
+    if (interfaceVisible_ == visible)
+        return;
+    interfaceVisible_ = visible;
     update();
 }
 void MeshViewport::updateSceneBounds() {
@@ -333,6 +369,7 @@ void MeshViewport::updateSceneBounds() {
         normalizedHalfSize_ = {};
     uploadPending_ = true;
     fieldUploadPending_ = true;
+    interfaceUploadPending_ = true;
 }
 
 void MeshViewport::setPressureField(std::shared_ptr<const PressureFieldPlane> plane,
@@ -555,6 +592,32 @@ void MeshViewport::uploadMesh() {
     selectionUploadPending_ = true;
 }
 
+void MeshViewport::uploadInterfaces() {
+    std::vector<RenderVertex> vertices;
+    if (interfaceMesh_) {
+        vertices.reserve(interfaceMesh_->triangles.size() * 6);
+        for (const auto &triangle : interfaceMesh_->triangles) {
+            for (const auto local : std::array<unsigned, 6>{0, 1, 1, 2, 2, 0}) {
+                const auto &v = interfaceMesh_->vertices[triangle.vertices[local]];
+                vertices.push_back({{static_cast<float>((v.x - center_.x) / extent_),
+                                     static_cast<float>((v.y - center_.y) / extent_),
+                                     static_cast<float>((v.z - center_.z) / extent_)},
+                                    {0, 0, 1},
+                                    {0.0f, 0.65f, 0.72f}});
+            }
+        }
+    }
+    interfaceVao_.bind();
+    interfaceBuffer_.bind();
+    interfaceBuffer_.setUsagePattern(QOpenGLBuffer::StaticDraw);
+    interfaceBuffer_.allocate(vertices.data(),
+                              static_cast<int>(vertices.size() * sizeof(RenderVertex)));
+    interfaceVao_.release();
+    interfaceBuffer_.release();
+    interfaceVertexCount_ = static_cast<int>(vertices.size());
+    interfaceUploadPending_ = false;
+}
+
 void MeshViewport::uploadSelection() {
     std::vector<float> selected;
     selected.reserve(renderFaceIds_.size());
@@ -606,6 +669,8 @@ void MeshViewport::paintGL() {
         uploadSelection();
     if (fieldUploadPending_)
         uploadField();
+    if (interfaceUploadPending_)
+        uploadInterfaces();
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glDepthMask(GL_TRUE);
@@ -646,6 +711,16 @@ void MeshViewport::paintGL() {
         }
         vao_.release();
     }
+    if (interfaceVisible_ && interfaceVertexCount_ > 0) {
+        program_->setUniformValue("wirePass", 0);
+        program_->setUniformValue("orientationPass", 0);
+        program_->setUniformValue("unlit", 1);
+        glDepthMask(GL_FALSE);
+        interfaceVao_.bind();
+        glDrawArrays(GL_LINES, 0, interfaceVertexCount_);
+        interfaceVao_.release();
+        glDepthMask(GL_TRUE);
+    }
     program_->release();
     if (fieldVisible_ && field_ && fieldIndexCount_ > 0 && fieldProgram_) {
         const auto limits = pressureFieldRange(fieldAppearance_);
@@ -657,8 +732,9 @@ void MeshViewport::paintGL() {
             fieldAppearance_.quantity == 2 ? std::array<double, 2>{-1, 1} : limits;
         fieldProgram_->setUniformValue("limits", QVector2D(static_cast<float>(shaderLimits[0]),
                                                            static_cast<float>(shaderLimits[1])));
-        const float bandStep = fieldAppearance_.quantity == 0 ? 3.f
-                               : fieldAppearance_.quantity == 1 ? 36.f : .2f;
+        const float bandStep = fieldAppearance_.quantity == 0   ? 3.f
+                               : fieldAppearance_.quantity == 1 ? 36.f
+                                                                : .2f;
         fieldProgram_->setUniformValue("bandStep", bandStep);
         std::array<QVector3D, 10> colors;
         for (std::size_t i = 0; i < colors.size(); ++i) {
@@ -697,6 +773,12 @@ void MeshViewport::paintOverlay() {
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setPen(QColor(55, 61, 66));
     painter.drawText(QRect(12, 8, width() - 24, 23), Qt::AlignLeft | Qt::AlignVCenter, label_);
+    if (interfaceVisible_ && interfaceMesh_ && !interfaceMesh_->triangles.empty()) {
+        painter.setPen(QColor(0, 140, 155));
+        painter.drawText(QRect(12, 32, 100, 20), Qt::AlignLeft | Qt::AlignVCenter,
+                         tr("Interfaces"));
+        painter.setPen(QColor(55, 61, 66));
+    }
     std::vector<QRectF> occupied;
     if (!label_.isEmpty()) {
         const auto textSize = painter.fontMetrics().size(Qt::TextSingleLine, label_);
@@ -764,13 +846,15 @@ void MeshViewport::paintOverlay() {
                                  .arg(field_->frequency, 0, 'g', 8)
                                  .arg(field_->revision)
                                  .arg(field_->current ? QString{} : tr(" · veraltet"));
-        const int contextWidth = std::max(0, int((legend.isEmpty() ? width() - 10 : legend.left()) - 14));
+        const int contextWidth =
+            std::max(0, int((legend.isEmpty() ? width() - 10 : legend.left()) - 14));
         if (contextWidth > 0) {
             const QRect contextRect(10, 32, contextWidth, font.height() + 6);
             occupied.push_back(contextRect);
             painter.fillRect(contextRect, QColor(248, 250, 251, 225));
-            painter.drawText(contextRect.adjusted(4, 0, -4, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                             font.elidedText(context, Qt::ElideRight, std::max(0, contextWidth - 8)));
+            painter.drawText(
+                contextRect.adjusted(4, 0, -4, 0), Qt::AlignLeft | Qt::AlignVCenter,
+                font.elidedText(context, Qt::ElideRight, std::max(0, contextWidth - 8)));
         }
     } else if (colorMode_ == MeshColorMode::orientation && mesh_) {
         const int left = width() - 190;
@@ -1077,7 +1161,8 @@ std::optional<std::size_t> MeshViewport::pickFieldSample(QPointF position) const
     const auto &world = field_->positions[*selected];
     const Vec3 target{(world.x - center_.x) / extent_, (world.y - center_.y) / extent_,
                       (world.z - center_.z) / extent_};
-    const auto targetClip = transform * QVector4D(float(target.x), float(target.y), float(target.z), 1);
+    const auto targetClip =
+        transform * QVector4D(float(target.x), float(target.y), float(target.z), 1);
     const auto ndc = targetClip.toVector3DAffine();
     bool invertible = false;
     const auto inverse = transform.inverted(&invertible);
@@ -1155,9 +1240,9 @@ void MeshViewport::mouseReleaseEvent(QMouseEvent *event) {
         }
         const auto &p = field_->positions[*sample];
         const auto clip = (projectionMatrix() * viewMatrix()) *
-            QVector4D(static_cast<float>((p.x - center_.x) / extent_),
-                      static_cast<float>((p.y - center_.y) / extent_),
-                      static_cast<float>((p.z - center_.z) / extent_), 1);
+                          QVector4D(static_cast<float>((p.x - center_.x) / extent_),
+                                    static_cast<float>((p.y - center_.y) / extent_),
+                                    static_cast<float>((p.z - center_.z) / extent_), 1);
         const auto ndc = clip.toVector3DAffine();
         const QPointF projected((ndc.x() + 1.) * .5 * width(), (1. - ndc.y()) * .5 * height());
         const auto delta = projected - event->position();
@@ -1165,15 +1250,19 @@ void MeshViewport::mouseReleaseEvent(QMouseEvent *event) {
         const auto pressure = field_->pressure[*sample];
         const double magnitude = std::abs(pressure);
         const QString spl = magnitude > 0
-            ? tr("%1 dB SPL").arg(20 * std::log10(magnitude / 20e-6), 0, 'g', 5)
-            : tr("−∞ dB SPL");
-        const QString phase = magnitude > 0
-            ? tr("%1°").arg(std::arg(pressure) * 180 / std::numbers::pi, 0, 'g', 5)
-            : tr("nicht definiert");
-        const QString message = tr("Nächster projizierter Rasterpunkt (%1 px; keine Interpolation)\n"
-                                   "x=%2 m · y=%3 m · z=%4 m\n%5 · Phase %6")
-                                    .arg(pixelDistance, 0, 'f', 1).arg(p.x, 0, 'g', 5)
-                                    .arg(p.y, 0, 'g', 5).arg(p.z, 0, 'g', 5).arg(spl, phase);
+                                ? tr("%1 dB SPL").arg(20 * std::log10(magnitude / 20e-6), 0, 'g', 5)
+                                : tr("−∞ dB SPL");
+        const QString phase =
+            magnitude > 0 ? tr("%1°").arg(std::arg(pressure) * 180 / std::numbers::pi, 0, 'g', 5)
+                          : tr("nicht definiert");
+        const QString message =
+            tr("Nächster projizierter Rasterpunkt (%1 px; keine Interpolation)\n"
+               "x=%2 m · y=%3 m · z=%4 m\n%5 · Phase %6")
+                .arg(pixelDistance, 0, 'f', 1)
+                .arg(p.x, 0, 'g', 5)
+                .arg(p.y, 0, 'g', 5)
+                .arg(p.z, 0, 'g', 5)
+                .arg(spl, phase);
         QToolTip::showText(event->globalPosition().toPoint(), message, this);
         return;
     }

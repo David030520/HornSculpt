@@ -4,8 +4,10 @@ target_include_directories(hs_bem_api INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_link_libraries(hs_bem_api INTERFACE hs_core hs_lem)
 add_library(hs_bem_galerkin galerkin/space.cpp galerkin/pair_quadrature.cpp
   galerkin/exterior_domain.cpp galerkin/interaction_plan.cpp galerkin/axisymmetric_space.cpp
-  galerkin/axisymmetric_quadrature.cpp surface_measures.cpp fmm/tree.cpp axisymmetric_reduction.cpp
-  baffle_exterior.cpp)
+  galerkin/axisymmetric_quadrature.cpp surface_measures.cpp axisymmetric_reduction.cpp baffle_exterior.cpp
+  fmm/support_tree.cpp fmm/support_near_plan.cpp
+  fmm/wideband_transfer.cpp fmm/scaled_translation.cpp
+  fmm/spherical_rotation.cpp fmm/translation_plan_cache.cpp fmm/support_level_plan.cpp)
 target_include_directories(hs_bem_galerkin PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(hs_bem_galerkin PUBLIC hs_core hs_bem_api PRIVATE Threads::Threads hs_meshing)
 
@@ -16,14 +18,16 @@ if(NOT HORNSCULPT_BUILD_CUDA_BEM)
   return()
 endif()
 
-add_library(hs_bem cuda/cuda_solver.cu cuda/baffled_solver.cu cuda/axisymmetric_assembly.cu
-  cuda/fmm_operator.cu cuda/fmm_solve.cu lem_coupling.cpp)
-target_link_libraries(hs_bem PUBLIC hs_bem_api PRIVATE hs_bem_galerkin hs_bem_field hs_meshing CUDA::cudart CUDA::cublas CUDA::cusolver)
+add_library(hs_bem cuda/cuda_solver.cu cuda/subdomain_solver.cu cuda/baffled_solver.cu cuda/axisymmetric_assembly.cu cuda/device_gmres.cu
+  cuda/wideband_angular.cu cuda/wideband_axial.cu cuda/wideband_rotation.cu
+  cuda/support_near_operator.cu cuda/adaptive_patch_estimator.cu cuda/support_preconditioner.cu cuda/wideband_leaf.cu
+  cuda/support_fmm_operator.cu cuda/support_fmm_solve.cu cuda/support_direct_audit.cu lem_coupling.cpp)
+target_link_libraries(hs_bem PUBLIC hs_bem_api PRIVATE hs_bem_galerkin hs_bem_field hs_meshing CUDA::cudart CUDA::cublas CUDA::cusolver CUDA::cufft)
 set_target_properties(hs_bem PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 target_compile_options(hs_bem PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus,/wd4211>)
 # NVCC-generated launch stubs redeclare internal kernel symbols (MSVC C4211).
 if(WIN32)
-  foreach(runtime_name IN ITEMS cudart64_13 cublas64_13 cublasLt64_13 cusolver64_12 cusparse64_12)
+  foreach(runtime_name IN ITEMS cudart64_13 cublas64_13 cublasLt64_13 cusolver64_12 cusparse64_12 cufft64_12)
     find_file(HS_${runtime_name}_RUNTIME "${runtime_name}.dll"
       HINTS "${CUDAToolkit_BIN_DIR}/x64" "${CUDAToolkit_BIN_DIR}" REQUIRED)
     list(APPEND HS_CUDA_RUNTIME_FILES "${HS_${runtime_name}_RUNTIME}")
@@ -32,6 +36,24 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+  foreach(test_name IN ITEMS subdomain_lem subdomain_accuracy)
+    add_executable(${test_name}_tests "${PROJECT_SOURCE_DIR}/tests/${test_name}_tests.cpp")
+    target_link_libraries(${test_name}_tests PRIVATE hs_bem hs_bem_field hs_meshing hs_bem_galerkin)
+    add_test(NAME ${test_name} COMMAND ${test_name}_tests)
+    set_tests_properties(${test_name} PROPERTIES LABELS "cuda;numerical" TIMEOUT 600 RUN_SERIAL TRUE)
+    if(WIN32)
+      add_custom_command(TARGET ${test_name}_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E
+        copy_if_different ${HS_CUDA_RUNTIME_FILES} "$<TARGET_FILE_DIR:${test_name}_tests>" VERBATIM)
+    endif()
+  endforeach()
+  add_executable(subdomain_bem_tests "${PROJECT_SOURCE_DIR}/tests/subdomain_bem_tests.cpp")
+  target_link_libraries(subdomain_bem_tests PRIVATE hs_bem hs_bem_field hs_meshing)
+  add_test(NAME subdomain_bem COMMAND subdomain_bem_tests)
+  set_tests_properties(subdomain_bem PROPERTIES LABELS "cuda;numerical" TIMEOUT 600 RUN_SERIAL TRUE)
+  if(WIN32)
+    add_custom_command(TARGET subdomain_bem_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E
+      copy_if_different ${HS_CUDA_RUNTIME_FILES} "$<TARGET_FILE_DIR:subdomain_bem_tests>" VERBATIM)
+  endif()
   add_executable(exterior_baffle_tests "${PROJECT_SOURCE_DIR}/tests/exterior_baffle_tests.cpp")
   target_link_libraries(exterior_baffle_tests PRIVATE hs_bem hs_bem_galerkin hs_bem_field hs_meshing)
   add_test(NAME exterior_baffle COMMAND exterior_baffle_tests)

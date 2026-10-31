@@ -4,6 +4,7 @@
 #include <QString>
 #include <QUndoCommand>
 #include <functional>
+#include <hornsculpt/acoustic_partition.hpp>
 #include <hornsculpt/draft_geometry.hpp>
 #include <hornsculpt/draft_instances.hpp>
 #include <hornsculpt/freecad_link.hpp>
@@ -33,6 +34,7 @@ struct EditState {
     std::optional<CadAssignmentState> cad;
     lem::Network couplingNetwork;
     bool couplingEnabled{};
+    std::vector<AcousticRegionDefinition> acousticRegions;
 };
 
 bool sameCadGeometry(const std::optional<CadAssignmentState> &a,

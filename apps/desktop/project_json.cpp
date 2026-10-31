@@ -1,6 +1,7 @@
 #include "project_json.hpp"
 #include "galerkin/exterior_domain.hpp"
 #include <QSet>
+#include <QStringList>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -12,11 +13,21 @@ namespace hornsculpt::project_json {
         (QStringLiteral("Ungültige Projektdatei: ") + message).toStdString());
 }
 void keys(const QJsonObject &value, std::initializer_list<const char *> expected) {
-    if (value.size() != static_cast<qsizetype>(expected.size()))
-        invalid(QStringLiteral("Unbekannte oder fehlende Felder."));
+    QSet<QString> allowed;
     for (const auto key : expected)
-        if (!value.contains(QLatin1String(key)))
-            invalid(QStringLiteral("Feld fehlt: ") + QLatin1String(key));
+        allowed.insert(QString::fromLatin1(key));
+    QStringList missing, unexpected;
+    for (const auto &key : allowed)
+        if (!value.contains(key))
+            missing << key;
+    for (auto it = value.begin(); it != value.end(); ++it)
+        if (!allowed.contains(it.key()))
+            unexpected << it.key();
+    missing.sort();
+    unexpected.sort();
+    if (!missing.empty() || !unexpected.empty())
+        invalid(QStringLiteral("Felder fehlen: %1; unbekannte Felder: %2.")
+                    .arg(missing.join(", "), unexpected.join(", ")));
 }
 QJsonObject object(const QJsonValue &value) {
     if (!value.isObject())
@@ -265,7 +276,7 @@ void decodeDraft(const QJsonObject &root, Project &project) {
     const auto os = object(root["profile"]);
     auto horizontal = os;
     horizontal.remove("vertical");
-    const auto version = integer(root["version"], 15);
+    const auto version = integer(root["version"], 16);
     const bool oldFormat = version < 4;
     if (oldFormat) {
         keys(horizontal, {"throatRadius", "length", "throatAngle", "k", "terminationScale",
@@ -291,8 +302,8 @@ void decodeDraft(const QJsonObject &root, Project &project) {
             keys(slot, {"enabled", "aperture", "adapterLength", "straightLength",
                         "transitionLength", "contour", "cornerRadius", "exit", "exitRadius"});
         else
-            keys(slot, {"enabled", "aperture", "adapterLength", "straightLength",
-                        "transitionLength"});
+            keys(slot,
+                 {"enabled", "aperture", "adapterLength", "straightLength", "transitionLength"});
         const auto aperture = object(slot["aperture"]);
         keys(aperture, {"width", "height", "exponent"});
         p.slot.enabled = boolean(slot["enabled"]);

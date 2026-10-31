@@ -98,6 +98,66 @@ double determinant(std::array<std::array<double, 4>, 4> matrix) {
     }
     return result;
 }
+void forcedAdaptiveFarTests() {
+    const auto a = panel({{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}}, {0, 1, 2});
+    const auto b = panel({{{0, 0, 3}, {1, 0, 3}, {0, 1, 3}}}, {3, 4, 5});
+    PairQuadratureSettings settings;
+    settings.nearDistanceRatio = 0;
+    settings.relativeTolerance = 1e-4;
+    const auto regular = makePairQuadrature(a, b, settings, 1.0);
+    const auto adaptive = makePairQuadrature(a, b, settings, 1.0, {}, true);
+    settings.relativeTolerance = 1e-6;
+    const auto refined = makePairQuadrature(a, b, settings, 1.0, {}, true);
+    require(!regular.points.empty() && regular.patches.empty(), "Far shortcut was not exercised");
+    require(adaptive.points.empty() && !adaptive.patches.empty() && !refined.patches.empty(),
+            "Forced adaptive fallback was not exercised");
+    PairQuadratureRule high;
+    const auto reference = triangleRule(14);
+    for (const auto &x : reference)
+        for (const auto &y : reference) {
+            PairQuadraturePoint point{};
+            for (unsigned j = 0; j < 3; ++j) {
+                point.test[j] = x.barycentric[j];
+                point.trial[j] = y.barycentric[j];
+            }
+            point.weight = x.weight * y.weight;
+            high.points.push_back(point);
+        }
+    // All P1xP1 moments of G and its three spatial derivatives. Their linear
+    // combinations cover the weak single/double/adjoint layers and the
+    // regularized hypersingular terms for a planar panel pair.
+    using Complex = std::complex<double>;
+    const auto moments = [&](const PairQuadratureRule &rule) {
+        std::array<Complex, 36> result{};
+        eachPoint(a, b, rule, [&](const PairQuadraturePoint &q) {
+            const auto d = pointDifference(a, q.test, b, q.trial);
+            const double r = length(d);
+            const Complex g = std::exp(Complex{0, -r}) / r;
+            const Complex gradient = -(Complex{1, r} * g) / (r * r);
+            const std::array<Complex, 4> kernel{g, gradient * d.x, gradient * d.y, gradient * d.z};
+            for (unsigned i = 0; i < 3; ++i)
+                for (unsigned j = 0; j < 3; ++j)
+                    for (unsigned c = 0; c < 4; ++c)
+                        result[4 * (3 * i + j) + c] +=
+                            q.weight * q.test[i] * q.trial[j] * kernel[c];
+        });
+        return result;
+    };
+    const auto expected = moments(high), coarse = moments(adaptive), fine = moments(refined);
+    const auto error = [&](const auto &actual) {
+        double difference = 0, norm = 0;
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            difference += std::norm(actual[i] - expected[i]);
+            norm += std::norm(expected[i]);
+        }
+        return std::sqrt(difference / norm);
+    };
+    const auto coarseError = error(coarse), fineError = error(fine);
+    require(coarseError < 1e-4 && fineError < 1e-6,
+            "Adaptive far-pair P1 Green/gradient moments miss the degree-14 reference");
+    require(fineError <= coarseError * 1.1 + 1e-13,
+            "Tighter far-pair tolerance worsened the P1 moment error");
+}
 void partitionTests() {
     for (auto topology : {PairTopology::disjoint, PairTopology::shared_vertex,
                           PairTopology::shared_edge, PairTopology::coincident}) {
@@ -676,9 +736,37 @@ void translationTests() {
         }
     }
 }
+void workspaceTests() {
+    const auto a = panel({{{0, 0, 0}, {.01, 0, 0}, {0, .01, 0}}}, {0, 1, 2});
+    const auto close =
+        panel({{{.001, .001, .002}, {.011, .001, .002}, {.001, .011, .002}}}, {3, 4, 5});
+    const auto far = panel({{{0, 0, .1}, {.01, 0, .1}, {0, .01, .1}}}, {6, 7, 8});
+    PairQuadratureSettings settings;
+    settings.relativeTolerance = 1e-4;
+    for (const auto &b : {a, close, far}) {
+        const auto original = makePairQuadrature(a, b, settings, 20);
+        require(original.peakWorkspaceBytes > 0, "Quadrature omitted actual workspace accounting");
+        auto bounded = settings;
+        bounded.maximumWorkspaceBytes = original.peakWorkspaceBytes;
+        const auto repeated = makePairQuadrature(a, b, bounded, 20);
+        require(repeated.peakWorkspaceBytes == original.peakWorkspaceBytes &&
+                    repeated.points.size() == original.points.size() &&
+                    repeated.patches.size() == original.patches.size(),
+                "Exact workspace budget changed quadrature");
+        bounded.maximumWorkspaceBytes--;
+        bool rejected = false;
+        try {
+            (void)makePairQuadrature(a, b, bounded, 20);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected, "Quadrature exceeded its owned workspace budget");
+    }
+}
 } // namespace
 int main() {
     try {
+        forcedAdaptiveFarTests();
         partitionTests();
         singularTests();
         nearTests();
@@ -686,6 +774,7 @@ int main() {
         promotedNearTests();
         projectionQuadratureTests();
         translationTests();
+        workspaceTests();
         std::cout << "Triangle-pair quadrature tests passed.\n";
         return 0;
     } catch (const std::exception &e) {

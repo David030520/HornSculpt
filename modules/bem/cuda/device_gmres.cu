@@ -1,21 +1,21 @@
-#include "fmm_operator.hpp"
-#include "fmm_solve.hpp"
+#include "device_gmres.hpp"
 #include "workspace_size.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
 #include <cublas_v2.h>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
-
 namespace hornsculpt::cuda_detail {
 namespace {
 using C = std::complex<double>;
 using Z = cuDoubleComplex;
-using Clock = std::chrono::steady_clock;
 void check(cudaError_t code, const char *context) {
     if (code != cudaSuccess)
         throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(code));
@@ -61,13 +61,15 @@ __global__ void difference(const Z *right, const Z *left, Z *output, int count) 
     if (i < count)
         output[i] = cuCsub(right[i], left[i]);
 }
-double elapsed(Clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+std::string scientific(double value) {
+    std::ostringstream output;
+    output << std::scientific << std::setprecision(6) << value;
+    return output.str();
 }
 std::size_t checkedBasisSize(std::size_t count, unsigned restart) {
     if (count == 0 || count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("GMRES pressure dimension is invalid.");
-    auto elements = checkedSizeProduct(count, restart + 7);
+    auto elements = checkedSizeProduct(count, static_cast<std::size_t>(restart) + 4);
     const auto projections = checkedSizeProduct(2, restart);
     if (projections > std::numeric_limits<std::size_t>::max() - elements)
         throw std::overflow_error("GMRES workspace size overflow.");
@@ -76,18 +78,27 @@ std::size_t checkedBasisSize(std::size_t count, unsigned restart) {
     check(cudaMemGetInfo(&free, &total), "GMRES capacity query");
     if (checkedSizeProduct(elements, sizeof(Z)) > deviceMemoryBudget(free))
         throw std::runtime_error("GMRES workspace exceeds available device memory.");
-    return checkedSizeProduct(count, restart + 1);
+    return checkedSizeProduct(count, static_cast<std::size_t>(restart) + 1);
 }
 } // namespace
 
-class FastMultipoleLinearSolver::Implementation {
+class DeviceGmresSolver::Implementation {
   public:
-    Implementation(FastMultipoleOperator &op, std::size_t size, const BemNumerics &settings,
-                   cudaStream_t selectedStream, std::stop_token token)
-        : operation(op), n(static_cast<int>(size)), options(settings), stream(selectedStream),
-          stop(token), basis(checkedBasisSize(size, settings.fastMultipole.restartLength)),
-          exactRhs(size), residual(size), product(size), correction(size), temporary(size),
-          gmresResidual(size), projections(2 * settings.fastMultipole.restartLength) {
+    Implementation(PressureApplication pressure, Preconditioner conditioning, std::size_t size,
+                   const BemNumerics &settings, cudaStream_t selectedStream, std::stop_token token,
+                   IterationProgress callback)
+        : applyPressure(std::move(pressure)), precondition(std::move(conditioning)),
+          n(static_cast<int>(size)), options(settings), stream(selectedStream), stop(token),
+          progress(std::move(callback)),
+          basis(checkedBasisSize(size, settings.fastMultipole.restartLength)), product(size),
+          temporary(size), gmresResidual(size),
+          projections(checkedSizeProduct(2, settings.fastMultipole.restartLength)) {
+        if (!applyPressure || !precondition || !settings.fastMultipole.maximumIterations ||
+            !settings.fastMultipole.restartLength ||
+            !std::isfinite(settings.relativeResidualTolerance) ||
+            settings.relativeResidualTolerance <= 0)
+            throw std::invalid_argument(
+                "Device GMRES settings or operation callbacks are invalid.");
         check(cublasCreate(&blas), "GMRES cuBLAS creation");
         try {
             check(cublasSetStream(blas, stream), "GMRES cuBLAS stream");
@@ -128,7 +139,7 @@ class FastMultipoleLinearSolver::Implementation {
         return result;
     }
     void applyPreconditioner(Z *value) {
-        operation.precondition(value);
+        precondition(value);
     }
     void orthogonalize(unsigned columns, C *h) {
         const Z one = device(1), zero = device(0), minusOne = device(-1);
@@ -157,9 +168,10 @@ class FastMultipoleLinearSolver::Implementation {
         check(cudaGetLastError(), "GMRES residual subtraction");
     }
 
-    unsigned gmres(const Z *right, Z *solution) {
-        // The original equation is audited separately. The tighter Krylov
-        // threshold leaves room for interpolation error and FP32 panel storage.
+    unsigned gmres(const Z *right, Z *solution, double &relativeResidual) {
+        // A higher-order equation is audited separately. The tighter Krylov
+        // threshold leaves room for expansion and mixed-sample arithmetic
+        // errors; original panel geometry and phases remain FP64.
         const auto &settings = options.fastMultipole;
         const unsigned restart = std::min(settings.restartLength, settings.maximumIterations);
         const unsigned stride = restart + 1;
@@ -167,24 +179,29 @@ class FastMultipoleLinearSolver::Implementation {
         std::vector<double> c(restart);
         clear(solution);
         copy(right, temporary.data());
+        const double unpreconditionedRightNorm = norm(right);
         applyPreconditioner(temporary.data());
         const double rightNorm = norm(temporary.data());
-        if (rightNorm == 0)
+        if (rightNorm == 0) {
+            if (unpreconditionedRightNorm != 0)
+                throw std::runtime_error("GMRES preconditioner annihilated a nonzero RHS.");
+            relativeResidual = 0;
             return 0;
-        const double tolerance = options.relativeResidualTolerance * .1 * rightNorm;
+        }
+        const double tolerance =
+            options.relativeResidualTolerance * deviceGmresResidualFraction * rightNorm;
+        copy(temporary.data(), gmresResidual.data());
+        double beta = rightNorm;
+        double achievedPreconditionedResidual = 1;
         unsigned iterations = 0;
         while (iterations < settings.maximumIterations) {
             cancelled(stop);
-            if (iterations == 0)
-                copy(temporary.data(), gmresResidual.data());
-            else {
-                operation.applyPressure(solution, product.data());
+            if (beta <= tolerance) {
+                applyPressure(solution, product.data());
                 subtract(right, product.data(), gmresResidual.data());
-                applyPreconditioner(gmresResidual.data());
-            }
-            const double beta = norm(gmresResidual.data());
-            if (beta <= tolerance)
+                relativeResidual = norm(gmresResidual.data()) / unpreconditionedRightNorm;
                 return iterations;
+            }
             copy(gmresResidual.data(), basis.data());
             scale(1.0 / beta, basis.data());
             std::fill(h.begin(), h.end(), C{});
@@ -194,8 +211,7 @@ class FastMultipoleLinearSolver::Implementation {
             bool breakdown = false;
             for (unsigned j = 0; j < restart && iterations < settings.maximumIterations; ++j) {
                 cancelled(stop);
-                operation.applyPressure(basis.data() + static_cast<std::size_t>(j) * n,
-                                        product.data());
+                applyPressure(basis.data() + static_cast<std::size_t>(j) * n, product.data());
                 applyPreconditioner(product.data());
                 const double before = norm(product.data());
                 orthogonalize(j + 1, h.data() + static_cast<std::size_t>(j) * stride);
@@ -228,6 +244,8 @@ class FastMultipoleLinearSolver::Implementation {
                 g[j + 1] = -std::conj(s[j]) * g[j] + c[j] * g[j + 1];
                 g[j] = rotated;
                 ++iterations;
+                if (progress)
+                    progress();
                 used = j + 1;
                 if (std::abs(g[j + 1]) <= tolerance || breakdown)
                     break;
@@ -244,79 +262,60 @@ class FastMultipoleLinearSolver::Implementation {
             }
             for (unsigned j = 0; j < used; ++j)
                 axpy(y[j], basis.data() + static_cast<std::size_t>(j) * n, solution);
-            operation.applyPressure(solution, product.data());
+            applyPressure(solution, product.data());
             subtract(right, product.data(), gmresResidual.data());
+            relativeResidual = norm(gmresResidual.data()) / unpreconditionedRightNorm;
             applyPreconditioner(gmresResidual.data());
-            if (norm(gmresResidual.data()) <= tolerance)
+            const double preconditionedResidualNorm = norm(gmresResidual.data());
+            achievedPreconditionedResidual = preconditionedResidualNorm / rightNorm;
+            if (preconditionedResidualNorm <= tolerance)
                 return iterations;
             if (breakdown)
                 throw std::runtime_error("FMM GMRES stagnated after Arnoldi breakdown.");
+            // The verified restart residual is already M^-1(b-A*x). Keep
+            // its vector and norm until the next Arnoldi cycle; recomputing
+            // them would apply the unchanged operator and PC a second time.
+            beta = preconditionedResidualNorm;
         }
-        throw std::runtime_error("FMM GMRES did not converge within " +
-                                 std::to_string(settings.maximumIterations) + " iterations.");
+        throw std::runtime_error(
+            "FMM GMRES did not converge after " + std::to_string(iterations) + "/" +
+            std::to_string(settings.maximumIterations) +
+            " iterations: unpreconditioned relative FMM equation residual " +
+            scientific(relativeResidual) + ", preconditioned relative residual " +
+            scientific(achievedPreconditionedResidual) + " (inner target " +
+            scientific(options.relativeResidualTolerance * deviceGmresResidualFraction) + ").");
     }
 
-    IterativeSolution solve(const cuFloatComplex *flux, Z *pressure, bool useInitialGuess) {
-        cancelled(stop);
-        IterativeSolution result;
-        auto audit = Clock::now();
-        operation.applyFluxDirect(flux, exactRhs.data());
-        const double rhsNorm = norm(exactRhs.data());
-        result.residualCheckMilliseconds += elapsed(audit);
-        if (!useInitialGuess)
-            clear(pressure);
-        const bool hadInitialGuess = useInitialGuess;
-        unsigned solves = 0;
-        for (;;) {
-            cancelled(stop);
-            audit = Clock::now();
-            if (!useInitialGuess)
-                copy(exactRhs.data(), residual.data());
-            else {
-                operation.applyPressureDirect(pressure, product.data());
-                subtract(exactRhs.data(), product.data(), residual.data());
-            }
-            const double error = norm(residual.data());
-            result.boundaryResidual = rhsNorm > 0 ? error / rhsNorm : error;
-            result.residualCheckMilliseconds += elapsed(audit);
-            if (error == 0 ||
-                (rhsNorm > 0 && result.boundaryResidual <= options.relativeResidualTolerance))
-                return result;
-            if (solves >= options.maximumRefinementSteps + (hadInitialGuess ? 0u : 1u))
-                throw std::runtime_error(
-                    "FMM original Galerkin residual " + std::to_string(result.boundaryResidual) +
-                    " exceeds tolerance " + std::to_string(options.relativeResidualTolerance) +
-                    "; increase interpolation order or tighten separation.");
-            result.iterations += gmres(residual.data(), correction.data());
-            axpy(1.0, correction.data(), pressure);
-            useInitialGuess = true;
-            ++solves;
-            result.refinementSteps = solves - (hadInitialGuess ? 0u : 1u);
-        }
-    }
     std::size_t bytes() const {
-        return basis.bytes() + exactRhs.bytes() + residual.bytes() + product.bytes() +
-               correction.bytes() + temporary.bytes() + gmresResidual.bytes() + projections.bytes();
+        return basis.bytes() + product.bytes() + temporary.bytes() + gmresResidual.bytes() +
+               projections.bytes();
     }
-    FastMultipoleOperator &operation;
+    PressureApplication applyPressure;
+    Preconditioner precondition;
     int n;
     BemNumerics options;
     cudaStream_t stream;
     std::stop_token stop;
-    Buffer basis, exactRhs, residual, product, correction, temporary, gmresResidual, projections;
+    IterationProgress progress;
+    Buffer basis, product, temporary, gmresResidual, projections;
     cublasHandle_t blas{};
 };
-
-FastMultipoleLinearSolver::FastMultipoleLinearSolver(FastMultipoleOperator &operation,
-                                                     std::size_t count, const BemNumerics &options,
-                                                     cudaStream_t stream, std::stop_token stop)
-    : implementation_(std::make_unique<Implementation>(operation, count, options, stream, stop)) {}
-FastMultipoleLinearSolver::~FastMultipoleLinearSolver() = default;
-IterativeSolution FastMultipoleLinearSolver::solve(const cuFloatComplex *flux,
-                                                   cuDoubleComplex *pressure, bool initial) {
-    return implementation_->solve(flux, pressure, initial);
+DeviceGmresSolver::DeviceGmresSolver(PressureApplication apply, Preconditioner precondition,
+                                     std::size_t count, const BemNumerics &options,
+                                     cudaStream_t stream, std::stop_token stop,
+                                     IterationProgress progress)
+    : implementation_(std::make_unique<Implementation>(std::move(apply), std::move(precondition),
+                                                       count, options, stream, stop,
+                                                       std::move(progress))) {}
+DeviceGmresSolver::~DeviceGmresSolver() = default;
+unsigned DeviceGmresSolver::solve(const cuDoubleComplex *right, cuDoubleComplex *solution,
+                                  double &relativeResidual) {
+    if (!right || !solution || right == solution)
+        throw std::invalid_argument(
+            "Device GMRES requires distinct nonnull RHS and solution arrays.");
+    return implementation_->gmres(right, solution, relativeResidual);
 }
-std::size_t FastMultipoleLinearSolver::deviceBytes() const {
+std::size_t DeviceGmresSolver::deviceBytes() const noexcept {
     return implementation_->bytes();
 }
 } // namespace hornsculpt::cuda_detail

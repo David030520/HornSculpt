@@ -181,3 +181,12 @@ Für gekoppelte Referenzfälle zusätzlich Schnittstellen-Normalen, beidseitige
 Leistungsbilanz, Frequenz, Materialparameter und verwendete Strukturdynamik
 festhalten. Erst danach sind Rechenzeit und Speicher unter ausgewiesener
 Hardware und Genauigkeit sinnvoll vergleichbar.
+
+## Gekoppelte BEM-Luftgebiete
+
+Der eigene [Mehrgebietspfad](../SUBDOMAINS.md) verwendet gemeinsamen P1-Druck
+und gegensinnigen P1-Fluss an konformen transparenten Interfaces. Physische
+LEM-Ports können an verschiedene Gebiete gekoppelt sein. Dieser dichte
+3D-CUDA-Pfad ist von virtuellen uniformen BEM↔LEM-Anschlüssen und vom
+Schallwandvertrag zu unterscheiden; er ist keine allgemeine FEM-, Struktur-
+oder Medienkopplung. Die Methodendokumentation nennt geprüfte Fälle und Grenzen.

@@ -1,4 +1,3 @@
-#include "cuda/fmm_operator.hpp"
 #include "fixture_geometry.hpp"
 #include <algorithm>
 #include <array>
@@ -6,9 +5,9 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cuda_runtime_api.h>
 #include <fstream>
 #include <future>
-#include <galerkin/interaction_plan.hpp>
 #include <galerkin/space.hpp>
 #include <hornsculpt/bem.hpp>
 #include <iomanip>
@@ -104,19 +103,47 @@ BemRequest sphereRequest() {
     return value;
 }
 
-BemRequest accelerated(BemRequest value, unsigned order = 5) {
+BemRequest accelerated(BemRequest value, double residualTolerance = 0) {
     value.numerics.acceleration = BemAcceleration::fastMultipole;
-    value.numerics.fastMultipole.interpolationOrder = order;
-    value.numerics.fastMultipole.leafPanelCapacity = 4;
+    if (residualTolerance > 0)
+        value.numerics.relativeResidualTolerance = residualTolerance;
+    value.numerics.fastMultipole.leafSupportCapacity = 4;
     return value;
 }
 
 void checkResidual(const BemResult &result, const BemRequest &request) {
     for (const auto &frequency : result.frequencies)
-        for (const auto &excitation : frequency.excitations)
+        for (const auto &excitation : frequency.excitations) {
             require(std::isfinite(excitation.boundaryResidual) &&
                         excitation.boundaryResidual <= request.numerics.relativeResidualTolerance,
-                    "FMM did not meet its requested final unscaled residual.");
+                    "FMM did not meet its requested final audit residual.");
+            const bool higherOrder =
+                excitation.residualEvaluation == BemResidualEvaluation::higherOrderFastMultipole;
+            require(excitation.fastMultipoleAccuracySeed > 0 &&
+                        !excitation.historicalChebyshevEvidence,
+                    "New wideband solve lacks automatic seed evidence or retained historical "
+                    "interpolation metadata.");
+            require((higherOrder && excitation.fastMultipoleComparisonAccuracySeed > 0 &&
+                     excitation.fastMultipoleVerificationAccuracySeed > 0 &&
+                     excitation.fastMultipoleVerificationAccuracySeed <
+                         excitation.fastMultipoleComparisonAccuracySeed &&
+                     excitation.fastMultipoleComparisonAccuracySeed <
+                         excitation.fastMultipoleAccuracySeed &&
+                     excitation.fastMultipoleComparisonLevels !=
+                         excitation.fastMultipoleVerificationLevels) ||
+                        (!higherOrder && excitation.fastMultipoleComparisonAccuracySeed == 0 &&
+                         excitation.fastMultipoleVerificationAccuracySeed == 0 &&
+                         excitation.fastMultipoleComparisonLevels.empty() &&
+                         excitation.fastMultipoleVerificationLevels.empty() &&
+                         excitation.fastMultipoleOperatorDiscrepancy == 0),
+                    "Wideband audit seeds or actual independent level evidence are inconsistent.");
+            require(std::isfinite(excitation.fastMultipoleKrylovResidual) &&
+                        std::isfinite(excitation.fastMultipoleOperatorDiscrepancy) &&
+                        excitation.fastMultipoleOperatorDiscrepancy <=
+                            fastMultipoleOrderComparisonBudgetFraction *
+                                request.numerics.relativeResidualTolerance,
+                    "FMM accepted an unconverged interpolation-order comparison.");
+        }
 }
 
 void checkFastExecution(const BemResult &result) {
@@ -125,18 +152,21 @@ void checkFastExecution(const BemResult &result) {
     for (const auto &frequency : result.frequencies) {
         const auto &stats = frequency.fastMultipole;
         require(stats.nodeCount > 1 && stats.leafCount > 1 && stats.farInteractionCount > 0 &&
-                    stats.representedFarPanelPairs > 0,
+                    stats.pressurePressureFarPairs > 0,
                 "FMM parity fixture did not execute multipole translations.");
-        require(stats.directPanelPairCount + stats.representedFarPanelPairs ==
-                    result.triangleCount * result.triangleCount,
-                "FMM interaction partition loses or duplicates panel pairs.");
-        require(stats.directPanelPairCount < result.triangleCount * result.triangleCount,
-                "FMM evaluated every panel pair directly.");
+        require(stats.pressurePressureNearPairs + stats.pressurePressureFarPairs ==
+                        result.pressureDofCount * result.pressureDofCount &&
+                    stats.pressureFluxNearPairs + stats.pressureFluxFarPairs ==
+                        result.pressureDofCount * result.triangleCount,
+                "Wideband complete-support interaction partition loses or duplicates DOF pairs.");
+        require(!stats.historicalChebyshevStatistics,
+                "New wideband execution retained historical panel-pair provenance.");
         for (const auto &excitation : frequency.excitations)
             require(excitation.iterations > 0, "FMM did not report actual Krylov iterations.");
         std::cout << frequency.frequency << " Hz: M2L " << stats.farInteractionCount
-                  << ", represented far panel pairs " << stats.representedFarPanelPairs
-                  << ", direct panel pairs " << stats.directPanelPairCount << '\n';
+                  << ", P1/P1 near/far " << stats.pressurePressureNearPairs << '/'
+                  << stats.pressurePressureFarPairs << ", P1/DP0 near/far "
+                  << stats.pressureFluxNearPairs << '/' << stats.pressureFluxFarPairs << '\n';
     }
 }
 
@@ -318,16 +348,17 @@ void checkConvergence() {
     const auto input = irregularRequest(mesh);
     CudaBemSolver solver(std::move(mesh));
     const auto dense = solver.solve(input);
-    const auto lowInput = accelerated(input, 3), highInput = accelerated(input, 7);
+    const auto lowInput = accelerated(input, 1e-3), highInput = accelerated(input, 1e-6);
     const auto low = solver.solve(lowInput), high = solver.solve(highInput);
     checkFastExecution(low);
     checkFastExecution(high);
     const double lowError = compare(low, dense, .05);
     const double highError = compare(high, dense, parityLimit);
     require(highError < .5 * lowError || highError < 1e-4,
-            "Increasing FMM interpolation order did not improve complex pressure parity.");
+            "Tightening wideband residual/seed budgets did not improve complex pressure parity.");
     checkResidual(high, highInput);
-    std::cout << "Interpolation convergence order 3/7: " << lowError << '/' << highError << '\n';
+    std::cout << "Wideband convergence residual budgets 1e-3/1e-6: " << lowError << '/' << highError
+              << '\n';
 }
 
 template <class Exception, class Function> void rejects(Function function, const char *message) {
@@ -347,18 +378,29 @@ void checkLifecycle() {
     const auto input = accelerated(irregularRequest(mesh));
     CudaBemSolver solver(mesh);
     auto invalid = input;
-    invalid.numerics.fastMultipole.interpolationOrder = 0;
+    invalid.numerics.fastMultipole.separationRatio = 1;
     rejects<std::invalid_argument>([&] { solver.solve(invalid); },
-                                   "FMM accepted zero interpolation order.");
+                                   "FMM accepted an inadmissible separation ratio.");
     invalid = input;
-    invalid.numerics.fastMultipole.leafPanelCapacity = 0;
+    invalid.numerics.fastMultipole.leafSupportCapacity = 0;
     rejects<std::invalid_argument>([&] { solver.solve(invalid); },
                                    "FMM accepted zero leaf capacity.");
     invalid = input;
     invalid.numerics.fastMultipole.maximumIterations = 1;
     invalid.numerics.fastMultipole.restartLength = 2;
-    rejects<std::runtime_error>([&] { solver.solve(invalid); },
-                                "Unconverged FMM solve returned successful results.");
+    bool unconverged = false;
+    try {
+        solver.solve(invalid);
+    } catch (const std::runtime_error &error) {
+        const std::string message = error.what();
+        require(message.find("1/1 iterations") != std::string::npos &&
+                    message.find("unpreconditioned relative FMM equation residual") !=
+                        std::string::npos &&
+                    message.find("preconditioned relative residual") != std::string::npos,
+                "GMRES failure omitted its actual residual or iteration budget.");
+        unconverged = true;
+    }
+    require(unconverged, "Unconverged FMM solve returned successful results.");
     std::stop_source cancelled;
     cancelled.request_stop();
     rejects<std::runtime_error>([&] { solver.solve(input, cancelled.get_token()); },
@@ -371,17 +413,27 @@ void checkLifecycle() {
     rejects<std::runtime_error>(
         [&] {
             solver.solve(sweep, during.get_token(), [&](const BemProgress &progress) {
-                completed = static_cast<unsigned>(progress.completedFrequencies);
-                during.request_stop();
+                if (progress.phase == BemSolvePhase::frequencyComplete) {
+                    completed = static_cast<unsigned>(progress.completedFrequencies);
+                    during.request_stop();
+                }
             });
         },
         "FMM ignored cancellation between sweep frequencies.");
     require(completed == 1, "FMM published a second frequency after cancellation.");
     auto high = input;
-    high.frequencies = {10000};
+    high.frequencies = {1500};
+    const auto reuseSpace = galerkin::buildSpace(mesh);
+    double maximumKh = 0;
+    for (const auto &panel : reuseSpace.panels)
+        maximumKh = std::max(maximumKh, 2 * std::numbers::pi * high.frequencies.front() /
+                                            high.medium.soundSpeed * panel.maximumEdgeLength);
+    require(maximumKh <= 2 * std::numbers::pi / 6,
+            "Lifecycle reuse fixture needs at least six panel edges per wavelength.");
     auto direct = high;
     direct.numerics.acceleration = BemAcceleration::dense;
-    // This is an algebraic parity test, not a physical accuracy claim for this mesh.
+    // Exercise a real frequency/plan and backend change on a resolved mesh.
+    // High-frequency algebra is covered by the independent wideband gates.
     const auto denseBefore = solver.solve(direct);
     const auto acceleratedResult = solver.solve(high);
     compare(acceleratedResult, denseBefore, parityLimit);
@@ -438,7 +490,10 @@ void checkRunningCancellation() {
         ready.set_value();
         try {
             cudaCheck(cudaSetDevice(device));
-            solver.solve(input, stop.get_token(), [&](const BemProgress &) { ++published; });
+            solver.solve(input, stop.get_token(), [&](const BemProgress &progress) {
+                if (progress.phase == BemSolvePhase::frequencyComplete)
+                    ++published;
+            });
             return std::string{"FMM returned a completed result after cancellation."};
         } catch (const std::runtime_error &error) {
             const std::string message = error.what();
@@ -477,167 +532,37 @@ void checkRunningCancellation() {
     std::cout << "First-solve CUDA cancellation returned in " << cancellationSeconds << " s\n";
 }
 
-template <class T> class DeviceBuffer {
-  public:
-    explicit DeviceBuffer(std::size_t count) : size_(count) {
-        cudaCheck(cudaMalloc(reinterpret_cast<void **>(&data_), size_ * sizeof(T)));
-    }
-    ~DeviceBuffer() {
-        cudaFree(data_);
-    }
-    DeviceBuffer(const DeviceBuffer &) = delete;
-    DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-    T *data() {
-        return data_;
-    }
-    void upload(const std::vector<T> &values) {
-        require(values.size() == size_, "CUDA test upload has incorrect size.");
-        cudaCheck(cudaMemcpy(data_, values.data(), size_ * sizeof(T), cudaMemcpyHostToDevice));
-    }
-    std::vector<T> download() {
-        std::vector<T> result(size_);
-        cudaCheck(cudaMemcpy(result.data(), data_, size_ * sizeof(T), cudaMemcpyDeviceToHost));
-        return result;
-    }
-
-  private:
-    T *data_{};
-    std::size_t size_{};
-};
-
-std::vector<Complex> complexVector(const std::vector<cuDoubleComplex> &values) {
-    std::vector<Complex> result;
-    result.reserve(values.size());
-    for (const auto value : values)
-        result.emplace_back(value.x, value.y);
-    return result;
-}
-
-void checkPreconditioner() {
-    const auto space = galerkin::buildSpace(testing::sphere(1));
-    require(space.vertices.size() == 18, "Preconditioner fixture changed its pressure space.");
-    galerkin::PairQuadratureSettings quadrature;
-    quadrature.relativeTolerance = 1e-4;
-    quadrature.maximumSubdivisionDepth = 6;
-    const auto plan = galerkin::makeInteractionPlan(space, quadrature, 10);
-    auto numerics = accelerated(BemRequest{}).numerics;
-    numerics.fastMultipole.leafPanelCapacity = 64;
-    DeviceBuffer<cuDoubleComplex> input(space.vertices.size()), output(space.vertices.size());
-    for (const double k : {3.0, 10.0}) {
-        cuda_detail::FastMultipoleOperator operation(space, plan, numerics, k, nullptr);
-        require(operation.statistics().farInteractionCount == 0,
-                "Single-block inverse fixture must contain the exact full direct operator.");
-        // All 18 unknowns fit one spatial block. Its remaining 14 entries are
-        // padding, so applying the block inverse must recover arbitrary x from
-        // A*x. This also exercises the permutation in both directions.
-        for (unsigned trial = 0; trial < 2; ++trial) {
-            std::vector<cuDoubleComplex> values;
-            for (std::size_t i = 0; i < space.vertices.size(); ++i) {
-                const double t = static_cast<double>((i + 1) * (trial + 1));
-                values.push_back(make_cuDoubleComplex(std::sin(.729 * t), std::cos(.137 * t)));
-            }
-            input.upload(values);
-            operation.applyPressureDirect(input.data(), output.data());
-            operation.precondition(output.data());
-            const double error =
-                relativeError(complexVector(output.download()), complexVector(values));
-            require(error < 1e-10, "Single-block preconditioner does not invert its operator.");
-            std::cout << "Block inverse k=" << k << ", vector=" << trial << ": relative error "
-                      << error << '\n';
-        }
-    }
-}
-
+// Detailed pressure/flux actions, high-order rotations, LF/HF handoffs,
+// exact spatial preconditioning and independent direct solve/audit checks live
+// in the corresponding wideband/support CUDA tests. This public regression
+// retains asymmetric geometry and arbitrary complex face excitation parity.
 void checkOperator() {
-    checkPreconditioner();
-    auto mesh = testing::sphere(3);
-    // An affine shear and unequal axes remove the symmetries that can hide
-    // derivative sign or curl-contraction errors in a radial sphere solution.
+    auto mesh = testing::sphere(2);
     for (auto &point : mesh.vertices)
         point = {1.27 * point.x + .13 * point.z, .71 * point.y, .95 * point.z};
-    const auto space = galerkin::buildSpace(mesh);
-    galerkin::PairQuadratureSettings quadrature;
-    quadrature.relativeTolerance = 1e-4;
-    quadrature.maximumSubdivisionDepth = 6;
-    const auto plan = galerkin::makeInteractionPlan(space, quadrature, 40);
-    std::vector<cuDoubleComplex> pressure;
-    std::vector<cuFloatComplex> flux;
-    for (std::size_t i = 0; i < space.vertices.size(); ++i) {
-        const double t = static_cast<double>(i + 1);
-        pressure.push_back(make_cuDoubleComplex(std::sin(.729 * t), std::cos(.137 * t)));
-    }
-    for (std::size_t i = 0; i < space.panels.size(); ++i) {
-        const double t = static_cast<double>(i + 1);
-        flux.push_back(make_cuFloatComplex(static_cast<float>(std::cos(.327 * t)),
-                                           static_cast<float>(std::sin(.619 * t))));
-    }
-    DeviceBuffer<cuDoubleComplex> input(space.vertices.size()), output(space.vertices.size()),
-        direct(space.vertices.size());
-    DeviceBuffer<cuFloatComplex> q(space.panels.size());
-    input.upload(pressure);
-    q.upload(flux);
-    std::array<double, 2> lowError{}, highError{};
-    for (const double k : {10.0, 40.0}) {
-        for (const unsigned order : {3U, 7U}) {
-            auto numerics = accelerated(BemRequest{}, order).numerics;
-            numerics.relativeResidualTolerance = 1e-7;
-            cuda_detail::FastMultipoleOperator operation(space, plan, numerics, k, nullptr);
-            require(operation.statistics().farInteractionCount > 0,
-                    "Random-vector operator parity did not execute M2L.");
-            operation.applyPressure(input.data(), output.data());
-            const auto fastPressure = complexVector(output.download());
-            operation.applyPressureDirect(input.data(), direct.data());
-            const double aError = relativeError(fastPressure, complexVector(direct.download()));
-            operation.applyFlux(q.data(), output.data());
-            const auto fastFlux = complexVector(output.download());
-            operation.applyFluxDirect(q.data(), direct.data());
-            const double bError = relativeError(fastFlux, complexVector(direct.download()));
-            require(aError < (order == 3 ? .01 : 2e-5) && bError < (order == 3 ? .01 : 2e-5),
-                    "Random complex vector A/B operator parity failed.");
-            if (k == 10) {
-                if (order == 3)
-                    lowError = {aError, bError};
-                else
-                    highError = {aError, bError};
-            }
-            std::cout << "Random operator k=" << k << ", order=" << order << ": A/B relative error "
-                      << aError << '/' << bError << '\n';
+    const auto request = irregularRequest(mesh);
+    CudaBemSolver solver(mesh);
+    const auto direct = solver.solve(request);
+    const auto fastRequest = accelerated(request);
+    const auto fast = solver.solve(fastRequest);
+    checkFastExecution(fast);
+    checkResidual(fast, fastRequest);
+    compare(fast, direct, parityLimit);
+    auto silent = fastRequest;
+    for (auto &face : silent.excitations.front().faces)
+        face.normalVelocity = {};
+    const auto zero = solver.solve(silent);
+    for (const auto &frequency : zero.frequencies)
+        for (const auto &excitation : frequency.excitations) {
+            require(excitation.boundaryResidual == 0 && excitation.iterations == 0 &&
+                        excitation.fastMultipoleKrylovResidual == 0 &&
+                        excitation.fastMultipoleOperatorDiscrepancy == 0,
+                    "Zero-flow public wideband solve invented a residual or iteration.");
+            for (const auto pressure : excitation.boundary()->surfacePressure)
+                require(pressure == Complex{},
+                        "Zero-flow public wideband solve retained earlier pressure.");
         }
-        std::array<std::vector<Complex>, 2> strict;
-        for (const bool mixedPrecision : {false, true}) {
-            // Isolate amplitude precision from interpolation error. Lower-order
-            // approximation and its independent residual acceptance are tested
-            // above and by the complete solves; neither changes this threshold.
-            auto numerics = accelerated(BemRequest{}, 7).numerics;
-            numerics.relativeResidualTolerance = mixedPrecision ? 5e-5 : 1e-7;
-            cuda_detail::FastMultipoleOperator operation(space, plan, numerics, k, nullptr);
-            require(operation.statistics().farInteractionCount > 0,
-                    "Mixed-precision operator parity did not execute M2L.");
-            operation.applyPressure(input.data(), output.data());
-            const auto fastPressure = complexVector(output.download());
-            operation.applyPressureDirect(input.data(), direct.data());
-            const double aError = relativeError(fastPressure, complexVector(direct.download()));
-            operation.applyFlux(q.data(), output.data());
-            const auto fastFlux = complexVector(output.download());
-            operation.applyFluxDirect(q.data(), direct.data());
-            const double bError = relativeError(fastFlux, complexVector(direct.download()));
-            require(aError < 5e-5 && bError < 5e-5,
-                    "High-order random complex vector precision parity failed.");
-            if (mixedPrecision) {
-                const double aPrecisionError = relativeError(fastPressure, strict[0]);
-                const double bPrecisionError = relativeError(fastFlux, strict[1]);
-                require(aPrecisionError < 2e-6 && bPrecisionError < 2e-6,
-                        "Mixed M2L precision changed the operator beyond its error budget.");
-                std::cout << "Mixed/strict operator k=" << k << ": A/B relative error "
-                          << aPrecisionError << '/' << bPrecisionError << ", mixed/direct "
-                          << aError << '/' << bError << '\n';
-            } else
-                strict = {fastPressure, fastFlux};
-        }
-    }
-    for (std::size_t channel = 0; channel < 2; ++channel)
-        require(highError[channel] < lowError[channel] * .2 || highError[channel] < 1e-7,
-                "FMM operator did not converge with interpolation order.");
+    compare(solver.solve(fastRequest), fast, parityLimit);
 }
 
 void checkLem() {

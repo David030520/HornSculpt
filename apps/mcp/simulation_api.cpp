@@ -75,8 +75,9 @@ QJsonObject encodeNumerics(const BemNumerics &n) {
             {"maximumRefinementSteps", int(n.maximumRefinementSteps)},
             {"acceleration", accelerationName(n.acceleration)},
             {"fastMultipole",
-             QJsonObject{{"interpolationOrder", int(n.fastMultipole.interpolationOrder)},
-                         {"leafPanelCapacity", int(n.fastMultipole.leafPanelCapacity)},
+             QJsonObject{{"leafSupportCapacity", int(n.fastMultipole.leafSupportCapacity)},
+                         {"preconditionerBlockWidth", int(n.fastMultipole.preconditionerBlockWidth)},
+                         {"orderSelection", "automatic_per_level"},
                          {"separationRatio", n.fastMultipole.separationRatio},
                          {"maximumIterations", int(n.fastMultipole.maximumIterations)},
                          {"restartLength", int(n.fastMultipole.restartLength)}}}};
@@ -384,11 +385,22 @@ QJsonObject complexResultDocument(const StudyRequest &request, const BemResult &
                         QStringLiteral("Volumenimpedanz einer angeregten Fläche fehlt."));
             const double residual = checkedNonnegative(excitation.boundaryResidual);
             require(residual <= bem.numerics.relativeResidualTolerance,
-                    QStringLiteral("Originalgleichungsresiduum überschreitet die angeforderte Toleranz."));
+                    QStringLiteral("Gleichungs-Auditrest überschreitet die angeforderte Toleranz."));
             excitations.append(QJsonObject{
                 {"name", QString::fromStdString(excitation.name)}, {"pressurePaRms", pressures},
                 {"actualFaceVelocitiesMetresPerSecondRms", velocities},
                 {"sourceImpedances", impedances}, {"relativeBoundaryResidual", residual},
+                {"residualEvaluation",
+                 excitation.residualEvaluation == BemResidualEvaluation::directGalerkin
+                     ? "directGalerkin" : "higherOrderFastMultipole"},
+                {"fastMultipoleKrylovResidual", checkedNonnegative(excitation.fastMultipoleKrylovResidual)},
+                {"fastMultipoleKrylovTarget", checkedNonnegative(excitation.fastMultipoleKrylovTarget)},
+                {"fastMultipoleOperatorDiscrepancy", checkedNonnegative(excitation.fastMultipoleOperatorDiscrepancy)},
+                {"fastMultipoleAccuracySeed", checkedNonnegative(excitation.fastMultipoleAccuracySeed)},
+                {"fastMultipoleComparisonAccuracySeed", checkedNonnegative(excitation.fastMultipoleComparisonAccuracySeed)},
+                {"fastMultipoleVerificationAccuracySeed", checkedNonnegative(excitation.fastMultipoleVerificationAccuracySeed)},
+                {"farQuadratureDiscrepancy", checkedNonnegative(excitation.farQuadratureDiscrepancy)},
+                {"fieldQuadratureDiscrepancy", checkedNonnegative(excitation.fieldQuadratureDiscrepancy)},
                 {"refinementSteps", int(excitation.refinementSteps)},
                 {"iterations", int(excitation.iterations)}});
             if (excitation.name == request.referenceExcitation.toStdString()) {
@@ -421,8 +433,10 @@ QJsonObject complexResultDocument(const StudyRequest &request, const BemResult &
                 {"nodeCount", count(frame.fastMultipole.nodeCount)},
                 {"leafCount", count(frame.fastMultipole.leafCount)},
                 {"farInteractionCount", count(frame.fastMultipole.farInteractionCount)},
-                {"directPanelPairCount", count(frame.fastMultipole.directPanelPairCount)},
-                {"representedFarPanelPairs", count(frame.fastMultipole.representedFarPanelPairs)}}}});
+                {"pressurePressureNearPairs", count(frame.fastMultipole.pressurePressureNearPairs)},
+                {"pressurePressureFarPairs", count(frame.fastMultipole.pressurePressureFarPairs)},
+                {"pressureFluxNearPairs", count(frame.fastMultipole.pressureFluxNearPairs)},
+                {"pressureFluxFarPairs", count(frame.fastMultipole.pressureFluxFarPairs)}}}});
     }
     return {{"schema", "hornsculpt.complex-study"}, {"schemaVersion", 1},
             {"conventions", QJsonObject{{"time", "exp(+i*omega*t)"}, {"outgoingWave", "exp(-i*k*r)"},
@@ -442,6 +456,7 @@ QJsonObject complexResultDocument(const StudyRequest &request, const BemResult &
                                     {"triangleCount", count(result.triangleCount)},
                                     {"pressureDofCount", count(result.pressureDofCount)},
                                     {"peakDeviceBytes", count(result.peakDeviceBytes)},
+                                    {"liveDeviceBytes", count(result.liveDeviceBytes)},
                                     {"acceleration", accelerationName(result.acceleration)},
                                     {"geometryMode", "threeDimensional"},
                                     {"method", "Burton-Miller Galerkin P1/DP0"}}},

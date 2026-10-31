@@ -53,6 +53,9 @@ class SimulationDock final : public QDockWidget {
     AcousticFrame observationFrame() const;
     void setCoupling(lem::Network network, bool enabled);
     void setInfiniteBaffle(std::optional<InfiniteBaffle> baffle);
+    void setAcousticRegions(std::vector<AcousticRegionDefinition> regions);
+    void setPartitionMeshingOptions(MeshingOptions options);
+    std::function<void()> onAcousticRegionsChanged;
     void setFrequencySweep(double minimum, double maximum, std::size_t count);
     void requestSolve();
     void cancelSolve();
@@ -60,10 +63,14 @@ class SimulationDock final : public QDockWidget {
     bool realtimeEnabled() const noexcept;
     bool isBusy() const noexcept;
     // GUI-thread identity of the currently active solve; zero means no active job.
-    std::uint64_t activeSolveJobId() const noexcept { return busy_ ? activeJob_ : 0; }
+    std::uint64_t activeSolveJobId() const noexcept {
+        return busy_ ? activeJob_ : 0;
+    }
     bool hasCurrentResult() const noexcept;
     bool hasConfiguredExcitation() const;
-    std::uint64_t inputGeneration() const noexcept { return generation_; }
+    std::uint64_t inputGeneration() const noexcept {
+        return generation_;
+    }
     QString lastError() const;
     void requestFieldEvaluation();
     bool fieldEvaluationInProgress() const noexcept;
@@ -82,7 +89,8 @@ class SimulationDock final : public QDockWidget {
     std::function<void(bool)> onRealtimeChanged;
     std::function<void()> onObservationFrameChanged;
     std::function<void(std::optional<lem::Solution>, bool)> onLemResultChanged;
-    std::function<void(std::shared_ptr<const PressureFieldPlane>, PressureFieldAppearance)> onFieldChanged;
+    std::function<void(std::shared_ptr<const PressureFieldPlane>, PressureFieldAppearance)>
+        onFieldChanged;
     std::function<void()> onFocusField;
     std::function<void(bool)> onFieldProbeModeChanged;
     std::function<void()> onRequestConvergence;
@@ -128,6 +136,8 @@ class SimulationDock final : public QDockWidget {
     std::vector<FaceVelocity> velocities_;
     std::shared_ptr<const BemResult> result_;
     std::shared_ptr<const SurfaceMesh> resultMesh_;
+    std::shared_ptr<const SurfaceMesh> resultSourceMesh_;
+    std::vector<AcousticRegionDefinition> resultRegions_;
     std::optional<BemRequest> resultRequest_;
     std::optional<AxisymmetricSamplingSettings> resultAxisymmetricSampling_;
     std::shared_ptr<const GeometrySource> geometrySource_;
@@ -138,6 +148,8 @@ class SimulationDock final : public QDockWidget {
     lem::Network couplingNetwork_;
     bool couplingEnabled_{};
     std::optional<InfiniteBaffle> infiniteBaffle_;
+    std::vector<AcousticRegionDefinition> acousticRegions_;
+    MeshingOptions partitionOptions_;
     FastMultipoleSettings fastMultipoleSettings_;
     std::uint64_t currentRevision_{};
     std::uint64_t meshRevision_{};
@@ -164,13 +176,15 @@ class SimulationDock final : public QDockWidget {
     QDoubleSpinBox *maximumFrequency_{};
     QSpinBox *frequencyCount_{};
     QCheckBox *fastMultipole_{};
-    QSpinBox *multipoleOrder_{};
+    QSpinBox *multipoleLeafCapacity_{};
+    QComboBox *multipoleJacobiBlock_{};
     QSpinBox *nearMaximumDepth_{};
     QComboBox *geometryMode_{};
     QDoubleSpinBox *meridianLength_{};
     QDoubleSpinBox *meridianTolerance_{};
     QDoubleSpinBox *rotationalTolerance_{};
     QSpinBox *angularSectors_{};
+    QSpinBox *singularOrder_{};
     QDoubleSpinBox *density_{};
     QDoubleSpinBox *soundSpeed_{};
     QDoubleSpinBox *velocity_{};

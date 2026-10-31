@@ -160,7 +160,7 @@ void filesAndSnapshots() {
     baseline.simulation.settings.maximumFrequency = 2000;
     baseline.simulation.settings.frequencyCount = 7;
     baseline.simulation.settings.acceleration = BemAcceleration::fastMultipole;
-    baseline.simulation.settings.fastMultipole.interpolationOrder = 6;
+    baseline.simulation.settings.fastMultipole.leafSupportCapacity = 64;
     baseline.simulation.settings.beamwidthTargetEnabled = true;
     const auto reference = std::make_shared<const Project>(baseline);
     baseline.comparisonSnapshots = {{QStringLiteral("Referenz"), reference}};
@@ -192,7 +192,7 @@ void filesAndSnapshots() {
                 variant.draftFaceTargetEdgeLengths == baseline.draftFaceTargetEdgeLengths &&
                 variant.simulation.settings.frequencyCount == 7 &&
                 variant.simulation.settings.acceleration == BemAcceleration::fastMultipole &&
-                variant.simulation.settings.fastMultipole.interpolationOrder == 6 &&
+                variant.simulation.settings.fastMultipole.leafSupportCapacity == 64 &&
                 variant.simulation.settings.beamwidthTargetEnabled,
             "Common mesh, solver or unrelated geometry settings were changed.");
     require(!variant.mesh && !variant.preview && !variant.simulation.result &&

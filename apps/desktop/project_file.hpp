@@ -2,10 +2,12 @@
 
 #include "angular_response_settings.hpp"
 #include "field_display_settings.hpp"
+#include "gmsh_import_data.hpp"
 #include "measured_response.hpp"
 #include "mesh_settings.hpp"
 #include <QString>
 #include <hornsculpt/acoustic_frame.hpp>
+#include <hornsculpt/acoustic_partition.hpp>
 #include <hornsculpt/bem.hpp>
 #include <hornsculpt/draft_geometry.hpp>
 #include <hornsculpt/draft_instances.hpp>
@@ -61,6 +63,8 @@ struct SimulationSettings {
     BemGeometryMode geometryMode{BemGeometryMode::threeDimensional};
     AxisymmetricSamplingSettings axisymmetricSampling;
     int ctaExcitationIndex{-1}; // display selection only
+    unsigned singularOrder{4};
+    std::vector<AcousticRegionDefinition> acousticRegions;
 };
 
 struct SimulationArchive {
@@ -76,6 +80,8 @@ struct SimulationArchive {
     std::optional<AxisymmetricSamplingSettings> axisymmetricSampling;
     // Missing in older archives: completeness of a stale result cannot be inferred.
     std::optional<bool> resultComplete;
+    std::shared_ptr<const SurfaceMesh> sourceMesh;
+    std::vector<AcousticRegionDefinition> resultRegions;
 };
 
 struct Project;
@@ -100,6 +106,7 @@ struct Project {
     std::shared_ptr<const SurfaceMesh> preview;
     std::shared_ptr<const MeshingResult> mesh;
     std::shared_ptr<const CadSnapshot> cad;
+    std::optional<MeshImportSelection> gmsh;
     SimulationArchive simulation;
     FaceColors draftFaceColors;
     FaceColors cadFaceColors;
@@ -113,6 +120,9 @@ FaceColors retainedCadFaceColors(const FaceColors &colors, const CadSnapshot *pr
 
 // Losing an assigned physical surface keeps a persistent review obligation.
 // A numeric ID in a new document is never evidence for a BEM-port match.
+std::vector<AcousticRegionDefinition>
+reconciledCadAcousticRegions(std::vector<AcousticRegionDefinition> regions,
+                             const CadSnapshot *previous, const CadSnapshot *current);
 lem::Network reconciledCadBemAssignments(lem::Network network, const CadSnapshot *previous,
                                          const CadSnapshot *current);
 

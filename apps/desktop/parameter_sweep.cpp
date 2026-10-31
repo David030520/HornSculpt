@@ -20,11 +20,11 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QScrollArea>
 #include <QScreen>
-#include <QTabWidget>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QTabWidget>
 #include <QTableView>
 #include <QVBoxLayout>
 #include <QWindow>
@@ -37,9 +37,9 @@
 #include <hornsculpt/heatmap_widget.hpp>
 #include <hornsculpt/mesh_orientation.hpp>
 #include <hornsculpt/plot_widget.hpp>
+#include <hornsculpt/polar_plot_widget.hpp>
 #include <limits>
 #include <numbers>
-#include <hornsculpt/polar_plot_widget.hpp>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -128,9 +128,9 @@ class StudyTableModel final : public QAbstractTableModel {
 void resultMemoryCheck(const SurfaceMesh &mesh, std::size_t exteriorPanels, std::size_t count,
                        std::size_t drivenCount, std::size_t excitationCount) {
     // Variants are evaluated sequentially; one result owns its own shared blocks.
-    const long double bytes = estimateResultBytes(
-        {mesh.triangles.size(), mesh.vertices.size(), exteriorPanels, 147, drivenCount,
-         count, excitationCount, 1});
+    const long double bytes =
+        estimateResultBytes({mesh.triangles.size(), mesh.vertices.size(), exteriorPanels, 147,
+                             drivenCount, count, excitationCount, 1});
     if (count > std::vector<BemFrequencyResult>{}.max_size() ||
         bytes > std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Das Frequenzraster überschreitet den verfügbaren Adressraum.");
@@ -221,18 +221,18 @@ Project calculateVariant(const SweepStudy &study, std::size_t index, std::stop_t
     }
     checkStop(stop);
     auto settings = project.simulation.settings;
+    if (!settings.acousticRegions.empty())
+        throw std::invalid_argument("Parameterstudien unterstützen derzeit keine Teilgebiete.");
     if (!study.frequencyOverride.empty()) {
         settings.minimumFrequency = study.frequencyOverride.front();
         settings.maximumFrequency = study.frequencyOverride.back();
         settings.frequencyCount = study.frequencyOverride.size();
     }
-    resultMemoryCheck(mesh->mesh,
-                      settings.infiniteBaffle
-                          ? settings.infiniteBaffle->exteriorDrivenMesh.triangles.size()
-                          : 0,
-                      settings.frequencyCount, velocities.size(),
-                      settings.couplingEnabled && settings.infiniteBaffle && !velocities.empty()
-                          ? 2 : 1);
+    resultMemoryCheck(
+        mesh->mesh,
+        settings.infiniteBaffle ? settings.infiniteBaffle->exteriorDrivenMesh.triangles.size() : 0,
+        settings.frequencyCount, velocities.size(),
+        settings.couplingEnabled && settings.infiniteBaffle && !velocities.empty() ? 2 : 1);
     auto request = makeSimulationRequest(settings, velocities, origin, axis);
     if (!study.frequencyOverride.empty())
         request.frequencies = study.frequencyOverride;
@@ -328,7 +328,10 @@ struct ParameterSweepDialog::Implementation {
     QLabel *mapStatus{};
     PolarPlotWidget *polarH{}, *polarV{};
     HeatmapWidget *mapH{}, *mapV{};
-    struct PolarInput { std::size_t row; Project project; };
+    struct PolarInput {
+        std::size_t row;
+        Project project;
+    };
     std::vector<PolarInput> polarInputs;
 
     Implementation(ParameterSweepDialog *owner, Project input);
@@ -336,8 +339,10 @@ struct ParameterSweepDialog::Implementation {
         worker.request_stop();
         if (worker.joinable())
             worker.join();
-        if (waitingForGpu && dialog->onCancelGpuAcquire) dialog->onCancelGpuAcquire();
-        if (gpuLease && dialog->onReleaseGpu) dialog->onReleaseGpu();
+        if (waitingForGpu && dialog->onCancelGpuAcquire)
+            dialog->onCancelGpuAcquire();
+        if (gpuLease && dialog->onReleaseGpu)
+            dialog->onReleaseGpu();
     }
     void axisChanged(std::size_t axis);
     void rebuildParameterCatalog(const std::array<QString, 2> &keys);
@@ -418,7 +423,7 @@ ParameterSweepDialog::Implementation::Implementation(ParameterSweepDialog *owner
     convergenceAxis = new QLabel(QObject::tr("Zielkante [mm]"));
     convergenceAxis->setObjectName("convergenceMeshAxis");
     convergenceAxis->setToolTip(QObject::tr("Grobe und feine Zielkante für dasselbe Modell. "
-                                           "Die Zwischenstufen werden linear erzeugt."));
+                                            "Die Zwischenstufen werden linear erzeugt."));
     axes->addWidget(convergenceAxis, 1, 0);
     convergenceAxis->hide();
     rebuildParameterCatalog({QStringLiteral("length"), QStringLiteral("horizontalAngle")});
@@ -576,16 +581,15 @@ ParameterSweepDialog::Implementation::Implementation(ParameterSweepDialog *owner
     split->addWidget(chartTabs);
     QObject::connect(polarFrequency, &QComboBox::currentIndexChanged, dialog,
                      [this] { updatePolars(); });
-    QObject::connect(polarNormalization, &QComboBox::currentIndexChanged, dialog,
-                     [this] {
-                         mapNormalization->setCurrentIndex(polarNormalization->currentIndex());
-                         updatePolars();
-                         updateMaps();
-                     });
-    QObject::connect(mapNormalization, &QComboBox::currentIndexChanged, dialog,
-                     [this] { polarNormalization->setCurrentIndex(mapNormalization->currentIndex()); });
-    QObject::connect(mapVariant, &QComboBox::currentIndexChanged, dialog,
-                     [this] { updateMaps(); });
+    QObject::connect(polarNormalization, &QComboBox::currentIndexChanged, dialog, [this] {
+        mapNormalization->setCurrentIndex(polarNormalization->currentIndex());
+        updatePolars();
+        updateMaps();
+    });
+    QObject::connect(mapNormalization, &QComboBox::currentIndexChanged, dialog, [this] {
+        polarNormalization->setCurrentIndex(mapNormalization->currentIndex());
+    });
+    QObject::connect(mapVariant, &QComboBox::currentIndexChanged, dialog, [this] { updateMaps(); });
     const auto setAllScales = [this](PlotDbScale scale) {
         polarH->setDecibelScale(scale);
         polarV->setDecibelScale(scale);
@@ -636,7 +640,10 @@ ParameterSweepDialog::Implementation::Implementation(ParameterSweepDialog *owner
     layout->addWidget(status);
     QObject::connect(start, &QPushButton::clicked, dialog, [this] { begin(); });
     QObject::connect(cancel, &QPushButton::clicked, dialog, [this] {
-        if (waitingForGpu) { cancelWaiting(); return; }
+        if (waitingForGpu) {
+            cancelWaiting();
+            return;
+        }
         worker.request_stop();
         cancel->setEnabled(false);
         status->setText("Abbruch angefordert …");
@@ -652,24 +659,29 @@ ParameterSweepDialog::Implementation::Implementation(ParameterSweepDialog *owner
     updateControls();
     updateMapVariants();
 }
-void ParameterSweepDialog::Implementation::rebuildParameterCatalog(const std::array<QString, 2> &keys) {
+void ParameterSweepDialog::Implementation::rebuildParameterCatalog(
+    const std::array<QString, 2> &keys) {
     const bool asymmetric = baseline.parameters.asymmetricEnabled;
-    parameterMode->setText(baseline.source == ProjectSource::freecad
-                               ? QObject::tr("CAD-Basis · Netzkonvergenz")
-                               : asymmetric ? QObject::tr("Draft · asymmetrisch: rechts, links, oben, unten")
-                                            : QObject::tr("Draft · symmetrisch: H und V gelten für beide Seiten"));
+    parameterMode->setText(
+        baseline.source == ProjectSource::freecad ? QObject::tr("CAD-Basis · Netzkonvergenz")
+        : asymmetric ? QObject::tr("Draft · asymmetrisch: rechts, links, oben, unten")
+                     : QObject::tr("Draft · symmetrisch: H und V gelten für beide Seiten"));
     const auto catalogue = sweepParameters(baseline.parameters);
     for (std::size_t a = 0; a < parameters.size(); ++a) {
         const QSignalBlocker blocker(parameters[a]);
         parameters[a]->clear();
-        parameters[a]->setToolTip(asymmetric
-            ? QObject::tr("H rechts/links und V oben/unten werden getrennt variiert. Winkel sind geometrische Halbwinkel in Grad.")
-            : QObject::tr("H und V gelten jeweils für beide Seiten. Winkel sind geometrische Halbwinkel in Grad."));
+        parameters[a]->setToolTip(
+            asymmetric ? QObject::tr("H rechts/links und V oben/unten werden getrennt variiert. "
+                                     "Winkel sind geometrische Halbwinkel in Grad.")
+                       : QObject::tr("H und V gelten jeweils für beide Seiten. Winkel sind "
+                                     "geometrische Halbwinkel in Grad."));
         for (const auto &p : catalogue)
-            parameters[a]->addItem(p.label + (p.unit.isEmpty() ? QString{} : " [" + p.unit + "]"), p.key);
+            parameters[a]->addItem(p.label + (p.unit.isEmpty() ? QString{} : " [" + p.unit + "]"),
+                                   p.key);
         const int selected = parameters[a]->findData(keys[a]);
         if (selected < 0)
-            throw std::invalid_argument("Studienparameter passt nicht zum Symmetriemodus der Basis.");
+            throw std::invalid_argument(
+                "Studienparameter passt nicht zum Symmetriemodus der Basis.");
         parameters[a]->setCurrentIndex(selected);
     }
     axisChanged(0);
@@ -691,14 +703,15 @@ void ParameterSweepDialog::Implementation::updateControls() {
         QStringList frequencies;
         for (const auto frequency : frequencyOverride)
             frequencies << QString::number(frequency, 'g', 8);
-        parameterMode->setText(QObject::tr("Netzkonvergenz · Prüffrequenzen: %1 Hz · Geometrie bleibt gleich")
-                                   .arg(frequencies.join(", ")));
+        parameterMode->setText(
+            QObject::tr("Netzkonvergenz · Prüffrequenzen: %1 Hz · Geometrie bleibt gleich")
+                .arg(frequencies.join(", ")));
     } else {
-        parameterMode->setText(baseline.source == ProjectSource::freecad
-                                   ? QObject::tr("CAD-Basis · Netzkonvergenz")
-                                   : baseline.parameters.asymmetricEnabled
-                                       ? QObject::tr("Draft · asymmetrisch: rechts, links, oben, unten")
-                                       : QObject::tr("Draft · symmetrisch: H und V gelten für beide Seiten"));
+        parameterMode->setText(
+            baseline.source == ProjectSource::freecad ? QObject::tr("CAD-Basis · Netzkonvergenz")
+            : baseline.parameters.asymmetricEnabled
+                ? QObject::tr("Draft · asymmetrisch: rechts, links, oben, unten")
+                : QObject::tr("Draft · symmetrisch: H und V gelten für beide Seiten"));
     }
     for (std::size_t a = 0; a < 2; ++a) {
         const bool enabled = !busy && (a == 0 || second->isChecked());
@@ -718,9 +731,18 @@ void ParameterSweepDialog::Implementation::updateControls() {
     second->setVisible(!convergence);
     second->setEnabled(!busy && !convergence);
     counts[0]->setMinimum(convergence ? 2 : 1);
-    starts[0]->setToolTip(convergence ? QObject::tr("Grobe Zielkante in mm; muss größer als die feine Zielkante sein.") : QString{});
-    ends[0]->setToolTip(convergence ? QObject::tr("Feine Zielkante in mm; größer als null und kleiner als die grobe Zielkante.") : QString{});
-    counts[0]->setToolTip(convergence ? QObject::tr("Mindestens zwei linear verteilte Netzstufen; für alle gelten dieselben Prüffrequenzen.") : QString{});
+    starts[0]->setToolTip(
+        convergence
+            ? QObject::tr("Grobe Zielkante in mm; muss größer als die feine Zielkante sein.")
+            : QString{});
+    ends[0]->setToolTip(
+        convergence
+            ? QObject::tr(
+                  "Feine Zielkante in mm; größer als null und kleiner als die grobe Zielkante.")
+            : QString{});
+    counts[0]->setToolTip(convergence ? QObject::tr("Mindestens zwei linear verteilte Netzstufen; "
+                                                    "für alle gelten dieselben Prüffrequenzen.")
+                                      : QString{});
     directory->setEnabled(!busy);
     browse->setEnabled(!busy);
     start->setEnabled(!busy);
@@ -731,7 +753,8 @@ void ParameterSweepDialog::Implementation::updateControls() {
         study && selected.size() == 1 &&
         study->variants[static_cast<std::size_t>(selected.front().row())].state ==
             SweepState::completed;
-    const bool validSelection = completed && polarInputs.size() == 1 &&
+    const bool validSelection =
+        completed && polarInputs.size() == 1 &&
         polarInputs.front().row == static_cast<std::size_t>(selected.front().row());
     adopt->setEnabled(!busy && validSelection && static_cast<bool>(dialog->onVariantChosen));
     analyze->setEnabled(!busy && validSelection &&
@@ -757,14 +780,18 @@ void ParameterSweepDialog::Implementation::begin() {
         progress->setValue(0);
         busy = true;
         updateControls();
-        if (!dialog->onAcquireGpu) { beginWorker(); return; }
+        if (!dialog->onAcquireGpu) {
+            beginWorker();
+            return;
+        }
         waitingForGpu = true;
         const auto id = ++acquisitionId;
         const QPointer<ParameterSweepDialog> receiver(dialog);
         status->setText(dialog->gpuWaitMessage ? dialog->gpuWaitMessage()
                                                : QStringLiteral("GPU-Speicher wird freigegeben …"));
         dialog->onAcquireGpu([this, receiver, id](bool acquired) {
-            if (!receiver || !waitingForGpu || id != acquisitionId) return;
+            if (!receiver || !waitingForGpu || id != acquisitionId)
+                return;
             waitingForGpu = false;
             if (!acquired) {
                 busy = false;
@@ -776,9 +803,11 @@ void ParameterSweepDialog::Implementation::begin() {
             beginWorker();
         });
     } catch (const std::exception &e) {
-        if (waitingForGpu && dialog->onCancelGpuAcquire) dialog->onCancelGpuAcquire();
+        if (waitingForGpu && dialog->onCancelGpuAcquire)
+            dialog->onCancelGpuAcquire();
         waitingForGpu = false;
-        if (gpuLease && dialog->onReleaseGpu) dialog->onReleaseGpu();
+        if (gpuLease && dialog->onReleaseGpu)
+            dialog->onReleaseGpu();
         gpuLease = false;
         busy = false;
         updateControls();
@@ -787,11 +816,13 @@ void ParameterSweepDialog::Implementation::begin() {
 }
 void ParameterSweepDialog::Implementation::beginWorker() {
     try {
-        if (worker.joinable()) worker.join();
+        if (worker.joinable())
+            worker.join();
         status->setText(sweepManifestPath(*study));
         worker = std::jthread([this, task = *study](std::stop_token stop) { run(task, stop); });
     } catch (const std::exception &error) {
-        if (gpuLease && dialog->onReleaseGpu) dialog->onReleaseGpu();
+        if (gpuLease && dialog->onReleaseGpu)
+            dialog->onReleaseGpu();
         gpuLease = false;
         busy = false;
         updateControls();
@@ -799,10 +830,12 @@ void ParameterSweepDialog::Implementation::beginWorker() {
     }
 }
 void ParameterSweepDialog::Implementation::cancelWaiting() {
-    if (!waitingForGpu) return;
+    if (!waitingForGpu)
+        return;
     waitingForGpu = false;
     ++acquisitionId;
-    if (dialog->onCancelGpuAcquire) dialog->onCancelGpuAcquire();
+    if (dialog->onCancelGpuAcquire)
+        dialog->onCancelGpuAcquire();
     busy = false;
     status->setText("GPU-Übergabe abgebrochen");
     updateControls();
@@ -872,8 +905,10 @@ void ParameterSweepDialog::Implementation::run(SweepStudy task, std::stop_token 
     QMetaObject::invokeMethod(
         dialog,
         [this, error, stopped = stop.stop_requested()] {
-            if (worker.joinable()) worker.join();
-            if (gpuLease && dialog->onReleaseGpu) dialog->onReleaseGpu();
+            if (worker.joinable())
+                worker.join();
+            if (gpuLease && dialog->onReleaseGpu)
+                dialog->onReleaseGpu();
             gpuLease = false;
             busy = false;
             updateControls();
@@ -998,8 +1033,7 @@ void ParameterSweepDialog::Implementation::compare() {
             if (variant.state != SweepState::completed)
                 continue;
             try {
-                auto project =
-                    readProject(QDir(study->directory).filePath(variant.projectFile));
+                auto project = readProject(QDir(study->directory).filePath(variant.projectFile));
                 if (!completeVariantResult(*study, project))
                     throw std::invalid_argument("Gespeicherte Simulation fehlt.");
                 if (!sweepVariantMatches(*study, index, project))
@@ -1162,7 +1196,8 @@ void ParameterSweepDialog::Implementation::analyzeVariant() {
     const QString directoryPath = QFileInfo(study->directory).canonicalFilePath();
     if (file.isSymLink() || file.canonicalFilePath().isEmpty() ||
         file.canonicalPath() != directoryPath) {
-        QMessageBox::critical(dialog, "Variante analysieren", "Die Variantendatei liegt nicht im Studienverzeichnis.");
+        QMessageBox::critical(dialog, "Variante analysieren",
+                              "Die Variantendatei liegt nicht im Studienverzeichnis.");
         return;
     }
     try {
@@ -1204,8 +1239,9 @@ void ParameterSweepDialog::Implementation::updatePolars() {
         const auto &project = input.project;
         const auto count = angularSampleCount(*project.simulation.request);
         const auto &frequencies = project.simulation.result->frequencies;
-        const auto found = std::find_if(frequencies.begin(), frequencies.end(),
-                                        [selected](const auto &f) { return f.frequency == selected; });
+        const auto found =
+            std::find_if(frequencies.begin(), frequencies.end(),
+                         [selected](const auto &f) { return f.frequency == selected; });
         if ((count != 37 && count != 73) || found == frequencies.end() ||
             found->excitations.empty() ||
             found->excitations.front().observerPressure.size() != 1 + 2 * count) {
@@ -1214,20 +1250,21 @@ void ParameterSweepDialog::Implementation::updatePolars() {
         }
         const auto &pressure = found->excitations.front().observerPressure;
         const QColor color = QColor::fromRgba(colors[input.row % colors.size()]);
-        const QString label = QString("#%1 · %2").arg(input.row + 1)
-                                  .arg(sweepVariantLabel(*study, input.row));
+        const QString label =
+            QString("#%1 · %2").arg(input.row + 1).arg(sweepVariantLabel(*study, input.row));
         bool valid = true;
-        std::array<PolarSeries, 2> pair{PolarSeries{label, color, {}}, PolarSeries{label, color, {}}};
+        std::array<PolarSeries, 2> pair{PolarSeries{label, color, {}},
+                                        PolarSeries{label, color, {}}};
         for (std::size_t cut = 0; cut < 2; ++cut) {
-            const auto levels = normalizedCut(pressure, count, cut,
-                                              polarNormalization->currentData().toInt() == 1);
+            const auto levels =
+                normalizedCut(pressure, count, cut, polarNormalization->currentData().toInt() == 1);
             if (std::all_of(levels.begin(), levels.end(), [](double x) { return std::isnan(x); })) {
                 valid = false;
                 break;
             }
             for (std::size_t i = 0; i < count; ++i) {
-                pair[cut].levels.push_back({((count == 73 ? -180. : -90.) + 5. * i) *
-                                                std::numbers::pi / 180., levels[i]});
+                pair[cut].levels.push_back(
+                    {((count == 73 ? -180. : -90.) + 5. * i) * std::numbers::pi / 180., levels[i]});
             }
         }
         if (!valid) {
@@ -1242,10 +1279,12 @@ void ParameterSweepDialog::Implementation::updatePolars() {
     polarH->setSeries(std::move(polarSeries[0]));
     polarV->setSeries(std::move(polarSeries[1]));
     polarLegend->setText(legend.join(" &nbsp; "));
-    polarStatus->setText(missing.isEmpty()
-        ? QString("H/V aus gespeicherten Beobachtern; keine Winkel ergänzt.")
-        : QString("Für %1 fehlen gültige H/V-Daten bei dieser Frequenz oder ein gültiger Bezug.")
-              .arg(missing.join(", ")));
+    polarStatus->setText(
+        missing.isEmpty()
+            ? QString("H/V aus gespeicherten Beobachtern; keine Winkel ergänzt.")
+            : QString(
+                  "Für %1 fehlen gültige H/V-Daten bei dieser Frequenz oder ein gültiger Bezug.")
+                  .arg(missing.join(", ")));
 }
 
 void ParameterSweepDialog::Implementation::applyStudyScale() {
@@ -1265,9 +1304,9 @@ void ParameterSweepDialog::Implementation::updateMapVariants() {
         mapVariant->clear();
         mapVariant->addItem("Variante auswählen …", QVariant{});
         for (const auto &input : polarInputs)
-            mapVariant->addItem(QString("#%1 · %2").arg(input.row + 1)
-                                    .arg(sweepVariantLabel(*study, input.row)),
-                                QVariant::fromValue(static_cast<qulonglong>(input.row)));
+            mapVariant->addItem(
+                QString("#%1 · %2").arg(input.row + 1).arg(sweepVariantLabel(*study, input.row)),
+                QVariant::fromValue(static_cast<qulonglong>(input.row)));
         const int selected = previous.isValid() ? mapVariant->findData(previous) : 0;
         mapVariant->setCurrentIndex(std::max(0, selected));
     }
@@ -1310,9 +1349,8 @@ void ParameterSweepDialog::Implementation::updateMaps() {
                 gaps = true;
                 continue;
             }
-            const auto values = normalizedCut(frequency.excitations.front().observerPressure,
-                                              count, cut,
-                                              mapNormalization->currentData().toInt() == 1);
+            const auto values = normalizedCut(frequency.excitations.front().observerPressure, count,
+                                              cut, mapNormalization->currentData().toInt() == 1);
             gaps = gaps || std::any_of(values.begin(), values.end(),
                                        [](double value) { return std::isnan(value); });
             std::copy(values.begin(), values.end(), levels[cut].begin() + rowOffset);

@@ -25,8 +25,8 @@ bool sameParameters(const DraftParameters &a, const DraftParameters &b) {
     };
     const auto slot = [](const DiffractionSlotParameters &p) {
         return std::tie(p.enabled, p.aperture.width, p.aperture.height, p.aperture.exponent,
-                        p.adapterLength, p.straightLength, p.transitionLength,
-                        p.contour, p.cornerRadius, p.exit, p.exitRadius);
+                        p.adapterLength, p.straightLength, p.transitionLength, p.contour,
+                        p.cornerRadius, p.exit, p.exitRadius);
     };
     return base(a) == base(b) && slot(a.slot) == slot(b.slot) &&
            directional(a.profile) == directional(b.profile) &&
@@ -61,7 +61,8 @@ bool sameCadGeometry(const std::optional<CadAssignmentState> &a,
                       std::tie(b->documentId, b->sessionId, b->revision));
 }
 bool sameEditState(const EditState &a, const EditState &b) {
-    if (a.couplingEnabled != b.couplingEnabled || a.couplingNetwork != b.couplingNetwork)
+    if (a.acousticRegions != b.acousticRegions || a.couplingEnabled != b.couplingEnabled ||
+        a.couplingNetwork != b.couplingNetwork)
         return false;
     if (a.assembly != b.assembly || !sameParameters(a.parameters, b.parameters) ||
         meshSettings(a.meshing) != meshSettings(b.meshing) ||

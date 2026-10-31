@@ -30,6 +30,61 @@ BemGeometryMode decodeGeometryMode(const QJsonValue &value) {
     return mode == "axisymmetric" ? BemGeometryMode::axisymmetric
                                   : BemGeometryMode::threeDimensional;
 }
+QJsonArray encodeAcousticRegions(const std::vector<AcousticRegionDefinition> &regions) {
+    QJsonArray result;
+    for (const auto &region : regions) {
+        QJsonArray faces;
+        for (auto id : region.faceIds)
+            faces.append(double(id));
+        QJsonArray interfaces;
+        for (auto id : region.interfaceFaceIds)
+            interfaces.append(double(id));
+        result.append(QJsonObject{{"id", double(region.id)},
+                                  {"name", QString::fromStdString(region.name)},
+                                  {"faceIds", faces},
+                                  {"interfaceFaceIds", interfaces},
+                                  {"needsAssignmentReview", region.needsAssignmentReview}});
+    }
+    return result;
+}
+std::vector<AcousticRegionDefinition> decodeAcousticRegions(const QJsonValue &value) {
+    std::vector<AcousticRegionDefinition> result;
+    std::set<std::uint32_t> ids, faces;
+    std::map<std::uint32_t, unsigned> interfaces;
+    for (const auto &item : array(value, 10000)) {
+        const auto o = object(item);
+        auto required = o;
+        required.remove("interfaceFaceIds");
+        required.remove("needsAssignmentReview");
+        keys(required, {"id", "name", "faceIds"});
+        AcousticRegionDefinition region;
+        region.id = integer(o["id"], std::numeric_limits<std::uint32_t>::max());
+        region.name = text(o["name"]).toStdString();
+        if (o.contains("needsAssignmentReview"))
+            region.needsAssignmentReview = boolean(o["needsAssignmentReview"]);
+        require(region.id != 0 && !region.name.empty() && ids.insert(region.id).second);
+        for (const auto &f : array(o["faceIds"], 1000000)) {
+            auto id = integer(f, std::numeric_limits<std::uint32_t>::max());
+            require(id != 0 && faces.insert(id).second);
+            region.faceIds.push_back(id);
+        }
+        if (o.contains("interfaceFaceIds")) {
+            std::set<std::uint32_t> local;
+            for (const auto &f : array(o["interfaceFaceIds"], 1000000)) {
+                auto id = integer(f, std::numeric_limits<std::uint32_t>::max());
+                require(id != 0 && local.insert(id).second && ++interfaces[id] <= 2);
+                region.interfaceFaceIds.push_back(id);
+            }
+        }
+        require(!region.faceIds.empty() || !region.interfaceFaceIds.empty());
+        result.push_back(std::move(region));
+    }
+    for (const auto &[id, count] : interfaces) {
+        (void)count;
+        require(!faces.contains(id));
+    }
+    return result;
+}
 QJsonObject encodeAxisymmetricSampling(const AxisymmetricSamplingSettings &s) {
     validateAxisymmetricSamplingSettings(s);
     return {{"maximumLength", s.maximumLength},
@@ -91,6 +146,73 @@ AxisymmetricBem decodeAxisymmetric(const QJsonValue &value, const SurfaceMesh &m
     bem_detail::validateAxisymmetricReduction(mesh, {}, r);
     return r;
 }
+QJsonValue encodeGraphEvidence(const std::optional<BemFastMultipoleGraphEvidence> &value) {
+    if (!value)
+        return QJsonValue::Null;
+    const auto &e = *value;
+    return QJsonObject{
+        {"captureAttempts", encodeWide(e.captureAttempts)},
+        {"instantiations", encodeWide(e.instantiations)},
+        {"launches", encodeWide(e.launches)},
+        {"reuses", encodeWide(e.reuses)},
+        {"executedBatches", encodeWide(e.executedBatches)},
+        {"canonicalChunks", encodeWide(e.canonicalChunks)},
+        {"canonicalBatches", encodeWide(e.canonicalBatches)},
+        {"invalidatedExecutables", encodeWide(e.invalidatedExecutables)},
+        {"budgetBypasses", encodeWide(e.budgetBypasses)},
+        {"admissionClosures", encodeWide(e.admissionClosures)},
+        {"maximumCachedExecutables", encodeWide(e.maximumCachedExecutables)},
+        {"maximumCachedNodes", encodeWide(e.maximumCachedNodes)},
+        {"peakOwnedHostMetadataBytes", encodeWide(e.peakOwnedHostMetadataBytes)},
+        {"captureMilliseconds", e.captureMilliseconds},
+        {"instantiationMilliseconds", e.instantiationMilliseconds},
+        {"memoryObservationAvailable", e.memoryObservationAvailable},
+        {"minimumObservedFreeDeviceBytes", encodeWide(e.minimumObservedFreeDeviceBytes)},
+        {"totalDeviceBytes", encodeWide(e.totalDeviceBytes)},
+        {"requiredFreeReserveBytes", encodeWide(e.requiredFreeReserveBytes)}};
+}
+BemFastMultipoleGraphEvidence decodeGraphEvidence(const QJsonValue &value) {
+    const auto o = object(value);
+    keys(o, {"captureAttempts", "instantiations", "launches", "reuses", "executedBatches",
+             "canonicalChunks", "canonicalBatches", "invalidatedExecutables", "budgetBypasses",
+             "admissionClosures", "maximumCachedExecutables", "maximumCachedNodes",
+             "peakOwnedHostMetadataBytes", "captureMilliseconds", "instantiationMilliseconds",
+             "memoryObservationAvailable", "minimumObservedFreeDeviceBytes", "totalDeviceBytes",
+             "requiredFreeReserveBytes"});
+    BemFastMultipoleGraphEvidence e;
+    e.captureAttempts = wideInteger(o["captureAttempts"]);
+    e.instantiations = wideInteger(o["instantiations"]);
+    e.launches = wideInteger(o["launches"]);
+    e.reuses = wideInteger(o["reuses"]);
+    e.executedBatches = wideInteger(o["executedBatches"]);
+    e.canonicalChunks = wideInteger(o["canonicalChunks"]);
+    e.canonicalBatches = wideInteger(o["canonicalBatches"]);
+    e.invalidatedExecutables = wideInteger(o["invalidatedExecutables"]);
+    e.budgetBypasses = wideInteger(o["budgetBypasses"]);
+    e.admissionClosures = wideInteger(o["admissionClosures"]);
+    e.maximumCachedExecutables = wideInteger(o["maximumCachedExecutables"]);
+    e.maximumCachedNodes = wideInteger(o["maximumCachedNodes"]);
+    e.peakOwnedHostMetadataBytes = wideInteger(o["peakOwnedHostMetadataBytes"]);
+    e.minimumObservedFreeDeviceBytes = wideInteger(o["minimumObservedFreeDeviceBytes"]);
+    e.totalDeviceBytes = wideInteger(o["totalDeviceBytes"]);
+    e.requiredFreeReserveBytes = wideInteger(o["requiredFreeReserveBytes"]);
+    e.captureMilliseconds = range(o["captureMilliseconds"], 0, 1e15);
+    e.instantiationMilliseconds = range(o["instantiationMilliseconds"], 0, 1e15);
+    require(o["memoryObservationAvailable"].isBool());
+    e.memoryObservationAvailable = o["memoryObservationAvailable"].toBool();
+    require(e.instantiations <= e.captureAttempts && e.reuses <= e.launches &&
+            e.launches <= e.executedBatches && e.canonicalChunks <= e.canonicalBatches &&
+            e.invalidatedExecutables <= e.instantiations &&
+            e.maximumCachedExecutables <= e.instantiations &&
+            e.maximumCachedExecutables <= e.maximumCachedNodes);
+    if (e.memoryObservationAvailable)
+        require(e.totalDeviceBytes > 0 && e.minimumObservedFreeDeviceBytes <= e.totalDeviceBytes &&
+                e.requiredFreeReserveBytes <= e.totalDeviceBytes);
+    else
+        require(e.minimumObservedFreeDeviceBytes == 0 && e.totalDeviceBytes == 0 &&
+                e.requiredFreeReserveBytes == 0);
+    return e;
+}
 QJsonObject encodeMedium(const AcousticMedium &v) {
     return {{"density", v.density}, {"soundSpeed", v.soundSpeed}};
 }
@@ -126,8 +248,8 @@ QJsonObject encodeInfiniteBaffle(const InfiniteBaffle &baffle) {
     for (const auto id : baffle.apertureFaceIds)
         faces.append(double(id));
     QJsonObject result{{"origin", encodeVector(baffle.origin)},
-            {"normal", encodeVector(baffle.normal)},
-            {"apertureFaceIds", faces}};
+                       {"normal", encodeVector(baffle.normal)},
+                       {"apertureFaceIds", faces}};
     if (!baffle.exteriorDrivenMesh.triangles.empty())
         result.insert("exteriorDrivenMesh", encodeMesh(baffle.exteriorDrivenMesh));
     return result;
@@ -157,24 +279,48 @@ BemAcceleration decodeAcceleration(const QJsonValue &v) {
     return mode == "fastMultipole" ? BemAcceleration::fastMultipole : BemAcceleration::dense;
 }
 QJsonObject encodeFastMultipole(const FastMultipoleSettings &s) {
-    return {{"interpolationOrder", int(s.interpolationOrder)},
-            {"leafPanelCapacity", int(s.leafPanelCapacity)},
+    return {{"leaf_support_capacity", int(s.leafSupportCapacity)},
+            {"preconditioner_block_width", int(s.preconditionerBlockWidth)},
             {"separationRatio", s.separationRatio},
             {"maximumIterations", int(s.maximumIterations)},
             {"restartLength", int(s.restartLength)}};
 }
 FastMultipoleSettings decodeFastMultipole(const QJsonValue &v) {
     const auto o = object(v);
-    keys(o, {"interpolationOrder", "leafPanelCapacity", "separationRatio", "maximumIterations",
-             "restartLength"});
     FastMultipoleSettings s;
-    s.interpolationOrder = integer(o["interpolationOrder"], 8);
-    s.leafPanelCapacity = integer(o["leafPanelCapacity"], 256);
+    if (o.contains("leaf_support_capacity")) {
+        auto required = o;
+        required.remove("preconditioner_block_width");
+        keys(required,
+             {"leaf_support_capacity", "separationRatio", "maximumIterations", "restartLength"});
+        require(!o.contains("leafPanelCapacity") && !o.contains("leaf_panel_capacity") &&
+                !o.contains("interpolationOrder"));
+        s.leafSupportCapacity = integer(o["leaf_support_capacity"], 256);
+        if (o.contains("preconditioner_block_width"))
+            s.preconditionerBlockWidth = integer(o["preconditioner_block_width"], 2048);
+    } else {
+        // Historical panel hierarchy settings migrate only the neutral leaf
+        // capacity. Chebyshev p has no meaning as a spherical/angular order.
+        require(o.contains("leafPanelCapacity") != o.contains("leaf_panel_capacity"));
+        if (o.contains("leafPanelCapacity"))
+            keys(o, {"interpolationOrder", "leafPanelCapacity", "separationRatio",
+                     "maximumIterations", "restartLength"});
+        else
+            keys(o, {"interpolationOrder", "leaf_panel_capacity", "separationRatio",
+                     "maximumIterations", "restartLength"});
+        s.leafSupportCapacity = integer(
+            o[o.contains("leafPanelCapacity") ? "leafPanelCapacity" : "leaf_panel_capacity"], 256);
+        const auto historicalOrder = integer(o["interpolationOrder"], 8);
+        require(historicalOrder >= 3);
+    }
     s.separationRatio = range(o["separationRatio"], 1.5, 10);
     s.maximumIterations = integer(o["maximumIterations"], 10000);
     s.restartLength = integer(o["restartLength"], 300);
-    require(s.interpolationOrder >= 3 && s.leafPanelCapacity >= 4 && s.maximumIterations >= 1 &&
-            s.restartLength >= 2);
+    require(s.leafSupportCapacity >= 4 && s.maximumIterations >= 1 && s.restartLength >= 2);
+    require(s.preconditionerBlockWidth == 32 || s.preconditionerBlockWidth == 64 ||
+            s.preconditionerBlockWidth == 128 || s.preconditionerBlockWidth == 256 ||
+            s.preconditionerBlockWidth == 512 || s.preconditionerBlockWidth == 1024 ||
+            s.preconditionerBlockWidth == 2048);
     return s;
 }
 QJsonObject encodeNumerics(const BemNumerics &v) {
@@ -231,7 +377,8 @@ QJsonObject encodeFieldDisplay(const FieldDisplaySettings &s) {
             {"maximumDb", s.maximumDb},
             {"phaseDegrees", s.phaseDegrees},
             {"exclusionDistance", s.exclusionDistance},
-            {"frequencyHz", s.frequencyHz}, {"excitationIndex", s.excitationIndex}};
+            {"frequencyHz", s.frequencyHz},
+            {"excitationIndex", s.excitationIndex}};
 }
 FieldDisplaySettings decodeFieldDisplay(const QJsonValue &value) {
     const auto o = object(value);
@@ -239,15 +386,16 @@ FieldDisplaySettings decodeFieldDisplay(const QJsonValue &value) {
     required.remove("frequencyHz");
     required.remove("excitationIndex");
     keys(required, {"vertical", "minimumLateral", "maximumLateral", "minimumAxial", "maximumAxial",
-             "lateralCount", "axialCount", "quantity", "minimumDb", "maximumDb", "phaseDegrees",
-             "exclusionDistance"});
+                    "lateralCount", "axialCount", "quantity", "minimumDb", "maximumDb",
+                    "phaseDegrees", "exclusionDistance"});
     FieldDisplaySettings s{boolean(o["vertical"]),        number(o["minimumLateral"]),
                            number(o["maximumLateral"]),   number(o["minimumAxial"]),
                            number(o["maximumAxial"]),     integer(o["lateralCount"], 201),
                            integer(o["axialCount"], 201), int(integer(o["quantity"], 2)),
                            number(o["minimumDb"]),        number(o["maximumDb"]),
                            number(o["phaseDegrees"]),     positive(o["exclusionDistance"])};
-    if (o.contains("frequencyHz")) s.frequencyHz = number(o["frequencyHz"]);
+    if (o.contains("frequencyHz"))
+        s.frequencyHz = number(o["frequencyHz"]);
     if (o.contains("excitationIndex")) {
         const double selection = range(o["excitationIndex"], -1, 10000);
         require(std::floor(selection) == selection);
@@ -304,6 +452,85 @@ std::vector<FaceVelocity> decodeVelocities(const QJsonValue &value, const Surfac
     }
     return result;
 }
+QJsonArray encodeIndices(const std::vector<std::uint32_t> &values) {
+    QJsonArray result;
+    for (auto value : values)
+        result.append(double(value));
+    return result;
+}
+std::vector<std::uint32_t> decodeIndices(const QJsonValue &value, std::size_t limit) {
+    std::vector<std::uint32_t> result;
+    require(limit > 0);
+    std::set<std::uint32_t> seen;
+    for (const auto &v : array(value, limit)) {
+        const auto index = integer(v, static_cast<std::uint32_t>(limit - 1));
+        require(seen.insert(index).second);
+        result.push_back(index);
+    }
+    return result;
+}
+QJsonObject encodeSubdomains(const BemSubdomainModel &model) {
+    QJsonArray domains, interfaces;
+    for (const auto &d : model.domains) {
+        QJsonArray panels;
+        for (const auto &p : d.panels)
+            panels.append(
+                QJsonObject{{"triangle", double(p.triangleIndex)}, {"sign", p.normalSign}});
+        domains.append(QJsonObject{{"id", double(d.id)},
+                                   {"name", QString::fromStdString(d.name)},
+                                   {"exterior", d.kind == BemDomainKind::exterior},
+                                   {"panels", panels}});
+    }
+    for (const auto &i : model.interfaces)
+        interfaces.append(QJsonObject{{"id", double(i.id)},
+                                      {"name", QString::fromStdString(i.name)},
+                                      {"first", double(i.firstDomainId)},
+                                      {"second", double(i.secondDomainId)},
+                                      {"triangles", encodeIndices(i.triangleIndices)}});
+    return {{"domains", domains}, {"interfaces", interfaces}};
+}
+BemSubdomainModel decodeSubdomains(const QJsonValue &value, const SurfaceMesh &mesh) {
+    const auto o = object(value);
+    keys(o, {"domains", "interfaces"});
+    BemSubdomainModel result;
+    std::set<std::uint32_t> domains, interfaces;
+    for (const auto &v : array(o["domains"], 10000, 1)) {
+        const auto d = object(v);
+        keys(d, {"id", "name", "exterior", "panels"});
+        BemSubdomain domain;
+        domain.id = integer(d["id"], UINT32_MAX);
+        domain.name = text(d["name"]).toStdString();
+        require(domains.insert(domain.id).second && !domain.name.empty());
+        domain.kind = boolean(d["exterior"]) ? BemDomainKind::exterior : BemDomainKind::interior;
+        std::set<std::uint32_t> seen;
+        for (const auto &p : array(d["panels"], mesh.triangles.size(), 1)) {
+            const auto panel = object(p);
+            keys(panel, {"triangle", "sign"});
+            const auto index =
+                integer(panel["triangle"], static_cast<std::uint32_t>(mesh.triangles.size() - 1));
+            const double sign = number(panel["sign"]);
+            require((sign == -1 || sign == 1) && seen.insert(index).second);
+            domain.panels.push_back({index, static_cast<int>(sign)});
+        }
+        result.domains.push_back(std::move(domain));
+    }
+    for (const auto &v : array(o["interfaces"], 10000)) {
+        const auto i = object(v);
+        keys(i, {"id", "name", "first", "second", "triangles"});
+        BemInterface face;
+        face.id = integer(i["id"], UINT32_MAX);
+        face.name = text(i["name"]).toStdString();
+        face.firstDomainId = integer(i["first"], UINT32_MAX);
+        face.secondDomainId = integer(i["second"], UINT32_MAX);
+        require(interfaces.insert(face.id).second && !face.name.empty() &&
+                face.firstDomainId != face.secondDomainId && domains.contains(face.firstDomainId) &&
+                domains.contains(face.secondDomainId));
+        face.triangleIndices = decodeIndices(i["triangles"], mesh.triangles.size());
+        require(!face.triangleIndices.empty());
+        result.interfaces.push_back(std::move(face));
+    }
+    return result;
+}
 QJsonObject encodeRequest(const BemRequest &r) {
     QJsonArray frequencies, observers, excitations;
     for (auto f : r.frequencies)
@@ -328,6 +555,8 @@ QJsonObject encodeRequest(const BemRequest &r) {
                                   {"referenceDistance", r.farField->referenceDistance}});
     if (r.coupling)
         result.insert("coupling", encodeLemNetwork(*r.coupling));
+    if (r.subdomains)
+        result.insert("subdomains", encodeSubdomains(*r.subdomains));
     if (r.infiniteBaffle)
         result.insert("infiniteBaffle", encodeInfiniteBaffle(*r.infiniteBaffle));
     if (r.axisymmetric)
@@ -348,8 +577,13 @@ BemRequest decodeRequest(const QJsonValue &requestValue, const SurfaceMesh &mesh
     required.remove("coupling");
     required.remove("infiniteBaffle");
     required.remove("axisymmetric");
+    required.remove("subdomains");
     keys(required, {"medium", "frequencies", "observers", "excitations", "numerics"});
     BemRequest r;
+    if (o.contains("subdomains")) {
+        r.subdomains = decodeSubdomains(o["subdomains"], mesh);
+        validateAcousticPartition(mesh, *r.subdomains);
+    }
     r.medium = decodeMedium(o["medium"]);
     r.numerics = decodeNumerics(o["numerics"]);
     if (o.contains("axisymmetric")) {
@@ -425,7 +659,6 @@ BemRequest decodeRequest(const QJsonValue &requestValue, const SurfaceMesh &mesh
         BemExcitation e;
         e.name = text(entry["name"], true).toStdString();
         std::set<std::uint32_t> assigned;
-        bool nonzero = false;
         for (const auto &faceValue :
              array(entry["faces"], static_cast<qsizetype>(known.size()), 1)) {
             const auto f = object(faceValue);
@@ -435,20 +668,353 @@ BemRequest decodeRequest(const QJsonValue &requestValue, const SurfaceMesh &mesh
             require(found != known.end() && found->second == BoundaryCondition::driven &&
                     assigned.insert(velocity.faceId).second &&
                     !portFaces.contains(velocity.faceId));
-            nonzero |= std::abs(velocity.normalVelocity) > 0;
             e.faces.push_back(velocity);
         }
-        require(nonzero || (r.coupling && r.infiniteBaffle));
         r.excitations.push_back(std::move(e));
     }
     return r;
+}
+QJsonArray encodeLevelEvidence(const std::vector<BemFastMultipoleLevelEvidence> &levels) {
+    QJsonArray result;
+    for (const auto &level : levels)
+        result.append(QJsonObject{
+            {"level", int(level.level)},
+            {"representation", level.representation == BemFastMultipoleRepresentation::planeWave
+                                   ? "planeWave"
+                                   : "regularSpherical"},
+            {"momentBandlimit", int(level.momentBandlimit)},
+            {"translationOrder", int(level.translationOrder)},
+            {"quadratureOrder", int(level.quadratureOrder)}});
+    return result;
+}
+std::vector<BemFastMultipoleLevelEvidence> decodeLevelEvidence(const QJsonValue &value) {
+    std::vector<BemFastMultipoleLevelEvidence> result;
+    for (const auto &entry : array(value, 31)) {
+        const auto item = object(entry);
+        keys(item,
+             {"level", "representation", "momentBandlimit", "translationOrder", "quadratureOrder"});
+        BemFastMultipoleLevelEvidence level;
+        level.level = integer(item["level"], 30);
+        const auto representation = text(item["representation"]);
+        require(representation == "planeWave" || representation == "regularSpherical");
+        level.representation = representation == "planeWave"
+                                   ? BemFastMultipoleRepresentation::planeWave
+                                   : BemFastMultipoleRepresentation::regularSpherical;
+        level.momentBandlimit = integer(item["momentBandlimit"], 512);
+        level.translationOrder = integer(item["translationOrder"], 1024);
+        level.quadratureOrder = integer(item["quadratureOrder"], 1024);
+        require(level.translationOrder >= 2 * level.momentBandlimit &&
+                level.quadratureOrder >= level.translationOrder &&
+                (result.empty() || level.level > result.back().level));
+        result.push_back(level);
+    }
+    return result;
+}
+void encodeAccuracyEvidence(QJsonObject &item, const BemExcitationResult &e) {
+    item.insert("quadratureEvidence",
+                QJsonObject{{"farComparisonDegree", int(e.farQuadratureComparisonDegree)},
+                            {"farVerificationDegree", int(e.farQuadratureVerificationDegree)},
+                            {"farRefinements", int(e.farQuadratureRefinements)},
+                            {"farDiscrepancy", e.farQuadratureDiscrepancy},
+                            {"farPreparationMilliseconds", e.farQuadraturePreparationMilliseconds},
+                            {"farPressureMilliseconds", e.farQuadraturePressureMilliseconds},
+                            {"farFluxMilliseconds", e.farQuadratureFluxMilliseconds},
+                            {"fieldComparisonDegree", int(e.fieldQuadratureComparisonDegree)},
+                            {"fieldVerificationDegree", int(e.fieldQuadratureVerificationDegree)},
+                            {"fieldDiscrepancy", e.fieldQuadratureDiscrepancy}});
+    item.insert("fastMultipoleAccuracySeed", e.fastMultipoleAccuracySeed);
+    item.insert("fastMultipoleComparisonAccuracySeed", e.fastMultipoleComparisonAccuracySeed);
+    item.insert("fastMultipoleVerificationAccuracySeed", e.fastMultipoleVerificationAccuracySeed);
+    item.insert("fastMultipoleAccuracyRefinements", int(e.fastMultipoleAccuracyRefinements));
+    item.insert("fastMultipoleComparisonLevels",
+                encodeLevelEvidence(e.fastMultipoleComparisonLevels));
+    item.insert("fastMultipoleVerificationLevels",
+                encodeLevelEvidence(e.fastMultipoleVerificationLevels));
+    item.insert("historicalChebyshevEvidence",
+                e.historicalChebyshevEvidence
+                    ? QJsonValue(QJsonObject{
+                          {"comparisonOrder", int(e.historicalChebyshevEvidence->comparisonOrder)},
+                          {"auditOrder", int(e.historicalChebyshevEvidence->auditOrder)}})
+                    : QJsonValue::Null);
+}
+void decodeQuadratureEvidence(BemExcitationResult &e, const QJsonObject &item, unsigned version,
+                              bool multipole, bool hasFar, double tolerance) {
+    // Earlier archives did not perform this independent rule check.
+    if (!item.contains("quadratureEvidence")) {
+        require(version < 16);
+        return;
+    }
+    require(version >= 12);
+    const auto q = object(item["quadratureEvidence"]);
+    keys(q, {"farComparisonDegree", "farVerificationDegree", "farRefinements", "farDiscrepancy",
+             "farPreparationMilliseconds", "farPressureMilliseconds", "farFluxMilliseconds",
+             "fieldComparisonDegree", "fieldVerificationDegree", "fieldDiscrepancy"});
+    e.farQuadratureComparisonDegree = integer(q["farComparisonDegree"], 14);
+    e.farQuadratureVerificationDegree = integer(q["farVerificationDegree"], 14);
+    e.farQuadratureRefinements = integer(q["farRefinements"], 3);
+    e.farQuadratureDiscrepancy = range(q["farDiscrepancy"], 0, 1e15);
+    e.farQuadraturePreparationMilliseconds = range(q["farPreparationMilliseconds"], 0, 1e15);
+    e.farQuadraturePressureMilliseconds = range(q["farPressureMilliseconds"], 0, 1e15);
+    e.farQuadratureFluxMilliseconds = range(q["farFluxMilliseconds"], 0, 1e15);
+    e.fieldQuadratureComparisonDegree = integer(q["fieldComparisonDegree"], 14);
+    e.fieldQuadratureVerificationDegree = integer(q["fieldVerificationDegree"], 14);
+    e.fieldQuadratureDiscrepancy = range(q["fieldDiscrepancy"], 0, 1e15);
+    const auto validPair = [](unsigned a, unsigned b) {
+        return (a == 4 && b == 6) || (a == 6 && b == 8) || (a == 8 && b == 12) ||
+               (a == 12 && b == 14);
+    };
+    if (e.farQuadratureComparisonDegree || e.farQuadratureVerificationDegree)
+        require(multipole && hasFar && !e.historicalChebyshevEvidence &&
+                validPair(e.farQuadratureComparisonDegree, e.farQuadratureVerificationDegree) &&
+                e.farQuadratureRefinements <= (e.farQuadratureComparisonDegree == 4   ? 0u
+                                               : e.farQuadratureComparisonDegree == 6 ? 1u
+                                               : e.farQuadratureComparisonDegree == 8 ? 2u
+                                                                                      : 3u) &&
+                e.farQuadratureDiscrepancy <= .025 * tolerance);
+    else
+        require(e.farQuadratureRefinements == 0 && e.farQuadratureDiscrepancy == 0 &&
+                e.farQuadraturePreparationMilliseconds == 0 &&
+                e.farQuadraturePressureMilliseconds == 0 && e.farQuadratureFluxMilliseconds == 0);
+    if (e.fieldQuadratureComparisonDegree || e.fieldQuadratureVerificationDegree)
+        require(!e.historicalChebyshevEvidence &&
+                validPair(e.fieldQuadratureComparisonDegree, e.fieldQuadratureVerificationDegree) &&
+                e.fieldQuadratureDiscrepancy <= .025 * tolerance);
+    else
+        require(e.fieldQuadratureDiscrepancy == 0);
+}
+void decodeAccuracyEvidence(BemExcitationResult &e, const QJsonObject &item, unsigned version,
+                            bool multipole, bool hasFar, double tolerance) {
+    if (item.contains("residualEvaluation")) {
+        const auto evaluation = text(item["residualEvaluation"]);
+        require(evaluation == "directGalerkin" || evaluation == "higherOrderFastMultipole");
+        e.residualEvaluation = evaluation == "directGalerkin"
+                                   ? BemResidualEvaluation::directGalerkin
+                                   : BemResidualEvaluation::higherOrderFastMultipole;
+        e.fastMultipoleKrylovResidual = range(item["fastMultipoleKrylovResidual"], 0, 1e15);
+        e.fastMultipoleOperatorDiscrepancy =
+            range(item["fastMultipoleOperatorDiscrepancy"], 0, 1e15);
+    } else {
+        require(version < 16 && !item.contains("fastMultipoleKrylovResidual") &&
+                !item.contains("fastMultipoleOperatorDiscrepancy") &&
+                !item.contains("fastMultipoleComparisonOrder") &&
+                !item.contains("fastMultipoleAuditOrder"));
+    }
+    if (item.contains("fastMultipoleKrylovTarget")) {
+        require(version >= 12);
+        e.fastMultipoleKrylovTarget = range(item["fastMultipoleKrylovTarget"], 0, 1);
+        require(multipole || e.fastMultipoleKrylovTarget == 0);
+    }
+    if (version < 16 && !item.contains("fastMultipoleAccuracySeed")) {
+        for (const auto *name :
+             {"fastMultipoleAccuracySeed", "fastMultipoleComparisonAccuracySeed",
+              "fastMultipoleVerificationAccuracySeed", "fastMultipoleAccuracyRefinements",
+              "fastMultipoleComparisonLevels", "fastMultipoleVerificationLevels",
+              "historicalChebyshevEvidence"})
+            require(!item.contains(name));
+        BemHistoricalChebyshevEvidence historical;
+        if (item.contains("fastMultipoleComparisonOrder") ||
+            item.contains("fastMultipoleAuditOrder")) {
+            historical.comparisonOrder = integer(item["fastMultipoleComparisonOrder"], 9);
+            historical.auditOrder = integer(item["fastMultipoleAuditOrder"], 10);
+        }
+        if (multipole)
+            e.historicalChebyshevEvidence = historical;
+    } else {
+        require(!item.contains("fastMultipoleComparisonOrder") &&
+                !item.contains("fastMultipoleAuditOrder"));
+        e.fastMultipoleAccuracySeed = range(item["fastMultipoleAccuracySeed"], 0, 1);
+        e.fastMultipoleComparisonAccuracySeed =
+            range(item["fastMultipoleComparisonAccuracySeed"], 0, 1);
+        e.fastMultipoleVerificationAccuracySeed =
+            range(item["fastMultipoleVerificationAccuracySeed"], 0, 1);
+        e.fastMultipoleAccuracyRefinements = integer(item["fastMultipoleAccuracyRefinements"], 32);
+        e.fastMultipoleComparisonLevels =
+            decodeLevelEvidence(item["fastMultipoleComparisonLevels"]);
+        e.fastMultipoleVerificationLevels =
+            decodeLevelEvidence(item["fastMultipoleVerificationLevels"]);
+        require(item.contains("historicalChebyshevEvidence"));
+        if (!item["historicalChebyshevEvidence"].isNull()) {
+            const auto historical = object(item["historicalChebyshevEvidence"]);
+            keys(historical, {"comparisonOrder", "auditOrder"});
+            e.historicalChebyshevEvidence = BemHistoricalChebyshevEvidence{
+                integer(historical["comparisonOrder"], 9), integer(historical["auditOrder"], 10)};
+        }
+    }
+    const bool approximate =
+        e.residualEvaluation == BemResidualEvaluation::higherOrderFastMultipole;
+    if (e.historicalChebyshevEvidence) {
+        const auto &old = *e.historicalChebyshevEvidence;
+        require(multipole && e.fastMultipoleKrylovTarget == 0 && e.fastMultipoleAccuracySeed == 0 &&
+                e.fastMultipoleComparisonAccuracySeed == 0 &&
+                e.fastMultipoleVerificationAccuracySeed == 0 &&
+                e.fastMultipoleAccuracyRefinements == 0 &&
+                e.fastMultipoleComparisonLevels.empty() &&
+                e.fastMultipoleVerificationLevels.empty());
+        require(approximate
+                    ? (old.comparisonOrder >= 3 && old.auditOrder == old.comparisonOrder + 1)
+                    : (old.comparisonOrder == 0 && old.auditOrder == 0));
+    } else if (multipole) {
+        require(e.fastMultipoleAccuracySeed > 0 && e.fastMultipoleAccuracySeed < 1);
+        if (approximate) {
+            require(e.fastMultipoleComparisonAccuracySeed > 0 &&
+                    e.fastMultipoleComparisonAccuracySeed <= e.fastMultipoleAccuracySeed &&
+                    e.fastMultipoleVerificationAccuracySeed > 0 &&
+                    e.fastMultipoleVerificationAccuracySeed <
+                        e.fastMultipoleComparisonAccuracySeed &&
+                    e.fastMultipoleComparisonLevels.size() ==
+                        e.fastMultipoleVerificationLevels.size() &&
+                    (!hasFar || !e.fastMultipoleComparisonLevels.empty()));
+            for (std::size_t i = 0; i < e.fastMultipoleComparisonLevels.size(); ++i) {
+                const auto &a = e.fastMultipoleComparisonLevels[i],
+                           &b = e.fastMultipoleVerificationLevels[i];
+                require(a.level == b.level && b.momentBandlimit >= a.momentBandlimit &&
+                        b.translationOrder >= a.translationOrder &&
+                        b.quadratureOrder >= a.quadratureOrder);
+            }
+        } else
+            require(e.fastMultipoleComparisonAccuracySeed == 0 &&
+                    e.fastMultipoleVerificationAccuracySeed == 0 &&
+                    e.fastMultipoleComparisonLevels.empty() &&
+                    e.fastMultipoleVerificationLevels.empty());
+    } else
+        require(e.fastMultipoleAccuracySeed == 0 && e.fastMultipoleComparisonAccuracySeed == 0 &&
+                e.fastMultipoleVerificationAccuracySeed == 0 &&
+                e.fastMultipoleAccuracyRefinements == 0 &&
+                e.fastMultipoleComparisonLevels.empty() &&
+                e.fastMultipoleVerificationLevels.empty());
+    if (approximate)
+        require(multipole && e.fastMultipoleOperatorDiscrepancy <=
+                                 fastMultipoleOrderComparisonBudgetFraction * tolerance);
+    else
+        require((multipole || e.fastMultipoleKrylovResidual == 0) &&
+                e.fastMultipoleOperatorDiscrepancy == 0);
+}
+QJsonArray encodeSubdomainTraces(const std::vector<BemSubdomainTrace> &traces) {
+    QJsonArray result;
+    for (const auto &trace : traces) {
+        require(trace.vertexIndices.size() == trace.pressureTrace.size() &&
+                trace.triangleIndices.size() == trace.normalDerivative.size());
+        QJsonArray fluxes;
+        for (const auto &flux : trace.interfaceFluxes) {
+            require(flux.vertexIndices.size() == flux.normalDerivative.size());
+            fluxes.append(QJsonObject{{"interface", double(flux.interfaceId)},
+                                      {"vertices", encodeIndices(flux.vertexIndices)},
+                                      {"normalDerivative", encodePressure(flux.normalDerivative)}});
+        }
+        result.append(QJsonObject{{"domain", double(trace.domainId)},
+                                  {"vertices", encodeIndices(trace.vertexIndices)},
+                                  {"pressure", encodePressure(trace.pressureTrace)},
+                                  {"triangles", encodeIndices(trace.triangleIndices)},
+                                  {"normalDerivative", encodePressure(trace.normalDerivative)},
+                                  {"interfaceFluxes", fluxes}});
+    }
+    return result;
+}
+std::vector<BemSubdomainTrace> decodeSubdomainTraces(const QJsonValue &value,
+                                                     const SurfaceMesh &mesh,
+                                                     const BemSubdomainModel &model) {
+    std::vector<BemSubdomainTrace> result;
+    std::set<std::uint32_t> domains;
+    for (const auto &v : array(value, model.domains.size(), model.domains.size())) {
+        const auto t = object(v);
+        keys(t, {"domain", "vertices", "pressure", "triangles", "normalDerivative",
+                 "interfaceFluxes"});
+        BemSubdomainTrace trace;
+        trace.domainId = integer(t["domain"], UINT32_MAX);
+        require(domains.insert(trace.domainId).second &&
+                std::any_of(model.domains.begin(), model.domains.end(),
+                            [&](const auto &d) { return d.id == trace.domainId; }));
+        trace.vertexIndices = decodeIndices(t["vertices"], mesh.vertices.size());
+        trace.pressureTrace = decodePressure(t["pressure"], trace.vertexIndices.size());
+        trace.triangleIndices = decodeIndices(t["triangles"], mesh.triangles.size());
+        trace.normalDerivative =
+            decodePressure(t["normalDerivative"], trace.triangleIndices.size());
+        std::set<std::uint32_t> interfaces;
+        for (const auto &f : array(t["interfaceFluxes"], model.interfaces.size())) {
+            const auto o = object(f);
+            keys(o, {"interface", "vertices", "normalDerivative"});
+            BemSubdomainTrace::InterfaceFlux flux;
+            flux.interfaceId = integer(o["interface"], UINT32_MAX);
+            require(
+                interfaces.insert(flux.interfaceId).second &&
+                std::any_of(model.interfaces.begin(), model.interfaces.end(), [&](const auto &i) {
+                    return i.id == flux.interfaceId && (i.firstDomainId == trace.domainId ||
+                                                        i.secondDomainId == trace.domainId);
+                }));
+            flux.vertexIndices = decodeIndices(o["vertices"], mesh.vertices.size());
+            flux.normalDerivative =
+                decodePressure(o["normalDerivative"], flux.vertexIndices.size());
+            trace.interfaceFluxes.push_back(std::move(flux));
+        }
+        const auto domain = std::find_if(model.domains.begin(), model.domains.end(),
+                                         [&](const auto &d) { return d.id == trace.domainId; });
+        std::set<std::uint32_t> expectedTriangles, expectedVertices;
+        for (const auto &panel : domain->panels) {
+            expectedTriangles.insert(panel.triangleIndex);
+            for (auto vertex : mesh.triangles[panel.triangleIndex].vertices)
+                expectedVertices.insert(vertex);
+        }
+        require(std::set<std::uint32_t>(trace.triangleIndices.begin(),
+                                        trace.triangleIndices.end()) == expectedTriangles &&
+                std::set<std::uint32_t>(trace.vertexIndices.begin(), trace.vertexIndices.end()) ==
+                    expectedVertices);
+        for (const auto &interface : model.interfaces) {
+            if (interface.firstDomainId != trace.domainId &&
+                interface.secondDomainId != trace.domainId)
+                continue;
+            const auto flux =
+                std::find_if(trace.interfaceFluxes.begin(), trace.interfaceFluxes.end(),
+                             [&](const auto &f) { return f.interfaceId == interface.id; });
+            require(flux != trace.interfaceFluxes.end());
+            std::set<std::uint32_t> vertices;
+            for (auto triangle : interface.triangleIndices)
+                for (auto vertex : mesh.triangles[triangle].vertices)
+                    vertices.insert(vertex);
+            require(std::set<std::uint32_t>(flux->vertexIndices.begin(),
+                                            flux->vertexIndices.end()) == vertices);
+        }
+        result.push_back(std::move(trace));
+    }
+    // Both sides share the same P1 pressure and opposite outward P1 flux.
+    constexpr double relativeInterfaceRoundoff = 1e-11;
+    const auto near = [](std::complex<double> a, std::complex<double> b) {
+        const double scale = std::max({std::abs(a), std::abs(b), 1e-300});
+        return std::abs(a - b) <= relativeInterfaceRoundoff * scale;
+    };
+    for (const auto &interface : model.interfaces) {
+        const auto findTrace = [&](std::uint32_t id) -> const BemSubdomainTrace & {
+            return *std::find_if(result.begin(), result.end(),
+                                 [id](const auto &t) { return t.domainId == id; });
+        };
+        const auto &a = findTrace(interface.firstDomainId),
+                   &b = findTrace(interface.secondDomainId);
+        const auto findFlux =
+            [&](const BemSubdomainTrace &trace) -> const BemSubdomainTrace::InterfaceFlux & {
+            return *std::find_if(trace.interfaceFluxes.begin(), trace.interfaceFluxes.end(),
+                                 [&](const auto &f) { return f.interfaceId == interface.id; });
+        };
+        const auto &fa = findFlux(a), &fb = findFlux(b);
+        std::map<std::uint32_t, std::complex<double>> pa, pb, qa, qb;
+        for (std::size_t i = 0; i < a.vertexIndices.size(); ++i)
+            pa.emplace(a.vertexIndices[i], a.pressureTrace[i]);
+        for (std::size_t i = 0; i < b.vertexIndices.size(); ++i)
+            pb.emplace(b.vertexIndices[i], b.pressureTrace[i]);
+        for (std::size_t i = 0; i < fa.vertexIndices.size(); ++i)
+            qa.emplace(fa.vertexIndices[i], fa.normalDerivative[i]);
+        for (std::size_t i = 0; i < fb.vertexIndices.size(); ++i)
+            qb.emplace(fb.vertexIndices[i], fb.normalDerivative[i]);
+        for (const auto &[vertex, flux] : qa)
+            require(pa.contains(vertex) && pb.contains(vertex) && qb.contains(vertex) &&
+                    near(pa.at(vertex), pb.at(vertex)) && near(flux, -qb.at(vertex)));
+    }
+    return result;
 }
 QJsonObject encodeResult(const BemResult &r) {
     QJsonArray frequencies;
     for (const auto &f : r.frequencies) {
         QJsonArray excitations;
         for (const auto &e : f.excitations) {
-            require(bool(e.boundary()));
+            require(bool(e.boundary()) != !e.subdomainTraces().empty());
             QJsonArray impedances;
             for (const auto &z : e.impedances)
                 impedances.append(
@@ -457,25 +1023,40 @@ QJsonObject encodeResult(const BemResult &r) {
                                 {"meanPressure", encodeComplex(z.meanPressure)},
                                 {"volumeVelocity", encodeComplex(z.volumeVelocity)},
                                 {"volumeImpedance", encodeComplex(z.volumeImpedance)}});
-            QJsonObject excitation{{"name", QString::fromStdString(e.name)},
-                                   {"surfacePressure", encodePressure(e.boundary()->surfacePressure)},
-                                   {"observerPressure", encodePressure(e.observerPressure)},
-                                   {"impedances", impedances},
-                                   {"refinementSteps", int(e.refinementSteps)},
-                                   {"iterations", int(e.iterations)},
-                                   {"boundaryResidual", e.boundaryResidual}};
+            QJsonObject excitation{
+                {"name", QString::fromStdString(e.name)},
+                {"observerPressure", encodePressure(e.observerPressure)},
+                {"impedances", impedances},
+                {"refinementSteps", int(e.refinementSteps)},
+                {"iterations", int(e.iterations)},
+                {"residualEvaluation", e.residualEvaluation == BemResidualEvaluation::directGalerkin
+                                           ? "directGalerkin"
+                                           : "higherOrderFastMultipole"},
+                {"fastMultipoleKrylovResidual", e.fastMultipoleKrylovResidual},
+                {"fastMultipoleKrylovTarget", e.fastMultipoleKrylovTarget},
+                {"fastMultipoleOperatorDiscrepancy", e.fastMultipoleOperatorDiscrepancy},
+                {"boundaryResidual", e.boundaryResidual}};
+            if (e.boundary())
+                excitation.insert("surfacePressure", encodePressure(e.boundary()->surfacePressure));
+            if (!e.subdomainTraces().empty())
+                excitation.insert("subdomainTraces", encodeSubdomainTraces(e.subdomainTraces()));
+            encodeAccuracyEvidence(excitation, e);
             if (e.lemSolution) {
                 excitation.insert("lemSolution", encodeLemSolution(*e.lemSolution));
                 excitation.insert("solvedVelocities", encodeVelocities(e.solvedVelocities));
             }
-            if (!e.boundary()->exteriorSurfacePressure.empty()) {
-                excitation.insert("exteriorSurfacePressure", encodePressure(e.boundary()->exteriorSurfacePressure));
+            if (e.boundary() && !e.boundary()->exteriorSurfacePressure.empty()) {
+                excitation.insert("exteriorSurfacePressure",
+                                  encodePressure(e.boundary()->exteriorSurfacePressure));
                 excitation.insert("solvedVelocities", encodeVelocities(e.solvedVelocities));
             }
-            require(e.boundary()->pressureTrace.empty() == e.boundary()->normalDerivative.empty());
-            if (!e.boundary()->pressureTrace.empty()) {
+            if (e.boundary())
+                require(e.boundary()->pressureTrace.empty() ==
+                        e.boundary()->normalDerivative.empty());
+            if (e.boundary() && !e.boundary()->pressureTrace.empty()) {
                 excitation.insert("pressureTrace", encodePressure(e.boundary()->pressureTrace));
-                excitation.insert("normalDerivative", encodePressure(e.boundary()->normalDerivative));
+                excitation.insert("normalDerivative",
+                                  encodePressure(e.boundary()->normalDerivative));
             }
             excitations.append(excitation);
         }
@@ -491,12 +1072,26 @@ QJsonObject encodeResult(const BemResult &r) {
             {"interactionPlanMilliseconds", f.interactionPlanMilliseconds},
             {"interactionPlanReused", f.interactionPlanReused},
             {"fastMultipole",
-             QJsonObject{{"nodeCount", encodeWide(f.fastMultipole.nodeCount)},
-                         {"leafCount", encodeWide(f.fastMultipole.leafCount)},
-                         {"farInteractionCount", encodeWide(f.fastMultipole.farInteractionCount)},
-                         {"directPanelPairCount", encodeWide(f.fastMultipole.directPanelPairCount)},
-                         {"representedFarPanelPairs",
-                          encodeWide(f.fastMultipole.representedFarPanelPairs)}}}});
+             QJsonObject{
+                 {"nodeCount", encodeWide(f.fastMultipole.nodeCount)},
+                 {"leafCount", encodeWide(f.fastMultipole.leafCount)},
+                 {"farInteractionCount", encodeWide(f.fastMultipole.farInteractionCount)},
+                 {"pressurePressureNearPairs",
+                  encodeWide(f.fastMultipole.pressurePressureNearPairs)},
+                 {"pressurePressureFarPairs", encodeWide(f.fastMultipole.pressurePressureFarPairs)},
+                 {"pressureFluxNearPairs", encodeWide(f.fastMultipole.pressureFluxNearPairs)},
+                 {"pressureFluxFarPairs", encodeWide(f.fastMultipole.pressureFluxFarPairs)},
+                 {"graphExecution", encodeGraphEvidence(f.fastMultipole.graphExecution)},
+                 {"historicalChebyshevStatistics",
+                  f.fastMultipole.historicalChebyshevStatistics
+                      ? QJsonValue(
+                            QJsonObject{{"directPanelPairCount",
+                                         encodeWide(f.fastMultipole.historicalChebyshevStatistics
+                                                        ->directPanelPairCount)},
+                                        {"representedFarPanelPairs",
+                                         encodeWide(f.fastMultipole.historicalChebyshevStatistics
+                                                        ->representedFarPanelPairs)}})
+                      : QJsonValue::Null}}}});
     }
     return {{"device", QString::fromStdString(r.device)},
             {"geometryMode", encodeGeometryMode(r.geometryMode)},
@@ -504,6 +1099,8 @@ QJsonObject encodeResult(const BemResult &r) {
             {"triangleCount", double(r.triangleCount)},
             {"pressureDofCount", double(r.pressureDofCount)},
             {"peakDeviceBytes", encodeWide(r.peakDeviceBytes)},
+            {"liveDeviceBytes",
+             r.liveDeviceBytes ? QJsonValue(encodeWide(r.liveDeviceBytes)) : QJsonValue::Null},
             {"frequencies", frequencies}};
 }
 struct FaceIntegral {
@@ -518,11 +1115,14 @@ bool close(std::complex<double> a, std::complex<double> b) {
     return std::abs(a - b) <= 1e-10 * std::max({std::abs(a), std::abs(b), 1e-300});
 }
 BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
-                       const SurfaceMesh &mesh) {
+                       const SurfaceMesh &mesh, unsigned version) {
     const auto o = object(resultValue);
     auto requiredResult = o;
     requiredResult.remove("acceleration");
     requiredResult.remove("geometryMode");
+    if (version >= 16)
+        require(o.contains("liveDeviceBytes"));
+    requiredResult.remove("liveDeviceBytes");
     keys(requiredResult,
          {"device", "triangleCount", "pressureDofCount", "peakDeviceBytes", "frequencies"});
     BemResult r;
@@ -538,6 +1138,11 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
     const auto bytes = wideInteger(o["peakDeviceBytes"]);
     require(bytes <= std::numeric_limits<std::size_t>::max());
     r.peakDeviceBytes = static_cast<std::size_t>(bytes);
+    if (o.contains("liveDeviceBytes") && !o["liveDeviceBytes"].isNull()) {
+        const auto live = wideInteger(o["liveDeviceBytes"]);
+        require(live <= bytes);
+        r.liveDeviceBytes = static_cast<std::size_t>(live);
+    }
     const auto pressureCount =
         request.axisymmetric
             ? bem_detail::validateAxisymmetricReduction(mesh, {}, *request.axisymmetric)
@@ -545,7 +1150,8 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
             : mesh.vertices.size();
     require(r.triangleCount == mesh.triangles.size() && r.pressureDofCount == pressureCount);
     const auto measures = surfaceMeasures(mesh, request.axisymmetric);
-    const auto exteriorMesh = request.infiniteBaffle ? request.infiniteBaffle->exteriorDrivenMesh : SurfaceMesh{};
+    const auto exteriorMesh =
+        request.infiniteBaffle ? request.infiniteBaffle->exteriorDrivenMesh : SurfaceMesh{};
     const auto combinedMesh = bem_detail::appendBaffleExterior(mesh, exteriorMesh);
     auto combinedAreas = measures.areas;
     if (!exteriorMesh.triangles.empty()) {
@@ -583,37 +1189,88 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
             f.interactionPlanReused = boolean(entry["interactionPlanReused"]);
         require(!f.interactionPlanReused || f.interactionPlanMilliseconds == 0);
         if (entry.contains("fastMultipole")) {
-            const auto stats = object(entry["fastMultipole"]);
-            keys(stats, {"nodeCount", "leafCount", "farInteractionCount", "directPanelPairCount",
-                         "representedFarPanelPairs"});
+            auto stats = object(entry["fastMultipole"]);
+            if (stats.contains("graphExecution")) {
+                if (!stats["graphExecution"].isNull()) {
+                    require(version >= 12 && multipole);
+                    f.fastMultipole.graphExecution = decodeGraphEvidence(stats["graphExecution"]);
+                }
+                stats.remove("graphExecution");
+            }
             const auto count = [](const QJsonValue &value) {
                 const auto result = wideInteger(value);
                 require(result <= std::numeric_limits<std::size_t>::max());
                 return static_cast<std::size_t>(result);
             };
-            f.fastMultipole = {count(stats["nodeCount"]), count(stats["leafCount"]),
-                               count(stats["farInteractionCount"]),
-                               count(stats["directPanelPairCount"]),
-                               count(stats["representedFarPanelPairs"])};
+            f.fastMultipole.nodeCount = count(stats["nodeCount"]);
+            f.fastMultipole.leafCount = count(stats["leafCount"]);
+            f.fastMultipole.farInteractionCount = count(stats["farInteractionCount"]);
             const auto panels = mesh.triangles.size();
             require(panels > 0 && panels <= std::numeric_limits<std::size_t>::max() / panels);
             const auto pairs = panels * panels;
             require(f.fastMultipole.leafCount <= f.fastMultipole.nodeCount &&
-                    f.fastMultipole.directPanelPairCount <= pairs &&
-                    f.fastMultipole.representedFarPanelPairs <= pairs);
-            if (multipole)
-                // Subtraction verifies the partition without overflowing an addition.
-                require(f.fastMultipole.leafCount >= 1 &&
-                        f.fastMultipole.directPanelPairCount ==
-                            pairs - f.fastMultipole.representedFarPanelPairs);
+                    (!multipole || f.fastMultipole.leafCount >= 1));
+            if (version < 16 && stats.contains("directPanelPairCount")) {
+                keys(stats, {"nodeCount", "leafCount", "farInteractionCount",
+                             "directPanelPairCount", "representedFarPanelPairs"});
+                const auto directPairs = count(stats["directPanelPairCount"]);
+                const auto farPairs = count(stats["representedFarPanelPairs"]);
+                if (multipole)
+                    f.fastMultipole.historicalChebyshevStatistics =
+                        BemHistoricalChebyshevStatistics{directPairs, farPairs};
+                else
+                    require(directPairs == 0 && farPairs == 0);
+            } else {
+                keys(stats,
+                     {"nodeCount", "leafCount", "farInteractionCount", "pressurePressureNearPairs",
+                      "pressurePressureFarPairs", "pressureFluxNearPairs", "pressureFluxFarPairs",
+                      "historicalChebyshevStatistics"});
+                f.fastMultipole.pressurePressureNearPairs =
+                    wideInteger(stats["pressurePressureNearPairs"]);
+                f.fastMultipole.pressurePressureFarPairs =
+                    wideInteger(stats["pressurePressureFarPairs"]);
+                f.fastMultipole.pressureFluxNearPairs = wideInteger(stats["pressureFluxNearPairs"]);
+                f.fastMultipole.pressureFluxFarPairs = wideInteger(stats["pressureFluxFarPairs"]);
+                if (!stats["historicalChebyshevStatistics"].isNull()) {
+                    const auto old = object(stats["historicalChebyshevStatistics"]);
+                    keys(old, {"directPanelPairCount", "representedFarPanelPairs"});
+                    f.fastMultipole.historicalChebyshevStatistics =
+                        BemHistoricalChebyshevStatistics{count(old["directPanelPairCount"]),
+                                                         count(old["representedFarPanelPairs"])};
+                }
+            }
+            const auto &s = f.fastMultipole;
+            if (s.graphExecution && s.farInteractionCount == 0)
+                require(*s.graphExecution == BemFastMultipoleGraphEvidence{});
+            if (s.historicalChebyshevStatistics) {
+                require(!s.graphExecution);
+                require(multipole && s.pressurePressureNearPairs == 0 &&
+                        s.pressurePressureFarPairs == 0 && s.pressureFluxNearPairs == 0 &&
+                        s.pressureFluxFarPairs == 0);
+                const auto &old = *s.historicalChebyshevStatistics;
+                require(old.representedFarPanelPairs <= pairs &&
+                        old.directPanelPairCount == pairs - old.representedFarPanelPairs);
+            } else if (multipole) {
+                const auto nodes = std::uint64_t(mesh.vertices.size()),
+                           pressurePairs = nodes * nodes, fluxPairs = nodes * panels;
+                require(s.pressurePressureFarPairs <= pressurePairs &&
+                        s.pressurePressureNearPairs == pressurePairs - s.pressurePressureFarPairs &&
+                        s.pressureFluxFarPairs <= fluxPairs &&
+                        s.pressureFluxNearPairs == fluxPairs - s.pressureFluxFarPairs);
+            }
         }
         const auto excitationCount = request.coupling ? 1 : request.excitations.size();
         const auto es = array(entry["excitations"], excitationCount, excitationCount);
         for (qsizetype ei = 0; ei < es.size(); ++ei) {
             const auto item = object(es[ei]);
+            if (version >= 16)
+                require(item.contains("residualEvaluation"));
             if (multipole)
                 require(item.contains("iterations"));
             auto requiredItem = item;
+            requiredItem.remove("subdomainTraces");
+            if (request.subdomains)
+                requiredItem.remove("surfacePressure");
             requiredItem.remove("iterations");
             requiredItem.remove("pressureTrace");
             requiredItem.remove("normalDerivative");
@@ -621,14 +1278,39 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
             if (!exteriorMesh.triangles.empty())
                 requiredItem.remove("solvedVelocities");
             require(item.contains("pressureTrace") == item.contains("normalDerivative"));
+            for (const auto *field :
+                 {"residualEvaluation", "fastMultipoleKrylovResidual", "fastMultipoleKrylovTarget",
+                  "fastMultipoleOperatorDiscrepancy", "fastMultipoleComparisonOrder",
+                  "fastMultipoleAuditOrder", "fastMultipoleAccuracySeed",
+                  "fastMultipoleComparisonAccuracySeed", "fastMultipoleVerificationAccuracySeed",
+                  "fastMultipoleAccuracyRefinements", "fastMultipoleComparisonLevels",
+                  "fastMultipoleVerificationLevels", "historicalChebyshevEvidence",
+                  "quadratureEvidence"})
+                requiredItem.remove(field);
             if (request.coupling) {
                 require(item.contains("lemSolution") && item.contains("solvedVelocities"));
                 requiredItem.remove("lemSolution");
                 requiredItem.remove("solvedVelocities");
             }
-            keys(requiredItem, {"name", "surfacePressure", "observerPressure", "impedances",
-                                "refinementSteps", "boundaryResidual"});
+            if (request.subdomains)
+                keys(requiredItem, {"name", "observerPressure", "impedances", "refinementSteps",
+                                    "boundaryResidual"});
+            else
+                keys(requiredItem, {"name", "surfacePressure", "observerPressure", "impedances",
+                                    "refinementSteps", "boundaryResidual"});
             BemExcitationResult e;
+            require(item.contains("subdomainTraces") == request.subdomains.has_value());
+            if (request.subdomains)
+                e.setSubdomainTraces(
+                    decodeSubdomainTraces(item["subdomainTraces"], mesh, *request.subdomains));
+            decodeAccuracyEvidence(e, item, version, multipole,
+                                   f.fastMultipole.farInteractionCount > 0,
+                                   request.numerics.relativeResidualTolerance);
+            decodeQuadratureEvidence(e, item, version, multipole,
+                                     f.fastMultipole.farInteractionCount > 0,
+                                     request.numerics.relativeResidualTolerance);
+            require(bool(e.historicalChebyshevEvidence) ==
+                    bool(f.fastMultipole.historicalChebyshevStatistics));
             e.name = text(item["name"], true).toStdString();
             require(e.name == (request.coupling ? "LEM" : request.excitations[ei].name));
             if (request.coupling) {
@@ -640,7 +1322,8 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                     if (port.kind == lem::BemPortKind::interfacePort)
                         interfaces.insert(port.faceIds.begin(), port.faceIds.end());
                 }
-                e.solvedVelocities = decodeVelocities(item["solvedVelocities"], combinedMesh, interfaces);
+                e.solvedVelocities =
+                    decodeVelocities(item["solvedVelocities"], combinedMesh, interfaces);
                 std::map<std::uint32_t, std::complex<double>> velocities;
                 for (const auto &v : e.solvedVelocities)
                     velocities.emplace(v.faceId, v.normalVelocity);
@@ -661,8 +1344,8 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                             port.faceIds.end())
                             area +=
                                 combinedAreas[ti] * (port.velocityWeights.contains(triangle.faceId)
-                                                          ? port.velocityWeights.at(triangle.faceId)
-                                                          : 1.);
+                                                         ? port.velocityWeights.at(triangle.faceId)
+                                                         : 1.);
                     }
                     require(std::isfinite(area) && area > 0);
                     const auto &solution = e.lemSolution->ports.at(i);
@@ -679,19 +1362,25 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                 require(expected.size() == velocities.size());
             }
             BemBoundaryData boundary;
-            boundary.surfacePressure = decodePressure(item["surfacePressure"], mesh.triangles.size());
+            if (!request.subdomains)
+                boundary.surfacePressure =
+                    decodePressure(item["surfacePressure"], mesh.triangles.size());
             if (!exteriorMesh.triangles.empty()) {
-                boundary.exteriorSurfacePressure = decodePressure(item["exteriorSurfacePressure"], exteriorMesh.triangles.size());
+                boundary.exteriorSurfacePressure =
+                    decodePressure(item["exteriorSurfacePressure"], exteriorMesh.triangles.size());
                 if (!request.coupling)
-                    e.solvedVelocities = decodeVelocities(item["solvedVelocities"], combinedMesh, {});
-            } else require(!item.contains("exteriorSurfacePressure"));
+                    e.solvedVelocities =
+                        decodeVelocities(item["solvedVelocities"], combinedMesh, {});
+            } else
+                require(!item.contains("exteriorSurfacePressure"));
             if (item.contains("pressureTrace")) {
-                boundary.pressureTrace = decodePressure(item["pressureTrace"], mesh.vertices.size());
+                boundary.pressureTrace =
+                    decodePressure(item["pressureTrace"], mesh.vertices.size());
                 boundary.normalDerivative =
                     decodePressure(item["normalDerivative"], mesh.triangles.size());
                 if (request.axisymmetric)
-                    bem_detail::validateAxisymmetricTrace(*request.axisymmetric, boundary.pressureTrace,
-                                                          boundary.normalDerivative);
+                    bem_detail::validateAxisymmetricTrace(
+                        *request.axisymmetric, boundary.pressureTrace, boundary.normalDerivative);
                 for (std::size_t t = 0; t < mesh.triangles.size(); ++t) {
                     const auto &nodes = mesh.triangles[t].vertices;
                     const auto &weights = measures.pressureIntegrals[t];
@@ -701,8 +1390,10 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                     const auto mean =
                         continuous
                             ? (weights[0] / measures.areas[t]) * boundary.pressureTrace[nodes[0]] +
-                                  (weights[1] / measures.areas[t]) * boundary.pressureTrace[nodes[1]] +
-                                  (weights[2] / measures.areas[t]) * boundary.pressureTrace[nodes[2]]
+                                  (weights[1] / measures.areas[t]) *
+                                      boundary.pressureTrace[nodes[1]] +
+                                  (weights[2] / measures.areas[t]) *
+                                      boundary.pressureTrace[nodes[2]]
                             : (boundary.pressureTrace[nodes[0]] + boundary.pressureTrace[nodes[1]] +
                                boundary.pressureTrace[nodes[2]]) /
                                   3.;
@@ -713,8 +1404,8 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
                     double scale = std::abs(boundary.surfacePressure[t]);
                     double absoluteMean = 0;
                     for (unsigned i = 0; i < 3; ++i)
-                        absoluteMean +=
-                            (weights[i] / measures.areas[t]) * std::abs(boundary.pressureTrace[nodes[i]]);
+                        absoluteMean += (weights[i] / measures.areas[t]) *
+                                        std::abs(boundary.pressureTrace[nodes[i]]);
                     scale = std::max(scale, absoluteMean);
                     require(std::isfinite(scale) &&
                             std::abs(mean - boundary.surfacePressure[t]) <=
@@ -724,103 +1415,216 @@ BemResult decodeResult(const QJsonValue &resultValue, const BemRequest &request,
             e.observerPressure = decodePressure(item["observerPressure"], request.observers.size());
             const unsigned couplingPasses =
                 e.lemSolution ? static_cast<unsigned>(e.lemSolution->ports.size()) + 1u : 1u;
-            e.refinementSteps = integer(item["refinementSteps"],
-                                        request.numerics.maximumRefinementSteps * couplingPasses);
+            std::uint64_t auditPasses = 1;
+            if (e.historicalChebyshevEvidence) {
+                const auto &old = *e.historicalChebyshevEvidence;
+                // Historical Chebyshev runs used p>=3. Keep a conservative
+                // counter bound without retaining p as a live solver setting.
+                auditPasses = old.comparisonOrder ? old.comparisonOrder - 3u : 7u;
+            } else if (multipole)
+                // Earlier quadrature attempts can each have all five seed stages;
+                // only the final attempt's refinement count is stored.
+                auditPasses = 2u * (std::uint64_t(e.fastMultipoleAccuracyRefinements) + 1 +
+                                    5u * e.farQuadratureRefinements);
+            const auto quadraturePasses = std::uint64_t(e.farQuadratureRefinements) + 1;
+            const auto maximumCorrections =
+                std::uint64_t(request.numerics.maximumRefinementSteps) * auditPasses;
+            const auto bound = [](std::uint64_t value) {
+                return static_cast<std::uint32_t>(std::min<std::uint64_t>(value, UINT32_MAX));
+            };
+            e.refinementSteps =
+                integer(item["refinementSteps"], bound(maximumCorrections * couplingPasses));
             if (item.contains("iterations"))
-                e.iterations =
-                    integer(item["iterations"],
-                            request.numerics.acceleration == BemAcceleration::fastMultipole
-                                ? request.numerics.fastMultipole.maximumIterations *
-                                      (request.numerics.maximumRefinementSteps + 1) * couplingPasses
-                                : 0);
+                e.iterations = integer(
+                    item["iterations"],
+                    multipole
+                        ? bound(std::uint64_t(request.numerics.fastMultipole.maximumIterations) *
+                                (maximumCorrections + quadraturePasses) * couplingPasses)
+                        : 0);
             e.boundaryResidual =
                 range(item["boundaryResidual"], 0, request.numerics.relativeResidualTolerance);
-            std::map<std::uint32_t, std::complex<double>> assigned;
-            for (const auto &face :
-                 request.coupling ? e.solvedVelocities : request.excitations[ei].faces)
-                if (std::abs(face.normalVelocity) > 0)
-                    assigned.emplace(face.faceId, face.normalVelocity);
-            std::map<std::uint32_t, FaceIntegral> integrals;
-            for (std::size_t ti = 0; ti < mesh.triangles.size(); ++ti) {
-                const auto &triangle = mesh.triangles[ti];
-                if (!assigned.contains(triangle.faceId))
-                    continue;
-                const double area = measures.areas[ti];
-                auto &sum = integrals[triangle.faceId];
-                sum.area += area;
-                sum.pressure += area * boundary.surfacePressure[ti];
-                sum.absolutePressure += area * std::abs(boundary.surfacePressure[ti]);
-            }
-            std::set<std::uint32_t> seen;
-            for (std::size_t ti = 0; ti < exteriorMesh.triangles.size(); ++ti) {
-                const auto &triangle = exteriorMesh.triangles[ti];
-                if (!assigned.contains(triangle.faceId))
-                    continue;
-                const double area = combinedAreas[mesh.triangles.size() + ti];
-                auto &sum = integrals[triangle.faceId];
-                sum.area += area;
-                sum.pressure += area * boundary.exteriorSurfacePressure[ti];
-                sum.absolutePressure += area * std::abs(boundary.exteriorSurfacePressure[ti]);
-            }
-            for (const auto &v : array(item["impedances"], assigned.size(), assigned.size())) {
-                const auto z = object(v);
-                keys(z, {"faceId", "area", "meanPressure", "volumeVelocity", "volumeImpedance"});
-                FaceImpedance impedance{integer(z["faceId"]), positive(z["area"]),
-                                        complex(z["meanPressure"]), complex(z["volumeVelocity"]),
-                                        complex(z["volumeImpedance"])};
-                require(assigned.contains(impedance.faceId) &&
-                        seen.insert(impedance.faceId).second);
-                const auto &sum = integrals.at(impedance.faceId);
-                const double pressureScale =
-                    std::max({std::abs(impedance.meanPressure), std::abs(sum.pressure / sum.area),
-                              sum.absolutePressure / sum.area});
-                require(std::isfinite(pressureScale) && close(impedance.area, sum.area) &&
+            if (!request.subdomains) {
+                std::map<std::uint32_t, std::complex<double>> assigned;
+                for (const auto &face :
+                     request.coupling ? e.solvedVelocities : request.excitations[ei].faces)
+                    if (std::abs(face.normalVelocity) > 0)
+                        assigned.emplace(face.faceId, face.normalVelocity);
+                std::map<std::uint32_t, FaceIntegral> integrals;
+                for (std::size_t ti = 0; ti < mesh.triangles.size(); ++ti) {
+                    const auto &triangle = mesh.triangles[ti];
+                    if (!assigned.contains(triangle.faceId))
+                        continue;
+                    const double area = measures.areas[ti];
+                    auto &sum = integrals[triangle.faceId];
+                    sum.area += area;
+                    sum.pressure += area * boundary.surfacePressure[ti];
+                    sum.absolutePressure += area * std::abs(boundary.surfacePressure[ti]);
+                }
+                std::set<std::uint32_t> seen;
+                for (std::size_t ti = 0; ti < exteriorMesh.triangles.size(); ++ti) {
+                    const auto &triangle = exteriorMesh.triangles[ti];
+                    if (!assigned.contains(triangle.faceId))
+                        continue;
+                    const double area = combinedAreas[mesh.triangles.size() + ti];
+                    auto &sum = integrals[triangle.faceId];
+                    sum.area += area;
+                    sum.pressure += area * boundary.exteriorSurfacePressure[ti];
+                    sum.absolutePressure += area * std::abs(boundary.exteriorSurfacePressure[ti]);
+                }
+                for (const auto &v : array(item["impedances"], assigned.size(), assigned.size())) {
+                    const auto z = object(v);
+                    keys(z,
+                         {"faceId", "area", "meanPressure", "volumeVelocity", "volumeImpedance"});
+                    FaceImpedance impedance{
+                        integer(z["faceId"]), positive(z["area"]), complex(z["meanPressure"]),
+                        complex(z["volumeVelocity"]), complex(z["volumeImpedance"])};
+                    require(assigned.contains(impedance.faceId) &&
+                            seen.insert(impedance.faceId).second);
+                    const auto &sum = integrals.at(impedance.faceId);
+                    const double pressureScale = std::max({std::abs(impedance.meanPressure),
+                                                           std::abs(sum.pressure / sum.area),
+                                                           sum.absolutePressure / sum.area});
+                    require(
+                        std::isfinite(pressureScale) && close(impedance.area, sum.area) &&
                         std::abs(impedance.meanPressure - sum.pressure / sum.area) <=
                             1e-10 * pressureScale &&
                         close(impedance.volumeVelocity, assigned.at(impedance.faceId) * sum.area) &&
                         close(impedance.volumeImpedance,
                               impedance.meanPressure / impedance.volumeVelocity));
-                e.impedances.push_back(impedance);
-            }
-            if (request.coupling) {
-                const auto ports = lem::bemPorts(*request.coupling);
-                for (std::size_t i = 0; i < ports.size(); ++i) {
-                    const auto &port = std::get<lem::BemPort>(ports[i]->component);
-                    auto allPressure = boundary.surfacePressure;
-                    allPressure.insert(allPressure.end(), boundary.exteriorSurfacePressure.begin(), boundary.exteriorSurfacePressure.end());
-                    double area = 0, magnitude = 0;
-                    std::complex<double> pressure{};
-                    for (std::size_t ti = 0; ti < combinedMesh.triangles.size(); ++ti) {
-                        const auto &triangle = combinedMesh.triangles[ti];
-                        if (std::find(port.faceIds.begin(), port.faceIds.end(), triangle.faceId) !=
-                            port.faceIds.end())
-                            area +=
-                                combinedAreas[ti] * (port.velocityWeights.contains(triangle.faceId)
-                                                          ? port.velocityWeights.at(triangle.faceId)
-                                                          : 1.);
-                    }
-                    require(std::isfinite(area) && area > 0);
-                    for (std::size_t ti = 0; ti < combinedMesh.triangles.size(); ++ti)
-                        if (std::find(port.faceIds.begin(), port.faceIds.end(),
-                                      combinedMesh.triangles[ti].faceId) != port.faceIds.end()) {
-                            // Normalize before multiplying by pressure: a global rescaling
-                            // of the modal weights must not overflow an unchanged field.
-                            const double weight =
-                                port.velocityWeights.contains(combinedMesh.triangles[ti].faceId)
-                                    ? port.velocityWeights.at(combinedMesh.triangles[ti].faceId)
-                                    : 1.;
-                            const double a = (weight / area) * combinedAreas[ti];
-                            pressure += a * allPressure[ti];
-                            magnitude += a * std::abs(allPressure[ti]);
+                    e.impedances.push_back(impedance);
+                }
+                if (request.coupling) {
+                    const auto ports = lem::bemPorts(*request.coupling);
+                    for (std::size_t i = 0; i < ports.size(); ++i) {
+                        const auto &port = std::get<lem::BemPort>(ports[i]->component);
+                        auto allPressure = boundary.surfacePressure;
+                        allPressure.insert(allPressure.end(),
+                                           boundary.exteriorSurfacePressure.begin(),
+                                           boundary.exteriorSurfacePressure.end());
+                        double area = 0, magnitude = 0;
+                        std::complex<double> pressure{};
+                        for (std::size_t ti = 0; ti < combinedMesh.triangles.size(); ++ti) {
+                            const auto &triangle = combinedMesh.triangles[ti];
+                            if (std::find(port.faceIds.begin(), port.faceIds.end(),
+                                          triangle.faceId) != port.faceIds.end())
+                                area += combinedAreas[ti] *
+                                        (port.velocityWeights.contains(triangle.faceId)
+                                             ? port.velocityWeights.at(triangle.faceId)
+                                             : 1.);
                         }
-                    // This is the solver's independent port-pressure closure acceptance limit,
-                    // not a pressure-error estimate derived from the Galerkin residual.
-                    require(std::abs(e.lemSolution->ports[i].pressure - pressure) <=
+                        require(std::isfinite(area) && area > 0);
+                        for (std::size_t ti = 0; ti < combinedMesh.triangles.size(); ++ti)
+                            if (std::find(port.faceIds.begin(), port.faceIds.end(),
+                                          combinedMesh.triangles[ti].faceId) !=
+                                port.faceIds.end()) {
+                                // Normalize before multiplying by pressure: a global rescaling
+                                // of the modal weights must not overflow an unchanged field.
+                                const double weight =
+                                    port.velocityWeights.contains(combinedMesh.triangles[ti].faceId)
+                                        ? port.velocityWeights.at(combinedMesh.triangles[ti].faceId)
+                                        : 1.;
+                                const double a = (weight / area) * combinedAreas[ti];
+                                pressure += a * allPressure[ti];
+                                magnitude += a * std::abs(allPressure[ti]);
+                            }
+                        // This is the solver's independent port-pressure closure acceptance limit,
+                        // not a pressure-error estimate derived from the Galerkin residual.
+                        require(
+                            std::abs(e.lemSolution->ports[i].pressure - pressure) <=
                             relativePortPressureClosureTolerance *
                                 std::max(magnitude, std::abs(e.lemSolution->ports[i].pressure)));
+                    }
+                }
+            } else {
+                if (!request.coupling)
+                    e.solvedVelocities = request.excitations[ei].faces;
+                std::map<std::uint32_t, std::complex<double>> assigned;
+                for (const auto &face : e.solvedVelocities)
+                    if (std::abs(face.normalVelocity) > 0)
+                        assigned.emplace(face.faceId, face.normalVelocity);
+                std::set<std::uint32_t> interfaceTriangles;
+                for (const auto &interface : request.subdomains->interfaces)
+                    interfaceTriangles.insert(interface.triangleIndices.begin(),
+                                              interface.triangleIndices.end());
+                std::map<std::uint32_t, FaceIntegral> integrals;
+                std::map<std::uint32_t, std::complex<double>> panelMeans;
+                for (const auto &trace : e.subdomainTraces()) {
+                    std::map<std::uint32_t, std::complex<double>> pressure;
+                    for (std::size_t i = 0; i < trace.vertexIndices.size(); ++i)
+                        pressure.emplace(trace.vertexIndices[i], trace.pressureTrace[i]);
+                    for (auto index : trace.triangleIndices) {
+                        const auto &triangle = mesh.triangles[index];
+                        if (interfaceTriangles.contains(index))
+                            continue;
+                        const auto mean =
+                            (pressure.at(triangle.vertices[0]) + pressure.at(triangle.vertices[1]) +
+                             pressure.at(triangle.vertices[2])) /
+                            3.;
+                        require(panelMeans.emplace(index, mean).second);
+                        if (!assigned.contains(triangle.faceId))
+                            continue;
+                        auto &sum = integrals[triangle.faceId];
+                        const auto area = measures.areas[index];
+                        sum.area += area;
+                        sum.pressure += area * mean;
+                        sum.absolutePressure += area * std::abs(mean);
+                    }
+                }
+                if (request.coupling) {
+                    const auto ports = lem::bemPorts(*request.coupling);
+                    for (std::size_t i = 0; i < ports.size(); ++i) {
+                        const auto &port = std::get<lem::BemPort>(ports[i]->component);
+                        double area = 0, magnitude = 0;
+                        std::complex<double> pressure{};
+                        for (const auto &[index, mean] : panelMeans) {
+                            const auto face = mesh.triangles[index].faceId;
+                            if (std::find(port.faceIds.begin(), port.faceIds.end(), face) ==
+                                port.faceIds.end())
+                                continue;
+                            const double weight = port.velocityWeights.contains(face)
+                                                      ? port.velocityWeights.at(face)
+                                                      : 1.;
+                            const double weightedArea = measures.areas[index] * weight;
+                            area += weightedArea;
+                            pressure += weightedArea * mean;
+                            magnitude += weightedArea * std::abs(mean);
+                        }
+                        require(std::isfinite(area) && area > 0);
+                        pressure /= area;
+                        magnitude /= area;
+                        require(
+                            std::abs(e.lemSolution->ports[i].pressure - pressure) <=
+                            relativePortPressureClosureTolerance *
+                                std::max(magnitude, std::abs(e.lemSolution->ports[i].pressure)));
+                    }
+                }
+                std::set<std::uint32_t> seen;
+                for (const auto &v : array(item["impedances"], assigned.size(), assigned.size())) {
+                    const auto z = object(v);
+                    keys(z,
+                         {"faceId", "area", "meanPressure", "volumeVelocity", "volumeImpedance"});
+                    FaceImpedance impedance{
+                        integer(z["faceId"]), positive(z["area"]), complex(z["meanPressure"]),
+                        complex(z["volumeVelocity"]), complex(z["volumeImpedance"])};
+                    require(assigned.contains(impedance.faceId) &&
+                            seen.insert(impedance.faceId).second &&
+                            integrals.contains(impedance.faceId));
+                    const auto &sum = integrals.at(impedance.faceId);
+                    const double scale = std::max({std::abs(impedance.meanPressure),
+                                                   std::abs(sum.pressure / sum.area),
+                                                   sum.absolutePressure / sum.area});
+                    require(
+                        std::isfinite(scale) && close(impedance.area, sum.area) &&
+                        std::abs(impedance.meanPressure - sum.pressure / sum.area) <=
+                            1e-10 * scale &&
+                        close(impedance.volumeVelocity, assigned.at(impedance.faceId) * sum.area) &&
+                        close(impedance.volumeImpedance,
+                              impedance.meanPressure / impedance.volumeVelocity));
+                    e.impedances.push_back(impedance);
                 }
             }
-            e.setBoundary(std::move(boundary));
+            if (!request.subdomains)
+                e.setBoundary(std::move(boundary));
             f.excitations.push_back(std::move(e));
         }
         r.frequencies.push_back(std::move(f));
@@ -855,6 +1659,7 @@ QJsonObject encodeSimulation(const SimulationArchive &a) {
                                  {"acceleration", encodeAcceleration(s.acceleration)},
                                  {"fastMultipole", encodeFastMultipole(s.fastMultipole)},
                                  {"nearMaximumDepth", int(s.nearMaximumDepth)},
+                                 {"singularOrder", int(s.singularOrder)},
                                  {"normalizeToOnAxis", s.normalizeToOnAxis},
                                  {"angularResponses", encodeAngularResponses(s.angularResponses)},
                                  {"fieldDisplay", encodeFieldDisplay(s.fieldDisplay)},
@@ -874,10 +1679,17 @@ QJsonObject encodeSimulation(const SimulationArchive &a) {
         {"request",
          a.request ? QJsonValue(encodeRequest(*a.request)) : QJsonValue(QJsonValue::Null)},
         {"result", a.result ? QJsonValue(encodeResult(*a.result)) : QJsonValue(QJsonValue::Null)}};
+    if (a.request && a.request->subdomains) {
+        require(bool(a.sourceMesh) && !a.resultRegions.empty());
+        result.insert("sourceMesh", encodeMesh(*a.sourceMesh));
+        result.insert("resultRegions", encodeAcousticRegions(a.resultRegions));
+    } else
+        require(!a.sourceMesh && a.resultRegions.empty());
     if (a.result && a.resultComplete)
         result.insert("resultComplete", *a.resultComplete);
     auto couplingSettings = result["settings"].toObject();
     require(s.ctaExcitationIndex >= -1 && s.ctaExcitationIndex <= 10000);
+    couplingSettings.insert("acousticRegions", encodeAcousticRegions(s.acousticRegions));
     couplingSettings.insert("ctaExcitationIndex", s.ctaExcitationIndex);
     couplingSettings.insert("couplingEnabled", s.couplingEnabled);
     couplingSettings.insert("couplingNetwork", encodeLemNetwork(s.couplingNetwork));
@@ -902,12 +1714,14 @@ QJsonObject encodeSimulation(const SimulationArchive &a) {
     }
     return result;
 }
-SimulationArchive decodeSimulation(const QJsonValue &v) {
+SimulationArchive decodeSimulation(const QJsonValue &v, unsigned formatVersion) {
     const auto o = object(v);
     auto required = o;
     required.remove("measurements");
     required.remove("axisymmetricSampling");
     required.remove("resultComplete");
+    required.remove("sourceMesh");
+    required.remove("resultRegions");
     keys(required, {"settings", "revision", "current", "solvedMesh", "request", "result"});
     SimulationArchive a;
     if (o.contains("axisymmetricSampling"))
@@ -930,6 +1744,7 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
     require(hasMesh == hasRequest && hasRequest == hasResult);
     const auto settings = object(o["settings"]);
     auto requiredSettings = settings;
+    requiredSettings.remove("acousticRegions");
     requiredSettings.remove("ctaExcitationIndex");
     requiredSettings.remove("beamwidthTarget");
     requiredSettings.remove("normAngle");
@@ -938,6 +1753,7 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
     requiredSettings.remove("acceleration");
     requiredSettings.remove("fastMultipole");
     requiredSettings.remove("nearMaximumDepth");
+    requiredSettings.remove("singularOrder");
     requiredSettings.remove("couplingEnabled");
     requiredSettings.remove("couplingNetwork");
     requiredSettings.remove("farField");
@@ -951,6 +1767,8 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
     keys(requiredSettings, {"minimumFrequency", "maximumFrequency", "frequencyCount", "medium",
                             "velocityScale", "phaseDegrees", "normalizeToOnAxis"});
     auto &s = a.settings;
+    if (settings.contains("acousticRegions"))
+        s.acousticRegions = decodeAcousticRegions(settings["acousticRegions"]);
     if (settings.contains("ctaExcitationIndex")) {
         const double selection = range(settings["ctaExcitationIndex"], -1, 10000);
         require(std::floor(selection) == selection);
@@ -984,6 +1802,10 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
         s.fastMultipole = decodeFastMultipole(settings["fastMultipole"]);
     if (settings.contains("nearMaximumDepth"))
         s.nearMaximumDepth = integer(settings["nearMaximumDepth"], 10);
+    if (settings.contains("singularOrder")) {
+        s.singularOrder = integer(settings["singularOrder"], 20);
+        require(s.singularOrder >= 2);
+    }
     s.normalizeToOnAxis = boolean(settings["normalizeToOnAxis"]);
     if (settings.contains("couplingEnabled")) {
         s.couplingEnabled = boolean(settings["couplingEnabled"]);
@@ -1032,15 +1854,31 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
     require(!a.resultComplete.has_value() || hasResult);
     require(!a.current || a.resultComplete.value_or(false));
     require(!a.current || s.couplingEnabled || !hasBoundInterfacePorts(s.couplingNetwork));
+    const bool partitioned = !o["request"].isNull() && object(o["request"]).contains("subdomains");
+    require(o.contains("sourceMesh") == partitioned && o.contains("resultRegions") == partitioned);
+    if (partitioned) {
+        a.sourceMesh = std::make_shared<SurfaceMesh>(decodeMesh(o["sourceMesh"], false));
+        a.resultRegions = decodeAcousticRegions(o["resultRegions"]);
+        require(!a.resultRegions.empty());
+    }
     if (!o["solvedMesh"].isNull())
-        a.mesh = std::make_shared<SurfaceMesh>(decodeMesh(o["solvedMesh"], true));
+        a.mesh = std::make_shared<SurfaceMesh>(decodeMesh(o["solvedMesh"], !partitioned));
     if (!o["request"].isNull()) {
         require(bool(a.mesh));
         a.request = decodeRequest(o["request"], *a.mesh);
+        if (partitioned) {
+            require(a.sourceMesh->vertices.size() <= a.mesh->vertices.size() &&
+                    a.sourceMesh->triangles.size() <= a.mesh->triangles.size());
+            require(std::equal(a.sourceMesh->vertices.begin(), a.sourceMesh->vertices.end(),
+                               a.mesh->vertices.begin()) &&
+                    std::equal(a.sourceMesh->triangles.begin(), a.sourceMesh->triangles.end(),
+                               a.mesh->triangles.begin()));
+        }
     }
     if (!o["result"].isNull()) {
         require(a.mesh && a.request.has_value());
-        a.result = std::make_shared<BemResult>(decodeResult(o["result"], *a.request, *a.mesh));
+        a.result = std::make_shared<BemResult>(
+            decodeResult(o["result"], *a.request, *a.mesh, formatVersion));
     }
     require(!a.current || bool(a.result));
     require(a.axisymmetricSampling.has_value() == (a.request && a.request->axisymmetric));
@@ -1053,6 +1891,9 @@ SimulationArchive decodeSimulation(const QJsonValue &v) {
             require(*a.axisymmetricSampling == s.axisymmetricSampling);
     }
     require(!a.current || a.request->infiniteBaffle == s.infiniteBaffle);
+    require(!a.current || !partitioned || a.resultRegions == s.acousticRegions);
+    require(!a.current || std::none_of(s.acousticRegions.begin(), s.acousticRegions.end(),
+                                       [](const auto &r) { return r.needsAssignmentReview; }));
     if (a.current) {
         require(a.request->coupling.has_value() == s.couplingEnabled);
         if (a.request->coupling)

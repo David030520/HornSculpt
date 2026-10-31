@@ -18,17 +18,23 @@ Vec3 added(Vec3 a, Vec3 b) {
 }
 } // namespace
 long double estimateResultBytes(const ResultMemoryDimensions &d) {
-    const long double boundary = static_cast<long double>(d.excitations) *
+    const long double boundary =
+        static_cast<long double>(d.excitations) *
         (sizeof(BemBoundaryData) +
-         (2.L * d.triangles + d.vertices + d.exteriorTriangles) *
-             sizeof(std::complex<double>));
-    const long double snapshot = sizeof(BemFrequencyResult) +
+         (2.L * d.triangles + d.vertices + d.exteriorTriangles) * sizeof(std::complex<double>));
+    const long double snapshot =
+        sizeof(BemFrequencyResult) +
         static_cast<long double>(d.excitations) *
             (sizeof(BemExcitationResult) +
              static_cast<long double>(d.observers) * sizeof(std::complex<double>) +
              static_cast<long double>(d.faces) * (sizeof(FaceImpedance) + sizeof(FaceVelocity)));
+    // Domain traces are shared immutably across realtime publications. Every domain
+    // may conservatively reference all vertices/panels and interface vertices.
+    const long double domainTraces = static_cast<long double>(d.domains) * d.excitations *
+                                     (2.L * d.vertices + d.triangles) *
+                                     (sizeof(std::complex<double>) + sizeof(std::uint32_t));
     return static_cast<long double>(d.frequencies) *
-           (boundary + static_cast<long double>(d.snapshots) * snapshot);
+           (boundary + domainTraces + static_cast<long double>(d.snapshots) * snapshot);
 }
 bool hasBoundInterfacePorts(const lem::Network &network) {
     return std::any_of(network.elements.begin(), network.elements.end(), [](const auto &element) {
@@ -62,7 +68,8 @@ void validateInfiniteBaffleSettings(const InfiniteBaffle &baffle) {
                 "Schallwand: Apertur-Flächen müssen positive, eindeutige IDs besitzen.");
     if (faces.empty())
         throw std::invalid_argument("Schallwand: Mindestens eine Apertur-Fläche ist erforderlich.");
-    bem_detail::validateBaffleExteriorMesh({}, baffle.exteriorDrivenMesh, baffle.origin, baffle.normal);
+    bem_detail::validateBaffleExteriorMesh({}, baffle.exteriorDrivenMesh, baffle.origin,
+                                           baffle.normal);
 }
 
 AcousticFrame simulationFrame(const SimulationSettings &settings, Vec3 sourceOrigin,
@@ -74,6 +81,15 @@ AcousticFrame simulationFrame(const SimulationSettings &settings, Vec3 sourceOri
 BemRequest makeSimulationRequest(const SimulationSettings &s,
                                  std::span<const FaceVelocity> velocities, Vec3 origin, Vec3 axis) {
     validateAxisymmetricSamplingSettings(s.axisymmetricSampling);
+    if (std::any_of(s.acousticRegions.begin(), s.acousticRegions.end(),
+                    [](const auto &r) { return r.needsAssignmentReview; }))
+        throw std::invalid_argument(
+            "Teilgebietsflächen müssen nach dem Geometriewechsel geprüft werden.");
+    if (!s.acousticRegions.empty() &&
+        (s.infiniteBaffle || s.geometryMode != BemGeometryMode::threeDimensional ||
+         s.acceleration != BemAcceleration::dense))
+        throw std::invalid_argument("Teilgebiete unterstützen derzeit nur 3D mit dichtem Solver "
+                                    "ohne unendliche Schallwand.");
     if (s.geometryMode != BemGeometryMode::threeDimensional &&
         s.geometryMode != BemGeometryMode::axisymmetric)
         throw std::invalid_argument("Unbekannter BEM-Geometriemodus.");
@@ -120,6 +136,9 @@ BemRequest makeSimulationRequest(const SimulationSettings &s,
     request.numerics.acceleration = s.acceleration;
     request.numerics.fastMultipole = s.fastMultipole;
     request.numerics.nearMaximumDepth = s.nearMaximumDepth;
+    if (s.singularOrder < 2 || s.singularOrder > 20)
+        throw std::invalid_argument("Singular quadrature order must be from 2 to 20.");
+    request.numerics.singularOrder = s.singularOrder;
     request.frequencies.reserve(s.frequencyCount);
     for (std::size_t i = 0; i < s.frequencyCount; ++i)
         request.frequencies.push_back(

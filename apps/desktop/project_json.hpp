@@ -36,7 +36,7 @@ void decodeDraft(const QJsonObject &root, Project &project);
 QJsonObject encodeCad(const CadSnapshot &snapshot);
 CadSnapshot decodeCad(const QJsonValue &value, bool exactGeometryFields);
 QJsonObject encodeSimulation(const SimulationArchive &archive);
-SimulationArchive decodeSimulation(const QJsonValue &value);
+SimulationArchive decodeSimulation(const QJsonValue &value, unsigned formatVersion);
 QJsonObject encodeLemNetwork(const lem::Network &network);
 lem::Network decodeLemNetwork(const QJsonValue &value);
 QJsonObject encodeLemSolution(const lem::Solution &solution);
