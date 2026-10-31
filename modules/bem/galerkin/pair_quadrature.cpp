@@ -331,7 +331,7 @@ struct AdaptiveRule {
     const Panel &trial;
     PairQuadratureSettings settings;
     double k;
-    bool projection{};
+    bool projection{}, promoteFarRoot{};
     std::stop_token stop;
     AdaptiveQuadratureWorkspace &workspace;
     PairQuadratureRule result;
@@ -377,6 +377,11 @@ struct AdaptiveRule {
         account(sizeof(AdaptiveRule));
         projection =
             useProjection(test, trial, std::max(test.maximumEdgeLength, trial.maximumEdgeLength));
+        // Smooth, well-separated pairs can need a higher polynomial order for
+        // phase resolution even when geometric subdivision is unnecessary.
+        // Try the existing 12/14 error estimator on the whole pair first;
+        // failure still falls back to the usual subdivision and error budget.
+        promoteFarRoot = !projection && !isNearPair(test, trial, 1.0);
         if (projection) {
             const auto parts = projectionPartition(test, trial);
             if (parts.size() > initialParts.size())
@@ -524,7 +529,9 @@ struct AdaptiveRule {
             requestedLeaves[0] =
                 leaf(value.test, value.trial, value.depth, value.degree, value.innerIntervals * 2);
             requestedCount = 1;
-        } else if (value.depth == settings.maximumSubdivisionDepth) {
+        } else if (value.degree == 8 &&
+                   (value.depth == settings.maximumSubdivisionDepth ||
+                    (promoteFarRoot && value.depth == 0))) {
             requestedLeaves[0] =
                 leaf(value.test, value.trial, value.depth, 14, value.innerIntervals);
             requestedCount = 1;

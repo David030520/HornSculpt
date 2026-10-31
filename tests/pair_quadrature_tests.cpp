@@ -437,6 +437,35 @@ PairQuadratureRule subdividedTensorReference(unsigned order) {
     return result;
 }
 
+void promotedFarTests() {
+    const auto a = panel({{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}}, {0, 1, 2});
+    const auto b = panel({{{3, .2, 1}, {3.8, .2, 1.3}, {3, 1.1, 1.2}}}, {3, 4, 5});
+    PairQuadratureSettings settings;
+    settings.relativeTolerance = 1e-4;
+    const double k = 5;
+    const auto controlled = makePairQuadrature(a, b, settings, k, {}, true);
+    require(controlled.patches.size() == 1 && controlled.patches.front().degree == 14 &&
+                controlled.maximumDepth == 0 &&
+                controlled.estimatedRelativeError <= settings.relativeTolerance,
+            "Well-separated oscillatory pair did not retain a compact promoted rule");
+    const auto low = operatorMoments(a, b, subdividedTensorReference(12), k);
+    const auto high = operatorMoments(a, b, subdividedTensorReference(16), k);
+    const auto actual = operatorMoments(a, b, controlled, k);
+    for (const auto [start, count] :
+         std::array<std::array<unsigned, 2>, 4>{{{0, 3}, {3, 9}, {12, 3}, {15, 9}}}) {
+        double error = 0, convergence = 0, reference = 0;
+        for (unsigned i = start; i < start + count; ++i) {
+            error += std::norm(actual[i] - high[i]);
+            convergence += std::norm(low[i] - high[i]);
+            reference += std::norm(high[i]);
+        }
+        require(std::sqrt(convergence / reference) < 1e-7,
+                "Independent far-pair operator reference did not converge");
+        require(std::sqrt(error / reference) < settings.relativeTolerance,
+                "Promoted far-pair rule exceeds the requested operator error");
+    }
+}
+
 void promotedNearTests() {
     for (const unsigned degree : {12U, 14U}) {
         const auto rule = triangleRule(degree);
@@ -771,6 +800,7 @@ int main() {
         singularTests();
         nearTests();
         nearCornerTests();
+        promotedFarTests();
         promotedNearTests();
         projectionQuadratureTests();
         translationTests();
